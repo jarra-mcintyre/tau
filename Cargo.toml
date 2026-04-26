@@ -1,6 +1,6 @@
 [workspace]
 members = [
+    "crates/libtau",
     "crates/tau",
-    "crates/tau-cli",
 ]
 resolver = "2"

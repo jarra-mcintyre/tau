@@ -1,3 +1,5 @@
+pub mod tools;
+
 /// Returns the human-readable name of the Tau tool.
 pub fn name() -> &'static str {
     "Tau"

@@ -15,8 +15,8 @@ build *args:
 
 # Run the Tau CLI in debug mode. Pass CLI args after `--`, e.g. `just run -- --help`.
 run *args:
-    cargo run -p tau-cli -- {{args}}
+    cargo run -p tau -- {{args}}
 
 # Run the Tau CLI in release mode.
 run-release *args:
-    cargo run -p tau-cli --release -- {{args}}
+    cargo run -p tau --release -- {{args}}
