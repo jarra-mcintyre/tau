@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/tau",
+    "crates/tau-cli",
+]
+resolver = "2"
