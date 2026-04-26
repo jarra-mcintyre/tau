@@ -2,6 +2,12 @@ use std::{fs, io, path::PathBuf};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::context::{TauContext, ToolCallError, ToolDefinition, ToolRegistrationError};
+
+pub const NAME: &str = "read_file";
+pub const DESCRIPTION: &str = "Read a UTF-8 text file from disk.";
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct ReadFileInput {
@@ -37,6 +43,22 @@ pub enum ReadFileErrorKind {
     PermissionDenied,
     InvalidInput,
     Other,
+}
+
+pub fn register(context: &mut TauContext) -> Result<(), ToolRegistrationError> {
+    context.register_tool(definition()?)
+}
+
+pub fn definition() -> Result<ToolDefinition, ToolRegistrationError> {
+    ToolDefinition::new::<ReadFileInput>(NAME, DESCRIPTION, callback)
+}
+
+fn callback(input: Value) -> Result<Value, ToolCallError> {
+    let input: ReadFileInput = serde_json::from_value(input)
+        .map_err(|error| ToolCallError::InvalidInput(error.to_string()))?;
+    let output = read_file(input);
+    serde_json::to_value(output)
+        .map_err(|error| ToolCallError::OutputSerializationFailed(error.to_string()))
 }
 
 pub fn read_file(input: ReadFileInput) -> ReadFileOutput {

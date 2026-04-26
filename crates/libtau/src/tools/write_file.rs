@@ -2,6 +2,12 @@ use std::{fs, io, path::PathBuf};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::context::{TauContext, ToolCallError, ToolDefinition, ToolRegistrationError};
+
+pub const NAME: &str = "write_file";
+pub const DESCRIPTION: &str = "Create or overwrite a text file";
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct WriteFileInput {
@@ -38,6 +44,22 @@ pub enum WriteFileErrorKind {
     PermissionDenied,
     InvalidInput,
     Other,
+}
+
+pub fn register(context: &mut TauContext) -> Result<(), ToolRegistrationError> {
+    context.register_tool(definition()?)
+}
+
+pub fn definition() -> Result<ToolDefinition, ToolRegistrationError> {
+    ToolDefinition::new::<WriteFileInput>(NAME, DESCRIPTION, callback)
+}
+
+fn callback(input: Value) -> Result<Value, ToolCallError> {
+    let input: WriteFileInput = serde_json::from_value(input)
+        .map_err(|error| ToolCallError::InvalidInput(error.to_string()))?;
+    let output = write_file(input);
+    serde_json::to_value(output)
+        .map_err(|error| ToolCallError::OutputSerializationFailed(error.to_string()))
 }
 
 pub fn write_file(input: WriteFileInput) -> WriteFileOutput {

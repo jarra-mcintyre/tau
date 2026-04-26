@@ -2,6 +2,13 @@ use std::{fs, io, path::PathBuf};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::context::{TauContext, ToolCallError, ToolDefinition, ToolRegistrationError};
+
+pub const NAME: &str = "edit_file";
+pub const DESCRIPTION: &str =
+    "Edit a UTF-8 text file using exact old contents to new contents substitutions.";
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct EditFileInput {
@@ -57,6 +64,22 @@ struct ResolvedSubstitution {
     start: usize,
     end: usize,
     new_contents: String,
+}
+
+pub fn register(context: &mut TauContext) -> Result<(), ToolRegistrationError> {
+    context.register_tool(definition()?)
+}
+
+pub fn definition() -> Result<ToolDefinition, ToolRegistrationError> {
+    ToolDefinition::new::<EditFileInput>(NAME, DESCRIPTION, callback)
+}
+
+fn callback(input: Value) -> Result<Value, ToolCallError> {
+    let input: EditFileInput = serde_json::from_value(input)
+        .map_err(|error| ToolCallError::InvalidInput(error.to_string()))?;
+    let output = edit_file(input);
+    serde_json::to_value(output)
+        .map_err(|error| ToolCallError::OutputSerializationFailed(error.to_string()))
 }
 
 pub fn edit_file(input: EditFileInput) -> EditFileOutput {
