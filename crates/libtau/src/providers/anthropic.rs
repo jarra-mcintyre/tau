@@ -1,13 +1,28 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    context::{ContentPart, ConversationItem, MediaData, TauContext, ToolResult, ToolUse},
-    providers::{Provider, ProviderError, ProviderResponse},
+    context::{ContentPart, ConversationItem, MediaData, TauSession, ToolResult, ToolUse},
+    providers::{
+        Provider, ProviderApi, ProviderApiConfig, ProviderError, ProviderResponse,
+        common::{
+            assistant_content_as_text, binary_content_as_text, json_as_text, tool_result_json,
+        },
+    },
 };
 
 pub const PROVIDER_NAME: &str = "anthropic";
+pub const API_NAME: &str = "anthropic_messages";
+pub const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+pub const API: ProviderApi = ProviderApi {
+    name: API_NAME,
+    api_key_env: API_KEY_ENV,
+    display_name: "Anthropic",
+    build: build_provider,
+};
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
@@ -20,16 +35,34 @@ pub struct AnthropicProvider {
     max_tokens: u32,
 }
 
+fn build_provider(config: ProviderApiConfig) -> Arc<dyn Provider> {
+    match config.base_url {
+        Some(base_url) => Arc::new(AnthropicProvider::with_base_url(config.api_key, base_url)),
+        None => Arc::new(AnthropicProvider::new(config.api_key)),
+    }
+}
+
+fn normalize_base_url(base_url: impl Into<String>) -> String {
+    let base_url = base_url.into();
+    let trimmed = base_url.trim_end_matches('/');
+
+    match reqwest::Url::parse(trimmed) {
+        Ok(mut url) if url.path() == "/" || url.path().is_empty() => {
+            url.set_path("/v1");
+            url.to_string().trim_end_matches('/').to_string()
+        }
+        _ => trimmed.to_string(),
+    }
+}
+
 impl AnthropicProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::with_base_url(api_key, DEFAULT_BASE_URL)
     }
 
     pub fn from_env() -> Result<Self, ProviderError> {
-        let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
-            ProviderError::Configuration(
-                "ANTHROPIC_API_KEY environment variable is not set".to_string(),
-            )
+        let api_key = std::env::var(API_KEY_ENV).map_err(|_| {
+            ProviderError::Configuration(format!("{API_KEY_ENV} environment variable is not set"))
         })?;
         Ok(Self::new(api_key))
     }
@@ -38,7 +71,7 @@ impl AnthropicProvider {
         Self {
             client: reqwest::Client::new(),
             api_key: api_key.into(),
-            base_url: base_url.into().trim_end_matches('/').to_string(),
+            base_url: normalize_base_url(base_url),
             max_tokens: DEFAULT_MAX_TOKENS,
         }
     }
@@ -55,8 +88,8 @@ impl Provider for AnthropicProvider {
         PROVIDER_NAME
     }
 
-    async fn respond(&self, context: &mut TauContext) -> Result<ProviderResponse, ProviderError> {
-        let request = build_request(context, self.max_tokens)?;
+    async fn respond(&self, session: &mut TauSession) -> Result<ProviderResponse, ProviderError> {
+        let request = build_request(session, self.max_tokens)?;
         let response = self
             .client
             .post(format!("{}/messages", self.base_url))
@@ -158,8 +191,8 @@ enum AnthropicResponseContent {
     Other,
 }
 
-fn build_request(context: &TauContext, max_tokens: u32) -> Result<AnthropicRequest, ProviderError> {
-    let model = context
+fn build_request(session: &TauSession, max_tokens: u32) -> Result<AnthropicRequest, ProviderError> {
+    let model = session
         .model()
         .ok_or(ProviderError::MissingModel)?
         .to_string();
@@ -167,7 +200,7 @@ fn build_request(context: &TauContext, max_tokens: u32) -> Result<AnthropicReque
     let mut system = Vec::new();
     let mut messages = Vec::new();
 
-    for item in &context.conversation().items {
+    for item in &session.conversation().items {
         match item {
             ConversationItem::System { content } => system.extend(input_content_parts(content)?),
             ConversationItem::User { content } => push_message(
@@ -203,7 +236,8 @@ fn build_request(context: &TauContext, max_tokens: u32) -> Result<AnthropicReque
         }
     }
 
-    let tools = context
+    let tools = session
+        .context()
         .tools()
         .map(|tool| AnthropicTool {
             name: tool.name.clone(),
@@ -266,7 +300,7 @@ fn input_content_parts(parts: &[ContentPart]) -> Result<Vec<AnthropicContent>, P
         .map(|part| match part {
             ContentPart::Text { text } => Ok(AnthropicContent::Text { text: text.clone() }),
             ContentPart::Json { value } => Ok(AnthropicContent::Text {
-                text: serde_json::to_string(value)?,
+                text: json_as_text(value)?,
             }),
             ContentPart::Image { media_type, data } => match data {
                 MediaData::Base64(data) => Ok(AnthropicContent::Image {
@@ -283,7 +317,7 @@ fn input_content_parts(parts: &[ContentPart]) -> Result<Vec<AnthropicContent>, P
                 }),
             },
             ContentPart::Binary { media_type, data } => Ok(AnthropicContent::Text {
-                text: format!("[binary content: {media_type}, {}]", media_data_label(data)),
+                text: binary_content_as_text(media_type, data),
             }),
         })
         .collect()
@@ -294,14 +328,9 @@ fn output_content_parts(parts: &[ContentPart]) -> Vec<AnthropicContent> {
         .iter()
         .map(|part| match part {
             ContentPart::Text { text } => AnthropicContent::Text { text: text.clone() },
-            ContentPart::Json { value } => AnthropicContent::Text {
-                text: value.to_string(),
+            part => AnthropicContent::Text {
+                text: assistant_content_as_text(part),
             },
-            ContentPart::Image { media_type, data } | ContentPart::Binary { media_type, data } => {
-                AnthropicContent::Text {
-                    text: format!("[media content: {media_type}, {}]", media_data_label(data)),
-                }
-            }
         })
         .collect()
 }
@@ -309,21 +338,9 @@ fn output_content_parts(parts: &[ContentPart]) -> Vec<AnthropicContent> {
 fn tool_result_content(result: &ToolResult) -> Result<AnthropicContent, ProviderError> {
     Ok(AnthropicContent::ToolResult {
         tool_use_id: result.call_id.clone(),
-        content: serde_json::to_string(&serde_json::json!({
-            "name": result.name,
-            "error": result.error,
-            "content": result.content,
-        }))?,
+        content: tool_result_json(result)?,
         is_error: result.error.as_ref().map(|_| true),
     })
-}
-
-fn media_data_label(data: &MediaData) -> String {
-    match data {
-        MediaData::Url(url) => format!("url={url}"),
-        MediaData::Base64(data) => format!("base64_bytes={}", data.len()),
-        MediaData::Path(path) => format!("path={path}"),
-    }
 }
 
 #[cfg(test)]
@@ -337,27 +354,20 @@ mod tests {
     }
 
     #[test]
+    fn derives_v1_base_path_for_host_only_urls() {
+        assert_eq!(
+            normalize_base_url("http://TP-MACMINI01.local:8080"),
+            "http://tp-macmini01.local:8080/v1"
+        );
+        assert_eq!(
+            normalize_base_url("http://TP-MACMINI01.local:8080/v1"),
+            "http://TP-MACMINI01.local:8080/v1"
+        );
+    }
+
+    #[test]
     fn builds_messages_api_request_from_complete_history() {
-        let mut context = TauContext::new();
-        context.set_model("claude-sonnet-4-5");
-        context.push_system_text("be helpful");
-        context.push_user_text("hello");
-        context.push_agent_text("I'll call a tool.");
-        context.push_item(ConversationItem::ToolUse {
-            calls: vec![ToolUse {
-                id: "toolu_1".to_string(),
-                name: "echo".to_string(),
-                input: json!({"text":"hello"}),
-            }],
-        });
-        context.push_item(ConversationItem::ToolResult {
-            results: vec![ToolResult {
-                call_id: "toolu_1".to_string(),
-                name: "echo".to_string(),
-                content: vec![ContentPart::json(json!({"text":"hello"}))],
-                error: None,
-            }],
-        });
+        let mut context = crate::context::TauContext::new();
         context
             .register_tool(ToolDefinition {
                 name: "echo".to_string(),
@@ -366,8 +376,26 @@ mod tests {
                 callback,
             })
             .unwrap();
-
-        let request = build_request(&context, DEFAULT_MAX_TOKENS).unwrap();
+        let mut session = context.session(AnthropicProvider::new("test-key"), "claude-sonnet-4-5");
+        session.push_system_text("be helpful");
+        session.push_user_text("hello");
+        session.push_agent_text("I'll call a tool.");
+        session.push_item(ConversationItem::ToolUse {
+            calls: vec![ToolUse {
+                id: "toolu_1".to_string(),
+                name: "echo".to_string(),
+                input: json!({"text":"hello"}),
+            }],
+        });
+        session.push_item(ConversationItem::ToolResult {
+            results: vec![ToolResult {
+                call_id: "toolu_1".to_string(),
+                name: "echo".to_string(),
+                content: vec![ContentPart::json(json!({"text":"hello"}))],
+                error: None,
+            }],
+        });
+        let request = build_request(&session, DEFAULT_MAX_TOKENS).unwrap();
         let value = serde_json::to_value(request).unwrap();
 
         assert_eq!(value["model"], "claude-sonnet-4-5");

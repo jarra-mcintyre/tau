@@ -1,13 +1,29 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::{
-    context::{ContentPart, ConversationItem, MediaData, TauContext, ToolResult, ToolUse},
-    providers::{Provider, ProviderError, ProviderResponse},
+    context::{ContentPart, ConversationItem, TauSession, ToolUse},
+    providers::{
+        Provider, ProviderApi, ProviderApiConfig, ProviderError, ProviderResponse,
+        common::{
+            assistant_content_as_text, binary_content_as_text, json_as_text, media_to_url,
+            tool_result_json,
+        },
+    },
 };
 
 pub const PROVIDER_NAME: &str = "openai";
+pub const API_NAME: &str = "openai_responses";
+pub const API_KEY_ENV: &str = "OPENAI_API_KEY";
+pub const API: ProviderApi = ProviderApi {
+    name: API_NAME,
+    api_key_env: API_KEY_ENV,
+    display_name: "OpenAI",
+    build: build_provider,
+};
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
 #[derive(Debug, Clone)]
@@ -22,16 +38,21 @@ pub struct OpenAiState {
     pub previous_response_id: Option<String>,
 }
 
+fn build_provider(config: ProviderApiConfig) -> Arc<dyn Provider> {
+    match config.base_url {
+        Some(base_url) => Arc::new(OpenAiProvider::with_base_url(config.api_key, base_url)),
+        None => Arc::new(OpenAiProvider::new(config.api_key)),
+    }
+}
+
 impl OpenAiProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::with_base_url(api_key, DEFAULT_BASE_URL)
     }
 
     pub fn from_env() -> Result<Self, ProviderError> {
-        let api_key = std::env::var("OPENAI_API_KEY").map_err(|_| {
-            ProviderError::Configuration(
-                "OPENAI_API_KEY environment variable is not set".to_string(),
-            )
+        let api_key = std::env::var(API_KEY_ENV).map_err(|_| {
+            ProviderError::Configuration(format!("{API_KEY_ENV} environment variable is not set"))
         })?;
         Ok(Self::new(api_key))
     }
@@ -51,8 +72,8 @@ impl Provider for OpenAiProvider {
         PROVIDER_NAME
     }
 
-    async fn respond(&self, context: &mut TauContext) -> Result<ProviderResponse, ProviderError> {
-        let request = build_request(context)?;
+    async fn respond(&self, session: &mut TauSession) -> Result<ProviderResponse, ProviderError> {
+        let request = build_request(session)?;
         let response = self
             .client
             .post(format!("{}/responses", self.base_url))
@@ -68,7 +89,7 @@ impl Provider for OpenAiProvider {
         }
 
         let response: OpenAiResponse = serde_json::from_str(&body)?;
-        context.set_provider_state(
+        session.set_provider_state(
             PROVIDER_NAME,
             OpenAiState {
                 previous_response_id: Some(response.id.clone()),
@@ -179,14 +200,14 @@ enum OpenAiOutputContent {
     Other,
 }
 
-fn build_request(context: &TauContext) -> Result<OpenAiRequest, ProviderError> {
-    let model = context
+fn build_request(session: &TauSession) -> Result<OpenAiRequest, ProviderError> {
+    let model = session
         .model()
         .ok_or(ProviderError::MissingModel)?
         .to_string();
 
     let mut input = Vec::new();
-    for item in &context.conversation().items {
+    for item in &session.conversation().items {
         match item {
             ConversationItem::System { content } => {
                 input.push(OpenAiInputItem::Message(OpenAiMessage {
@@ -230,7 +251,8 @@ fn build_request(context: &TauContext) -> Result<OpenAiRequest, ProviderError> {
         }
     }
 
-    let tools = context
+    let tools = session
+        .context()
         .tools()
         .map(|tool| OpenAiTool {
             kind: "function",
@@ -299,13 +321,13 @@ fn input_content_parts(parts: &[ContentPart]) -> Result<Vec<OpenAiContent>, Prov
         .map(|part| match part {
             ContentPart::Text { text } => Ok(OpenAiContent::InputText { text: text.clone() }),
             ContentPart::Json { value } => Ok(OpenAiContent::InputText {
-                text: serde_json::to_string(value)?,
+                text: json_as_text(value)?,
             }),
             ContentPart::Image { media_type, data } => Ok(OpenAiContent::InputImage {
                 image_url: media_to_url(media_type, data),
             }),
             ContentPart::Binary { media_type, data } => Ok(OpenAiContent::InputText {
-                text: format!("[binary content: {media_type}, {}]", media_data_label(data)),
+                text: binary_content_as_text(media_type, data),
             }),
         })
         .collect()
@@ -316,46 +338,22 @@ fn output_content_parts(parts: &[ContentPart]) -> Vec<OpenAiContent> {
         .iter()
         .map(|part| match part {
             ContentPart::Text { text } => OpenAiContent::OutputText { text: text.clone() },
-            ContentPart::Json { value } => OpenAiContent::OutputText {
-                text: value.to_string(),
+            part => OpenAiContent::OutputText {
+                text: assistant_content_as_text(part),
             },
-            ContentPart::Image { media_type, data } | ContentPart::Binary { media_type, data } => {
-                OpenAiContent::OutputText {
-                    text: format!("[media content: {media_type}, {}]", media_data_label(data)),
-                }
-            }
         })
         .collect()
 }
 
-fn tool_result_output(result: &ToolResult) -> Result<String, ProviderError> {
-    Ok(serde_json::to_string(&json!({
-        "name": result.name,
-        "error": result.error,
-        "content": result.content,
-    }))?)
-}
-
-fn media_to_url(media_type: &str, data: &MediaData) -> String {
-    match data {
-        MediaData::Url(url) => url.clone(),
-        MediaData::Base64(data) => format!("data:{media_type};base64,{data}"),
-        MediaData::Path(path) => path.clone(),
-    }
-}
-
-fn media_data_label(data: &MediaData) -> String {
-    match data {
-        MediaData::Url(url) => format!("url={url}"),
-        MediaData::Base64(data) => format!("base64_bytes={}", data.len()),
-        MediaData::Path(path) => format!("path={path}"),
-    }
+fn tool_result_output(result: &crate::context::ToolResult) -> Result<String, ProviderError> {
+    tool_result_json(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{ToolDefinition, ToolOutput};
+    use crate::context::{ToolDefinition, ToolOutput, ToolResult};
+    use serde_json::json;
 
     fn callback(input: Value) -> Result<ToolOutput, crate::context::ToolCallError> {
         Ok(ToolOutput::json(input))
@@ -363,25 +361,7 @@ mod tests {
 
     #[test]
     fn builds_responses_api_request_from_complete_history() {
-        let mut context = TauContext::new();
-        context.set_model("gpt-4.1-mini");
-        context.push_system_text("be helpful");
-        context.push_user_text("hello");
-        context.push_item(ConversationItem::ToolUse {
-            calls: vec![ToolUse {
-                id: "call_1".to_string(),
-                name: "echo".to_string(),
-                input: json!({"text":"hello"}),
-            }],
-        });
-        context.push_item(ConversationItem::ToolResult {
-            results: vec![ToolResult {
-                call_id: "call_1".to_string(),
-                name: "echo".to_string(),
-                content: vec![ContentPart::json(json!({"text":"hello"}))],
-                error: None,
-            }],
-        });
+        let mut context = crate::context::TauContext::new();
         context
             .register_tool(ToolDefinition {
                 name: "echo".to_string(),
@@ -390,8 +370,25 @@ mod tests {
                 callback,
             })
             .unwrap();
-
-        let request = build_request(&context).unwrap();
+        let mut session = context.session(OpenAiProvider::new("test-key"), "gpt-4.1-mini");
+        session.push_system_text("be helpful");
+        session.push_user_text("hello");
+        session.push_item(ConversationItem::ToolUse {
+            calls: vec![ToolUse {
+                id: "call_1".to_string(),
+                name: "echo".to_string(),
+                input: json!({"text":"hello"}),
+            }],
+        });
+        session.push_item(ConversationItem::ToolResult {
+            results: vec![ToolResult {
+                call_id: "call_1".to_string(),
+                name: "echo".to_string(),
+                content: vec![ContentPart::json(json!({"text":"hello"}))],
+                error: None,
+            }],
+        });
+        let request = build_request(&session).unwrap();
         let value = serde_json::to_value(request).unwrap();
 
         assert_eq!(value["model"], "gpt-4.1-mini");

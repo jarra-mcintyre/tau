@@ -12,8 +12,13 @@ pub type ProviderState = Arc<dyn Any + Send + Sync>;
 #[derive(Clone, Default)]
 pub struct TauContext {
     tools: BTreeMap<String, ToolDefinition>,
+}
+
+#[derive(Clone)]
+pub struct TauSession {
+    context: Arc<TauContext>,
     conversation: Conversation,
-    provider: Option<Arc<dyn Provider>>,
+    provider: Arc<dyn Provider>,
     provider_state: BTreeMap<String, ProviderState>,
 }
 
@@ -121,11 +126,17 @@ impl fmt::Debug for TauContext {
         formatter
             .debug_struct("TauContext")
             .field("tools", &self.tools)
+            .finish()
+    }
+}
+
+impl fmt::Debug for TauSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TauSession")
+            .field("context", &self.context)
             .field("conversation", &self.conversation)
-            .field(
-                "provider",
-                &self.provider.as_ref().map(|provider| provider.name()),
-            )
+            .field("provider", &self.provider.name())
             .field(
                 "provider_state_keys",
                 &self.provider_state.keys().collect::<Vec<_>>(),
@@ -139,26 +150,120 @@ impl TauContext {
         Self::default()
     }
 
-    pub fn with_provider_and_model(
+    pub fn session(
+        &self,
+        provider: impl Provider + 'static,
+        model: impl Into<String>,
+    ) -> TauSession {
+        TauSession::new(self.clone(), provider, model)
+    }
+
+    pub fn session_with_provider_arc(
+        &self,
+        provider: Arc<dyn Provider>,
+        model: impl Into<String>,
+    ) -> TauSession {
+        TauSession::new_with_provider_arc(self.clone(), provider, model)
+    }
+
+    pub fn register_tool(
+        &mut self,
+        definition: ToolDefinition,
+    ) -> Result<(), ToolRegistrationError> {
+        if self.tools.contains_key(&definition.name) {
+            return Err(ToolRegistrationError::DuplicateName(definition.name));
+        }
+
+        self.tools.insert(definition.name.clone(), definition);
+        Ok(())
+    }
+
+    pub fn tools(&self) -> impl Iterator<Item = &ToolDefinition> {
+        self.tools.values()
+    }
+
+    pub fn get_tool(&self, name: &str) -> Option<&ToolDefinition> {
+        self.tools.get(name)
+    }
+
+    pub fn call_tool(&self, name: &str, input: Value) -> Result<ToolOutput, ToolCallError> {
+        let tool = self
+            .get_tool(name)
+            .ok_or_else(|| ToolCallError::UnknownTool(name.to_string()))?;
+
+        (tool.callback)(input)
+    }
+
+    pub fn call_tool_json(&self, name: &str, input: Value) -> Result<Value, ToolCallError> {
+        match self.call_tool(name, input)?.content.as_slice() {
+            [ContentPart::Json { value }] => Ok(value.clone()),
+            other => serde_json::to_value(other)
+                .map_err(|error| ToolCallError::OutputSerializationFailed(error.to_string())),
+        }
+    }
+
+    pub fn call_tools_parallel(&self, calls: &[ToolUse]) -> Vec<ToolResult> {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = calls
+                .iter()
+                .map(|call| {
+                    scope.spawn(
+                        move || match self.call_tool(&call.name, call.input.clone()) {
+                            Ok(output) => ToolResult {
+                                call_id: call.id.clone(),
+                                name: call.name.clone(),
+                                content: output.content,
+                                error: None,
+                            },
+                            Err(error) => ToolResult {
+                                call_id: call.id.clone(),
+                                name: call.name.clone(),
+                                content: vec![ContentPart::text(format!("{error:?}"))],
+                                error: Some(format!("{error:?}")),
+                            },
+                        },
+                    )
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("tool call thread panicked"))
+                .collect()
+        })
+    }
+}
+
+impl TauSession {
+    pub fn new(
+        context: TauContext,
         provider: impl Provider + 'static,
         model: impl Into<String>,
     ) -> Self {
-        let mut context = Self::new();
-        context.set_provider(provider);
-        context.set_model(model);
-        context
+        Self::new_with_provider_arc(context, Arc::new(provider), model)
     }
 
-    pub fn set_provider(&mut self, provider: impl Provider + 'static) {
-        self.provider = Some(Arc::new(provider));
+    pub fn new_with_provider_arc(
+        context: TauContext,
+        provider: Arc<dyn Provider>,
+        model: impl Into<String>,
+    ) -> Self {
+        let mut conversation = Conversation::default();
+        conversation.model = Some(model.into());
+        Self {
+            context: Arc::new(context),
+            conversation,
+            provider,
+            provider_state: BTreeMap::new(),
+        }
     }
 
-    pub fn set_provider_arc(&mut self, provider: Arc<dyn Provider>) {
-        self.provider = Some(provider);
+    pub fn context(&self) -> &TauContext {
+        &self.context
     }
 
-    pub fn provider(&self) -> Option<&dyn Provider> {
-        self.provider.as_deref()
+    pub fn provider(&self) -> &dyn Provider {
+        self.provider.as_ref()
     }
 
     pub fn set_model(&mut self, model: impl Into<String>) {
@@ -237,72 +342,8 @@ impl TauContext {
             .and_then(|state| state.downcast::<T>().ok())
     }
 
-    pub fn register_tool(
-        &mut self,
-        definition: ToolDefinition,
-    ) -> Result<(), ToolRegistrationError> {
-        if self.tools.contains_key(&definition.name) {
-            return Err(ToolRegistrationError::DuplicateName(definition.name));
-        }
-
-        self.tools.insert(definition.name.clone(), definition);
-
-        Ok(())
-    }
-
-    pub fn tools(&self) -> impl Iterator<Item = &ToolDefinition> {
-        self.tools.values()
-    }
-
-    pub fn get_tool(&self, name: &str) -> Option<&ToolDefinition> {
-        self.tools.get(name)
-    }
-
-    pub fn call_tool(&self, name: &str, input: Value) -> Result<ToolOutput, ToolCallError> {
-        let tool = self
-            .get_tool(name)
-            .ok_or_else(|| ToolCallError::UnknownTool(name.to_string()))?;
-
-        (tool.callback)(input)
-    }
-
-    pub fn call_tool_json(&self, name: &str, input: Value) -> Result<Value, ToolCallError> {
-        match self.call_tool(name, input)?.content.as_slice() {
-            [ContentPart::Json { value }] => Ok(value.clone()),
-            other => serde_json::to_value(other)
-                .map_err(|error| ToolCallError::OutputSerializationFailed(error.to_string())),
-        }
-    }
-
     pub fn call_tools_parallel(&self, calls: &[ToolUse]) -> Vec<ToolResult> {
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = calls
-                .iter()
-                .map(|call| {
-                    scope.spawn(
-                        move || match self.call_tool(&call.name, call.input.clone()) {
-                            Ok(output) => ToolResult {
-                                call_id: call.id.clone(),
-                                name: call.name.clone(),
-                                content: output.content,
-                                error: None,
-                            },
-                            Err(error) => ToolResult {
-                                call_id: call.id.clone(),
-                                name: call.name.clone(),
-                                content: vec![ContentPart::text(format!("{error:?}"))],
-                                error: Some(format!("{error:?}")),
-                            },
-                        },
-                    )
-                })
-                .collect();
-
-            handles
-                .into_iter()
-                .map(|handle| handle.join().expect("tool call thread panicked"))
-                .collect()
-        })
+        self.context.call_tools_parallel(calls)
     }
 
     pub fn call_tools_parallel_and_record(&mut self, calls: &[ToolUse]) -> Vec<ToolResult> {
@@ -350,10 +391,6 @@ impl TauContext {
         content: Vec<ContentPart>,
         mut on_event: impl FnMut(TauEvent),
     ) -> Result<TauResponse, ProviderError> {
-        self.provider
-            .as_ref()
-            .ok_or(ProviderError::MissingProvider)?;
-
         self.push_user_content(content.clone());
         on_event(TauEvent::UserMessage(content));
 
@@ -364,11 +401,7 @@ impl TauContext {
     }
 
     pub async fn request_response(&mut self) -> Result<TauResponse, ProviderError> {
-        let provider = self
-            .provider
-            .clone()
-            .ok_or(ProviderError::MissingProvider)?;
-
+        let provider = self.provider.clone();
         let response = provider.respond(self).await?;
         self.record_provider_response(&response);
 
@@ -479,7 +512,7 @@ mod tests {
 
         async fn respond(
             &self,
-            _context: &mut TauContext,
+            _session: &mut TauSession,
         ) -> Result<ProviderResponse, ProviderError> {
             Ok(ProviderResponse {
                 content: vec![],
@@ -502,7 +535,8 @@ mod tests {
             .map(|definition| definition.name.as_str())
             .collect();
 
-        assert_eq!(names, vec!["edit_file", "read_file", "write_file"]);
+        assert_eq!(names, vec!["bash", "edit_file", "read_file", "write_file"]);
+        assert!(context.get_tool("bash").is_some());
         assert!(context.get_tool("read_file").is_some());
         assert!(context.get_tool("edit_file").is_some());
         assert!(context.get_tool("write_file").is_some());
@@ -537,11 +571,11 @@ mod tests {
             .build()
             .unwrap()
             .block_on(async {
-                let mut context = TauContext::with_provider_and_model(StubProvider, "gpt-test");
-                context.set_system_message("be helpful");
+                let mut session = TauContext::new().session(StubProvider, "gpt-test");
+                session.set_system_message("be helpful");
 
                 let mut events = Vec::new();
-                let response = context
+                let response = session
                     .send_message_with_events("read the readme", |event| events.push(event))
                     .await
                     .unwrap();
@@ -565,21 +599,18 @@ mod tests {
                         }])
                     ]
                 );
-                assert_eq!(context.model(), Some("gpt-test"));
-                assert_eq!(context.conversation().items.len(), 3);
+                assert_eq!(session.model(), Some("gpt-test"));
+                assert_eq!(session.conversation().items.len(), 3);
             });
     }
 
     #[test]
-    fn stores_conversation_history_and_parallel_tool_results() {
+    fn session_stores_conversation_history_and_parallel_tool_results() {
         fn echo(input: Value) -> Result<ToolOutput, ToolCallError> {
             Ok(ToolOutput::json(input))
         }
 
         let mut context = TauContext::new();
-        context.set_model("gpt-4.1");
-        context.push_system_text("system");
-        context.push_user_text("hello");
         context
             .register_tool(ToolDefinition {
                 name: "echo".to_string(),
@@ -588,16 +619,19 @@ mod tests {
                 callback: echo,
             })
             .unwrap();
+        let mut session = context.session(StubProvider, "gpt-4.1");
+        session.push_system_text("system");
+        session.push_user_text("hello");
 
         let calls = vec![ToolUse {
             id: "call_1".to_string(),
             name: "echo".to_string(),
             input: serde_json::json!({ "ok": true }),
         }];
-        let results = context.call_tools_parallel_and_record(&calls);
+        let results = session.call_tools_parallel_and_record(&calls);
 
-        assert_eq!(context.model(), Some("gpt-4.1"));
-        assert_eq!(context.conversation().items.len(), 3);
+        assert_eq!(session.model(), Some("gpt-4.1"));
+        assert_eq!(session.conversation().items.len(), 3);
         assert_eq!(
             results[0].content,
             vec![ContentPart::json(serde_json::json!({ "ok": true }))]

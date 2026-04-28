@@ -5,15 +5,15 @@ use std::{
 };
 
 use libtau::{
-    context::{ContentPart, TauContext, TauResponse, ToolResult, ToolUse},
-    providers::{anthropic::AnthropicProvider, openai::OpenAiProvider},
+    context::{ContentPart, TauContext, TauResponse, TauSession, ToolResult, ToolUse},
+    providers::{ProviderApi, ProviderApiConfig, find_provider_api, openai},
     tools,
 };
 use serde::Deserialize;
 
 const CONFIG_PATH: &str = ".tau/providers.json";
 const DEFAULT_PROVIDER: &str = "openai";
-const DEFAULT_API: &str = "openai_responses";
+const DEFAULT_API: &str = openai::API_NAME;
 const DEFAULT_MODEL: &str = "gpt-4.1-mini";
 const SYSTEM_MESSAGE: &str = r#"You are Tau, a coding agent running in a terminal.
 
@@ -50,11 +50,10 @@ struct ProviderConfig {
 #[derive(Debug, Clone)]
 struct CliConfig {
     provider_name: String,
-    provider_api: String,
+    provider_api: &'static ProviderApi,
     model: String,
     available_models: Vec<String>,
-    api_key: String,
-    base_url: Option<String>,
+    provider_config: ProviderApiConfig,
     config_path: Option<PathBuf>,
 }
 
@@ -68,30 +67,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli_config = load_cli_config()?;
     let mut context = TauContext::new();
-    match cli_config.provider_api.as_str() {
-        "openai_responses" => match &cli_config.base_url {
-            Some(base_url) => context.set_provider(OpenAiProvider::with_base_url(
-                cli_config.api_key.clone(),
-                base_url,
-            )),
-            None => context.set_provider(OpenAiProvider::new(cli_config.api_key.clone())),
-        },
-        "anthropic_messages" => match &cli_config.base_url {
-            Some(base_url) => context.set_provider(AnthropicProvider::with_base_url(
-                cli_config.api_key.clone(),
-                base_url,
-            )),
-            None => context.set_provider(AnthropicProvider::new(cli_config.api_key.clone())),
-        },
-        api => return Err(format!("unsupported provider API: {api}").into()),
-    }
-    context.set_model(cli_config.model.clone());
-    context.set_system_message(SYSTEM_MESSAGE);
     tools::register_builtin_tools(&mut context)?;
+
+    let provider = cli_config
+        .provider_api
+        .build_provider(cli_config.provider_config.clone());
+    let mut session = context.session_with_provider_arc(provider, cli_config.model.clone());
+    session.set_system_message(SYSTEM_MESSAGE);
 
     println!("Tau interactive shell");
     println!("provider: {}", cli_config.provider_name);
-    println!("api: {}", cli_config.provider_api);
+    println!("api: {}", cli_config.provider_api.name);
     println!("model: {}", cli_config.model);
     if let Some(path) = &cli_config.config_path {
         println!("config: {}", path.display());
@@ -125,7 +111,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        if let Err(error) = run_turn(&mut context, line).await {
+        if let Err(error) = run_turn(&mut session, line).await {
             eprintln!("error: {error}");
         }
     }
@@ -148,16 +134,10 @@ fn load_cli_config() -> Result<CliConfig, Box<dyn std::error::Error>> {
         .cloned()
         .unwrap_or_default();
 
-    let provider_api = provider_config
+    let provider_api_name = provider_config
         .api
         .clone()
-        .or_else(|| {
-            if provider_name == DEFAULT_PROVIDER {
-                Some(DEFAULT_API.to_string())
-            } else {
-                None
-            }
-        })
+        .or_else(|| default_provider_api_name(&provider_name).map(str::to_string))
         .ok_or_else(|| {
             format!(
                 "provider '{provider_name}' must specify an api in {}",
@@ -167,6 +147,8 @@ fn load_cli_config() -> Result<CliConfig, Box<dyn std::error::Error>> {
                     .unwrap_or_else(|| CONFIG_PATH.to_string())
             )
         })?;
+    let provider_api = find_provider_api(&provider_api_name)
+        .ok_or_else(|| format!("unsupported provider API: {provider_api_name}"))?;
 
     let model = std::env::var("TAU_MODEL")
         .ok()
@@ -186,33 +168,25 @@ fn load_cli_config() -> Result<CliConfig, Box<dyn std::error::Error>> {
         .into());
     }
 
-    let api_key = match provider_api.as_str() {
-        "openai_responses" => std::env::var("OPENAI_API_KEY")
-            .ok()
-            .or(provider_config.api_key.clone())
-            .ok_or_else(|| {
-                format!(
-                    "missing OpenAI API key; set OPENAI_API_KEY or providers.{provider_name}.api_key in ~/.tau/providers.json"
-                )
-            })?,
-        "anthropic_messages" => std::env::var("ANTHROPIC_API_KEY")
-            .ok()
-            .or(provider_config.api_key.clone())
-            .ok_or_else(|| {
-                format!(
-                    "missing Anthropic API key; set ANTHROPIC_API_KEY or providers.{provider_name}.api_key in ~/.tau/providers.json"
-                )
-            })?,
-        api => return Err(format!("unsupported provider API: {api}").into()),
-    };
+    let api_key = std::env::var(provider_api.api_key_env)
+        .ok()
+        .or(provider_config.api_key.clone())
+        .ok_or_else(|| {
+            format!(
+                "missing {} API key; set {} or providers.{provider_name}.api_key in ~/.tau/providers.json",
+                provider_api.display_name, provider_api.api_key_env
+            )
+        })?;
 
     Ok(CliConfig {
         provider_name,
         provider_api,
         model,
         available_models: provider_config.models,
-        api_key,
-        base_url: provider_config.base_url,
+        provider_config: ProviderApiConfig {
+            api_key,
+            base_url: provider_config.base_url,
+        },
         config_path,
     })
 }
@@ -234,6 +208,10 @@ fn load_providers_config() -> Result<(ProvidersConfig, Option<PathBuf>), Box<dyn
     Ok((config, Some(path)))
 }
 
+fn default_provider_api_name(provider_name: &str) -> Option<&'static str> {
+    (provider_name == DEFAULT_PROVIDER).then_some(DEFAULT_API)
+}
+
 fn providers_config_path() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -244,7 +222,7 @@ fn print_models(config: &CliConfig) {
     if config.available_models.is_empty() {
         println!(
             "no models configured for provider '{}' ({})",
-            config.provider_name, config.provider_api
+            config.provider_name, config.provider_api.name
         );
         println!("current model: {}", config.model);
         return;
@@ -260,7 +238,7 @@ fn print_models(config: &CliConfig) {
 }
 
 async fn run_turn(
-    context: &mut TauContext,
+    context: &mut TauSession,
     user_message: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut response = context.send_message(user_message).await?;
@@ -287,7 +265,7 @@ async fn run_turn(
     }
 }
 
-fn run_tools(context: &mut TauContext, tool_calls: &[ToolUse]) -> Vec<ToolResult> {
+fn run_tools(context: &mut TauSession, tool_calls: &[ToolUse]) -> Vec<ToolResult> {
     for call in tool_calls {
         println!("[tool] {}({})", call.name, compact_json(&call.input));
     }

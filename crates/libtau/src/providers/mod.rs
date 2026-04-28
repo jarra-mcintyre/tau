@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
-use crate::context::{ContentPart, TauContext, ToolUse};
+use crate::context::{ContentPart, TauSession, ToolUse};
 
 pub mod anthropic;
+pub mod common;
 pub mod openai;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -42,5 +45,35 @@ pub enum ProviderError {
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
 
-    async fn respond(&self, context: &mut TauContext) -> Result<ProviderResponse, ProviderError>;
+    async fn respond(&self, session: &mut TauSession) -> Result<ProviderResponse, ProviderError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderApiConfig {
+    pub api_key: String,
+    pub base_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderApi {
+    pub name: &'static str,
+    pub api_key_env: &'static str,
+    pub display_name: &'static str,
+    pub build: fn(ProviderApiConfig) -> Arc<dyn Provider>,
+}
+
+impl ProviderApi {
+    pub fn build_provider(&self, config: ProviderApiConfig) -> Arc<dyn Provider> {
+        (self.build)(config)
+    }
+}
+
+pub fn available_provider_apis() -> &'static [ProviderApi] {
+    &[openai::API, anthropic::API]
+}
+
+pub fn find_provider_api(name: &str) -> Option<&'static ProviderApi> {
+    available_provider_apis()
+        .iter()
+        .find(|api| api.name == name)
 }
