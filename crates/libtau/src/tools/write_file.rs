@@ -4,7 +4,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::context::{TauContext, ToolCallError, ToolDefinition, ToolRegistrationError};
+use crate::context::{
+    TauContext, ToolCallError, ToolDefinition, ToolOutput, ToolRegistrationError,
+};
 
 pub const NAME: &str = "write_file";
 pub const DESCRIPTION: &str = "Create or overwrite a text file";
@@ -54,12 +56,13 @@ pub fn definition() -> Result<ToolDefinition, ToolRegistrationError> {
     ToolDefinition::new::<WriteFileInput>(NAME, DESCRIPTION, callback)
 }
 
-fn callback(input: Value) -> Result<Value, ToolCallError> {
+fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {
     let input: WriteFileInput = serde_json::from_value(input)
         .map_err(|error| ToolCallError::InvalidInput(error.to_string()))?;
     let output = write_file(input);
-    serde_json::to_value(output)
-        .map_err(|error| ToolCallError::OutputSerializationFailed(error.to_string()))
+    let value = serde_json::to_value(output)
+        .map_err(|error| ToolCallError::OutputSerializationFailed(error.to_string()))?;
+    Ok(ToolOutput::json(value))
 }
 
 pub fn write_file(input: WriteFileInput) -> WriteFileOutput {
