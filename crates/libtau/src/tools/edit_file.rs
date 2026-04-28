@@ -20,8 +20,8 @@ pub struct EditFileInput {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct Substitution {
-    pub old_contents: String,
-    pub new_contents: String,
+    pub old: String,
+    pub new: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -94,7 +94,7 @@ pub fn edit_file(input: EditFileInput) -> EditFileOutput {
     let mut resolved = Vec::with_capacity(input.substitutions.len());
 
     for (index, substitution) in input.substitutions.iter().enumerate() {
-        let matches = match find_exact_matches(&contents, &substitution.old_contents) {
+        let matches = match find_exact_matches(&contents, &substitution.old) {
             Ok(matches) => matches,
             Err(message) => {
                 return error_output(EditFileError {
@@ -117,7 +117,7 @@ pub fn edit_file(input: EditFileInput) -> EditFileOutput {
                 index,
                 start: *start,
                 end: *end,
-                new_contents: substitution.new_contents.clone(),
+                new_contents: substitution.new.clone(),
             }),
             _ => {
                 return error_output(EditFileError {
@@ -232,8 +232,8 @@ mod tests {
         let output = edit_file(EditFileInput {
             path: path.clone(),
             substitutions: vec![Substitution {
-                old_contents: "hello world".to_string(),
-                new_contents: "hello tau".to_string(),
+                old: "hello world".to_string(),
+                new: "hello tau".to_string(),
             }],
         });
 
@@ -252,8 +252,8 @@ mod tests {
         let output = edit_file(EditFileInput {
             path: path.clone(),
             substitutions: vec![Substitution {
-                old_contents: "fn main(){ println!(\"hi\"); }".to_string(),
-                new_contents: "fn main() {\n    println!(\"hello\");\n}".to_string(),
+                old: "fn main(){ println!(\"hi\"); }".to_string(),
+                new: "fn main() {\n    println!(\"hello\");\n}".to_string(),
             }],
         });
 
@@ -275,8 +275,8 @@ mod tests {
         let output = edit_file(EditFileInput {
             path: path.clone(),
             substitutions: vec![Substitution {
-                old_contents: "same".to_string(),
-                new_contents: "different".to_string(),
+                old: "same".to_string(),
+                new: "different".to_string(),
             }],
         });
 
@@ -298,8 +298,8 @@ mod tests {
         let output = edit_file(EditFileInput {
             path: path.clone(),
             substitutions: vec![Substitution {
-                old_contents: "not here".to_string(),
-                new_contents: "replacement".to_string(),
+                old: "not here".to_string(),
+                new: "replacement".to_string(),
             }],
         });
 
