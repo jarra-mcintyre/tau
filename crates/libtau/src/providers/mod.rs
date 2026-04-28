@@ -12,6 +12,14 @@ pub mod openai;
 pub struct ProviderResponse {
     pub content: Vec<ContentPart>,
     pub tool_calls: Vec<ToolUse>,
+    pub usage: Option<TokenUsage>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
 }
 
 impl ProviderResponse {

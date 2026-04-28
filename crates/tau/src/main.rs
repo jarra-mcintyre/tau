@@ -6,7 +6,7 @@ use std::{
 
 use libtau::{
     context::{ContentPart, TauContext, TauResponse, TauSession, ToolResult, ToolUse},
-    providers::{ProviderApi, ProviderApiConfig, find_provider_api, openai},
+    providers::{ProviderApi, ProviderApiConfig, TokenUsage, find_provider_api, openai},
     tools,
 };
 use serde::Deserialize;
@@ -242,6 +242,7 @@ async fn run_turn(
     user_message: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut response = context.send_message(user_message).await?;
+    print_token_usage(context.last_token_usage());
 
     loop {
         match response {
@@ -252,6 +253,7 @@ async fn run_turn(
             TauResponse::ToolUse(tool_calls) => {
                 run_tools(context, &tool_calls);
                 response = context.request_response().await?;
+                print_token_usage(context.last_token_usage());
             }
             TauResponse::MessageAndToolUse {
                 content,
@@ -260,6 +262,7 @@ async fn run_turn(
                 print_content(&content);
                 run_tools(context, &tool_calls);
                 response = context.request_response().await?;
+                print_token_usage(context.last_token_usage());
             }
         }
     }
@@ -280,6 +283,32 @@ fn run_tools(context: &mut TauSession, tool_calls: &[ToolUse]) -> Vec<ToolResult
     }
 
     results
+}
+
+fn print_token_usage(usage: Option<&TokenUsage>) {
+    let Some(usage) = usage else {
+        return;
+    };
+
+    match (usage.input_tokens, usage.output_tokens, usage.total_tokens) {
+        (Some(input), Some(output), Some(total)) => {
+            println!("[tokens] input={input}, output={output}, total={total}");
+        }
+        (input, output, total) => {
+            println!(
+                "[tokens] input={}, output={}, total={}",
+                format_optional_u64(input),
+                format_optional_u64(output),
+                format_optional_u64(total)
+            );
+        }
+    }
+}
+
+fn format_optional_u64(value: Option<u64>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn print_content(content: &[ContentPart]) {

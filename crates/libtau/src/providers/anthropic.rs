@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::{
     context::{ContentPart, ConversationItem, MediaData, TauSession, ToolResult, ToolUse},
     providers::{
-        Provider, ProviderApi, ProviderApiConfig, ProviderError, ProviderResponse,
+        Provider, ProviderApi, ProviderApiConfig, ProviderError, ProviderResponse, TokenUsage,
         common::{
             assistant_content_as_text, binary_content_as_text, json_as_text, tool_result_json,
         },
@@ -174,6 +174,13 @@ struct AnthropicTool {
 struct AnthropicResponse {
     #[serde(default)]
     content: Vec<AnthropicResponseContent>,
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AnthropicUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -275,6 +282,17 @@ fn push_message(
 }
 
 fn parse_response(response: AnthropicResponse) -> Result<ProviderResponse, ProviderError> {
+    let usage = response.usage.map(|usage| {
+        let total_tokens = match (usage.input_tokens, usage.output_tokens) {
+            (Some(input), Some(output)) => Some(input + output),
+            _ => None,
+        };
+        TokenUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens,
+        }
+    });
     let mut content = Vec::new();
     let mut tool_calls = Vec::new();
 
@@ -291,6 +309,7 @@ fn parse_response(response: AnthropicResponse) -> Result<ProviderResponse, Provi
     Ok(ProviderResponse {
         content,
         tool_calls,
+        usage,
     })
 }
 
@@ -412,6 +431,10 @@ mod tests {
     #[test]
     fn parses_text_and_parallel_tool_calls() {
         let response = AnthropicResponse {
+            usage: Some(AnthropicUsage {
+                input_tokens: Some(50),
+                output_tokens: Some(12),
+            }),
             content: vec![
                 AnthropicResponseContent::Text {
                     text: "I'll check.".to_string(),
@@ -435,5 +458,6 @@ mod tests {
         assert_eq!(parsed.tool_calls.len(), 2);
         assert_eq!(parsed.tool_calls[0].id, "toolu_a");
         assert_eq!(parsed.tool_calls[1].input, json!({"path":"README.md"}));
+        assert_eq!(parsed.usage.unwrap().total_tokens, Some(62));
     }
 }

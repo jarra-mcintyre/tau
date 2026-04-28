@@ -4,7 +4,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::providers::{Provider, ProviderError, ProviderResponse};
+use crate::providers::{Provider, ProviderError, ProviderResponse, TokenUsage};
 
 pub type ToolCallback = fn(Value) -> Result<ToolOutput, ToolCallError>;
 pub type ProviderState = Arc<dyn Any + Send + Sync>;
@@ -20,6 +20,7 @@ pub struct TauSession {
     conversation: Conversation,
     provider: Arc<dyn Provider>,
     provider_state: BTreeMap<String, ProviderState>,
+    last_token_usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -255,6 +256,7 @@ impl TauSession {
             conversation,
             provider,
             provider_state: BTreeMap::new(),
+            last_token_usage: None,
         }
     }
 
@@ -264,6 +266,10 @@ impl TauSession {
 
     pub fn provider(&self) -> &dyn Provider {
         self.provider.as_ref()
+    }
+
+    pub fn last_token_usage(&self) -> Option<&TokenUsage> {
+        self.last_token_usage.as_ref()
     }
 
     pub fn set_model(&mut self, model: impl Into<String>) {
@@ -403,6 +409,7 @@ impl TauSession {
     pub async fn request_response(&mut self) -> Result<TauResponse, ProviderError> {
         let provider = self.provider.clone();
         let response = provider.respond(self).await?;
+        self.last_token_usage = response.usage.clone();
         self.record_provider_response(&response);
 
         Ok(response.into())
@@ -521,6 +528,11 @@ mod tests {
                     name: "read_file".to_string(),
                     input: serde_json::json!({"path":"README.md"}),
                 }],
+                usage: Some(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    total_tokens: Some(15),
+                }),
             })
         }
     }
@@ -601,6 +613,7 @@ mod tests {
                 );
                 assert_eq!(session.model(), Some("gpt-test"));
                 assert_eq!(session.conversation().items.len(), 3);
+                assert_eq!(session.last_token_usage().unwrap().total_tokens, Some(15));
             });
     }
 

@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::{
     context::{ContentPart, ConversationItem, TauSession, ToolUse},
     providers::{
-        Provider, ProviderApi, ProviderApiConfig, ProviderError, ProviderResponse,
+        Provider, ProviderApi, ProviderApiConfig, ProviderError, ProviderResponse, TokenUsage,
         common::{
             assistant_content_as_text, binary_content_as_text, json_as_text, media_to_url,
             tool_result_json,
@@ -107,6 +107,8 @@ struct OpenAiRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OpenAiTool>,
     parallel_tool_calls: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_response_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -170,6 +172,14 @@ struct OpenAiResponse {
     id: String,
     #[serde(default)]
     output: Vec<OpenAiOutputItem>,
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    total_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -206,8 +216,13 @@ fn build_request(session: &TauSession) -> Result<OpenAiRequest, ProviderError> {
         .ok_or(ProviderError::MissingModel)?
         .to_string();
 
+    let previous_response_id = session
+        .provider_state::<OpenAiState>(PROVIDER_NAME)
+        .and_then(|state| state.previous_response_id.clone());
+    let items = incremental_input_items(session, previous_response_id.as_deref());
+
     let mut input = Vec::new();
-    for item in &session.conversation().items {
+    for item in items {
         match item {
             ConversationItem::System { content } => {
                 input.push(OpenAiInputItem::Message(OpenAiMessage {
@@ -267,10 +282,32 @@ fn build_request(session: &TauSession) -> Result<OpenAiRequest, ProviderError> {
         input,
         tools,
         parallel_tool_calls: true,
+        previous_response_id,
     })
 }
 
+fn incremental_input_items<'a>(
+    session: &'a TauSession,
+    previous_response_id: Option<&str>,
+) -> &'a [ConversationItem] {
+    if previous_response_id.is_none() {
+        return &session.conversation().items;
+    }
+
+    let items = &session.conversation().items;
+    let start = items
+        .iter()
+        .rposition(|item| matches!(item, ConversationItem::ToolUse { .. }))
+        .unwrap_or(items.len());
+    &items[start..]
+}
+
 fn parse_response(response: OpenAiResponse) -> Result<ProviderResponse, ProviderError> {
+    let usage = response.usage.map(|usage| TokenUsage {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        total_tokens: usage.total_tokens,
+    });
     let mut content = Vec::new();
     let mut tool_calls = Vec::new();
 
@@ -312,6 +349,7 @@ fn parse_response(response: OpenAiResponse) -> Result<ProviderResponse, Provider
     Ok(ProviderResponse {
         content,
         tool_calls,
+        usage,
     })
 }
 
@@ -393,6 +431,7 @@ mod tests {
 
         assert_eq!(value["model"], "gpt-4.1-mini");
         assert_eq!(value["parallel_tool_calls"], true);
+        assert!(value.get("previous_response_id").is_none());
         assert_eq!(value["tools"][0]["type"], "function");
         assert_eq!(value["input"][0]["role"], "system");
         assert_eq!(value["input"][2]["type"], "function_call");
@@ -400,9 +439,60 @@ mod tests {
     }
 
     #[test]
+    fn uses_previous_response_id_for_incremental_requests() {
+        let mut context = crate::context::TauContext::new();
+        context
+            .register_tool(ToolDefinition {
+                name: "echo".to_string(),
+                description: "echo input".to_string(),
+                input_schema: json!({"type":"object"}),
+                callback,
+            })
+            .unwrap();
+        let mut session = context.session(OpenAiProvider::new("test-key"), "gpt-4.1-mini");
+        session.push_system_text("be helpful");
+        session.push_user_text("hello");
+        session.push_agent_text("I'll call a tool.");
+        session.push_item(ConversationItem::ToolUse {
+            calls: vec![ToolUse {
+                id: "call_1".to_string(),
+                name: "echo".to_string(),
+                input: json!({"text":"hello"}),
+            }],
+        });
+        session.push_item(ConversationItem::ToolResult {
+            results: vec![ToolResult {
+                call_id: "call_1".to_string(),
+                name: "echo".to_string(),
+                content: vec![ContentPart::json(json!({"text":"hello"}))],
+                error: None,
+            }],
+        });
+        session.set_provider_state(
+            PROVIDER_NAME,
+            OpenAiState {
+                previous_response_id: Some("resp_previous".to_string()),
+            },
+        );
+
+        let request = build_request(&session).unwrap();
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["previous_response_id"], "resp_previous");
+        assert_eq!(value["input"].as_array().unwrap().len(), 2);
+        assert_eq!(value["input"][0]["type"], "function_call");
+        assert_eq!(value["input"][1]["type"], "function_call_output");
+    }
+
+    #[test]
     fn parses_text_and_parallel_function_calls() {
         let response = OpenAiResponse {
             id: "resp_1".to_string(),
+            usage: Some(OpenAiUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                total_tokens: Some(120),
+            }),
             output: vec![
                 OpenAiOutputItem::Message {
                     content: vec![OpenAiOutputContent::OutputText {
@@ -428,5 +518,6 @@ mod tests {
         assert_eq!(parsed.tool_calls.len(), 2);
         assert_eq!(parsed.tool_calls[0].id, "call_a");
         assert_eq!(parsed.tool_calls[1].input, json!({"path":"README.md"}));
+        assert_eq!(parsed.usage.unwrap().total_tokens, Some(120));
     }
 }
