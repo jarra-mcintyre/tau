@@ -268,6 +268,21 @@ impl TauSession {
         self.provider.as_ref()
     }
 
+    pub fn set_provider_arc(&mut self, provider: Arc<dyn Provider>) {
+        self.provider = provider;
+        self.provider_state.clear();
+        self.last_token_usage = None;
+    }
+
+    pub fn set_provider_and_model(
+        &mut self,
+        provider: Arc<dyn Provider>,
+        model: impl Into<String>,
+    ) {
+        self.set_provider_arc(provider);
+        self.set_model(model);
+    }
+
     pub fn last_token_usage(&self) -> Option<&TokenUsage> {
         self.last_token_usage.as_ref()
     }
