@@ -1,90 +1,28 @@
-use std::{
-    fmt, fs,
-    io::{self, Write},
-    path::PathBuf,
-    str::FromStr,
-    sync::Arc,
-};
+use std::io::{self, Write};
 
+use clap::Parser;
 use libtau::{
-    context::{
-        ContentPart, Conversation, TauContext, TauResponse, TauSession, ToolResult, ToolUse,
-    },
-    providers::{Provider, ProviderApi, ProviderApiConfig, TokenUsage, find_provider_api, openai},
+    context::{ContentPart, TauResponse, TauSession, ToolResult, ToolUse},
+    providers::TokenUsage,
     tools,
 };
-use serde::{Deserialize, Serialize};
 
-const CONFIG_PATH: &str = ".tau/providers.json";
-const SESSIONS_DIR: &str = ".tau/sessions";
-const DEFAULT_PROVIDER: &str = "openai";
-const DEFAULT_API: &str = openai::API_NAME;
-const DEFAULT_MODEL: &str = "gpt-4.1-mini";
+mod config;
+mod session;
+
+use config::CliConfig;
+use session::{load_or_create_session, save_session};
+
 const SYSTEM_MESSAGE: &str = r#"You are Tau, a coding agent running in a terminal.
 
 You can inspect and modify files using tools. When the user asks you to read, write, or edit files, use the available tools."#;
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(deny_unknown_fields)]
-struct ProvidersConfig {
-    #[serde(default)]
-    current_model: Option<String>,
-    #[serde(default)]
-    providers: Vec<ProviderConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(deny_unknown_fields)]
-struct ProviderConfig {
-    /// The user-facing provider name, e.g. "personal-openai".
-    #[serde(default)]
-    name: Option<String>,
-    /// The provider API implementation to use, e.g. "openai_responses" or "anthropic_messages".
-    #[serde(default)]
-    api: Option<String>,
-    #[serde(default)]
-    api_key: Option<String>,
-    #[serde(default)]
-    base_url: Option<String>,
-    #[serde(default)]
-    models: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ConfiguredProvider {
-    name: String,
-    provider_api: &'static ProviderApi,
-    api_key: Option<String>,
-    base_url: Option<String>,
-    models: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ModelSelection {
-    provider_name: String,
-    model: String,
-}
-
-#[derive(Debug, Clone)]
-struct CliConfig {
-    current_model: ModelSelection,
-    providers_config: ProvidersConfig,
-    providers: Vec<ConfiguredProvider>,
-    config_path: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PersistedSession {
-    id: String,
-    current_model: String,
-    conversation: Conversation,
-}
-
-#[derive(Debug, Clone)]
-struct SessionPersistence {
-    id: String,
-    path: PathBuf,
+#[derive(Debug, Parser)]
+#[command(version, about = "Tau interactive coding agent")]
+struct Args {
+    /// Resume a previous session by id.
+    #[arg(long, value_name = "SESSION_ID")]
+    resume: Option<String>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -95,17 +33,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cli_config = load_cli_config()?;
-    let mut context = TauContext::new();
+    let args = Args::parse();
+    let mut cli_config = CliConfig::load()?;
+    let mut context = libtau::context::TauContext::new();
     tools::register_builtin_tools(&mut context)?;
 
-    let (mut session, persistence) = load_or_create_session(&context, &mut cli_config)?;
-    save_session(&persistence, &cli_config.current_model, &session)?;
+    let (mut session, persistence) =
+        load_or_create_session(&context, &mut cli_config, SYSTEM_MESSAGE, args.resume)?;
+    save_session(&persistence, cli_config.current_model(), &session)?;
 
     println!("Tau interactive shell");
     println!("session: {}", persistence.id);
-    print_current_model(&cli_config.current_model);
-    if let Some(path) = &cli_config.config_path {
+    cli_config.print_current_model();
+    if let Some(path) = cli_config.config_path() {
         println!("config: {}", path.display());
     } else {
         println!("config: not found, using environment/defaults");
@@ -135,14 +75,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
         if line == "/models" {
-            print_models(&cli_config);
+            cli_config.print_models();
             continue;
         }
         if let Some(model_ref) = line.strip_prefix("/model ") {
-            match switch_model(&mut cli_config, &mut session, model_ref.trim()) {
+            match cli_config.switch_model(&mut session, model_ref.trim()) {
                 Ok(()) => {
-                    save_session(&persistence, &cli_config.current_model, &session)?;
-                    print_current_model(&cli_config.current_model);
+                    save_session(&persistence, cli_config.current_model(), &session)?;
+                    cli_config.print_current_model();
                 }
                 Err(error) => eprintln!("error: {error}"),
             }
@@ -150,366 +90,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         match run_turn(&mut session, line).await {
-            Ok(()) => save_session(&persistence, &cli_config.current_model, &session)?,
+            Ok(()) => save_session(&persistence, cli_config.current_model(), &session)?,
             Err(error) => {
-                let _ = save_session(&persistence, &cli_config.current_model, &session);
+                let _ = save_session(&persistence, cli_config.current_model(), &session);
                 eprintln!("error: {error}");
             }
         }
     }
 
     Ok(())
-}
-
-fn load_cli_config() -> Result<CliConfig, Box<dyn std::error::Error>> {
-    let (providers_config, config_path) = load_providers_config()?;
-    let providers = configured_providers(&providers_config, config_path.as_ref())?;
-    let current_model_ref = std::env::var("TAU_MODEL")
-        .ok()
-        .or(providers_config.current_model.clone())
-        .or_else(|| first_configured_model_ref(&providers))
-        .unwrap_or_else(|| format!("{DEFAULT_PROVIDER}/{DEFAULT_MODEL}"));
-    let current_model = current_model_ref.parse()?;
-    validate_model_selection(&providers, &current_model, config_path.as_ref())?;
-
-    Ok(CliConfig {
-        current_model,
-        providers_config,
-        providers,
-        config_path,
-    })
-}
-
-fn load_or_create_session(
-    context: &TauContext,
-    config: &mut CliConfig,
-) -> Result<(TauSession, SessionPersistence), Box<dyn std::error::Error>> {
-    let session_id = resume_session_id()?;
-    if let Some(session_id) = session_id {
-        let path = session_path(&session_id)?;
-        let persisted = read_session(&path)?;
-        let current_model: ModelSelection = persisted.current_model.parse()?;
-        validate_model_selection(
-            &config.providers,
-            &current_model,
-            config.config_path.as_ref(),
-        )?;
-        config.current_model = current_model;
-
-        let provider = build_provider_for_selection(config, &config.current_model)?;
-        let mut session =
-            context.session_with_provider_arc(provider, config.current_model.model.clone());
-        *session.conversation_mut() = persisted.conversation;
-        session.set_model(config.current_model.model.clone());
-
-        return Ok((
-            session,
-            SessionPersistence {
-                id: persisted.id,
-                path,
-            },
-        ));
-    }
-
-    let provider = build_provider_for_selection(config, &config.current_model)?;
-    let mut session =
-        context.session_with_provider_arc(provider, config.current_model.model.clone());
-    session.set_system_message(SYSTEM_MESSAGE);
-    let id = format!("session-{}", uuid::Uuid::new_v4());
-    let path = session_path(&id)?;
-
-    Ok((session, SessionPersistence { id, path }))
-}
-
-fn resume_session_id() -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1);
-    let Some(first) = args.next() else {
-        return Ok(None);
-    };
-
-    if first == "--resume" {
-        let id = args
-            .next()
-            .ok_or("--resume requires a session id, e.g. --resume session-...")?;
-        return Ok(Some(id));
-    }
-
-    Ok(Some(first))
-}
-
-fn read_session(path: &PathBuf) -> Result<PersistedSession, Box<dyn std::error::Error>> {
-    let contents = fs::read_to_string(path)
-        .map_err(|error| format!("failed to read session {}: {error}", path.display()))?;
-    serde_json::from_str(&contents)
-        .map_err(|error| format!("failed to parse session {}: {error}", path.display()).into())
-}
-
-fn save_session(
-    persistence: &SessionPersistence,
-    current_model: &ModelSelection,
-    session: &TauSession,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(parent) = persistence.path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let persisted = PersistedSession {
-        id: persistence.id.clone(),
-        current_model: current_model.to_string(),
-        conversation: session.conversation().clone(),
-    };
-    fs::write(
-        &persistence.path,
-        serde_json::to_string_pretty(&persisted)? + "\n",
-    )?;
-    Ok(())
-}
-
-fn session_path(session_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let Some(home) = std::env::var_os("HOME") else {
-        return Err("cannot persist session because HOME is not set".into());
-    };
-    Ok(PathBuf::from(home)
-        .join(SESSIONS_DIR)
-        .join(format!("{session_id}.json")))
-}
-
-fn configured_providers(
-    config: &ProvidersConfig,
-    config_path: Option<&PathBuf>,
-) -> Result<Vec<ConfiguredProvider>, Box<dyn std::error::Error>> {
-    let mut providers = Vec::new();
-
-    for provider_config in &config.providers {
-        let name = provider_config.name.clone().ok_or_else(|| {
-            format!(
-                "provider entry in {} is missing a name",
-                config_path_label(config_path)
-            )
-        })?;
-        let api_name = provider_config
-            .api
-            .clone()
-            .or_else(|| default_provider_api_name(&name).map(str::to_string))
-            .ok_or_else(|| {
-                format!(
-                    "provider '{name}' must specify an api in {}",
-                    config_path_label(config_path)
-                )
-            })?;
-        let provider_api = find_provider_api(&api_name)
-            .ok_or_else(|| format!("unsupported provider API: {api_name}"))?;
-
-        providers.push(ConfiguredProvider {
-            name,
-            provider_api,
-            api_key: provider_config.api_key.clone(),
-            base_url: provider_config.base_url.clone(),
-            models: provider_config.models.clone(),
-        });
-    }
-
-    if providers.is_empty() {
-        providers.push(ConfiguredProvider {
-            name: DEFAULT_PROVIDER.to_string(),
-            provider_api: find_provider_api(DEFAULT_API)
-                .expect("default provider API is registered"),
-            api_key: None,
-            base_url: None,
-            models: vec![DEFAULT_MODEL.to_string()],
-        });
-    }
-
-    Ok(providers)
-}
-
-fn first_configured_model_ref(providers: &[ConfiguredProvider]) -> Option<String> {
-    providers.iter().find_map(|provider| {
-        provider
-            .models
-            .first()
-            .map(|model| format!("{}/{model}", provider.name))
-    })
-}
-
-impl FromStr for ModelSelection {
-    type Err = String;
-
-    fn from_str(model_ref: &str) -> Result<Self, Self::Err> {
-        let Some((provider_name, model)) = model_ref.split_once('/') else {
-            return Err(format!(
-                "model must be specified as provider/model, got '{model_ref}'"
-            ));
-        };
-        if provider_name.is_empty() || model.is_empty() {
-            return Err(format!(
-                "model must be specified as provider/model, got '{model_ref}'"
-            ));
-        }
-
-        Ok(Self {
-            provider_name: provider_name.to_string(),
-            model: model.to_string(),
-        })
-    }
-}
-
-impl fmt::Display for ModelSelection {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}/{}", self.provider_name, self.model)
-    }
-}
-
-fn validate_model_selection(
-    providers: &[ConfiguredProvider],
-    selection: &ModelSelection,
-    config_path: Option<&PathBuf>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let provider = providers
-        .iter()
-        .find(|provider| provider.name == selection.provider_name)
-        .ok_or_else(|| {
-            format!(
-                "provider '{}' is not configured in {}",
-                selection.provider_name,
-                config_path_label(config_path)
-            )
-        })?;
-
-    if !provider.models.is_empty() && !provider.models.contains(&selection.model) {
-        return Err(format!(
-            "model '{}' is not listed for provider '{}' in {}",
-            selection.model,
-            selection.provider_name,
-            config_path_label(config_path)
-        )
-        .into());
-    }
-
-    Ok(())
-}
-
-fn build_provider_for_selection(
-    config: &CliConfig,
-    selection: &ModelSelection,
-) -> Result<Arc<dyn Provider>, Box<dyn std::error::Error>> {
-    let provider = config
-        .providers
-        .iter()
-        .find(|provider| provider.name == selection.provider_name)
-        .ok_or_else(|| format!("provider '{}' is not configured", selection.provider_name))?;
-    let api_key = std::env::var(provider.provider_api.api_key_env)
-        .ok()
-        .or(provider.api_key.clone())
-        .ok_or_else(|| {
-            format!(
-                "missing {} API key; set {} or providers.{}.api_key in ~/.tau/providers.json",
-                provider.provider_api.display_name,
-                provider.provider_api.api_key_env,
-                provider.name
-            )
-        })?;
-
-    Ok(provider.provider_api.build_provider(ProviderApiConfig {
-        api_key,
-        base_url: provider.base_url.clone(),
-    }))
-}
-
-fn config_path_label(config_path: Option<&PathBuf>) -> String {
-    config_path
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| CONFIG_PATH.to_string())
-}
-
-fn load_providers_config() -> Result<(ProvidersConfig, Option<PathBuf>), Box<dyn std::error::Error>>
-{
-    let Some(path) = providers_config_path() else {
-        return Ok((ProvidersConfig::default(), None));
-    };
-
-    if !path.exists() {
-        return Ok((ProvidersConfig::default(), None));
-    }
-
-    let contents = fs::read_to_string(&path)?;
-    let config = serde_json::from_str(&contents)
-        .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
-
-    Ok((config, Some(path)))
-}
-
-fn default_provider_api_name(provider_name: &str) -> Option<&'static str> {
-    (provider_name == DEFAULT_PROVIDER).then_some(DEFAULT_API)
-}
-
-fn providers_config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(CONFIG_PATH))
-}
-
-fn print_models(config: &CliConfig) {
-    let mut printed_current = false;
-    for provider in &config.providers {
-        for model in &provider.models {
-            let selection = ModelSelection {
-                provider_name: provider.name.clone(),
-                model: model.clone(),
-            };
-            if selection == config.current_model {
-                printed_current = true;
-                println!("* {selection}");
-            } else {
-                println!("  {selection}");
-            }
-        }
-    }
-
-    if !printed_current {
-        println!("* {}", config.current_model);
-    }
-}
-
-fn switch_model(
-    config: &mut CliConfig,
-    session: &mut TauSession,
-    model_ref: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let selection = model_ref.parse()?;
-    validate_model_selection(&config.providers, &selection, config.config_path.as_ref())?;
-    let provider = build_provider_for_selection(config, &selection)?;
-    save_current_model(config, &selection)?;
-    session.set_provider_and_model(provider, selection.model.clone());
-    config.current_model = selection;
-    Ok(())
-}
-
-fn save_current_model(
-    config: &mut CliConfig,
-    selection: &ModelSelection,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let path = config
-        .config_path
-        .clone()
-        .or_else(providers_config_path)
-        .ok_or("cannot persist current model because HOME is not set")?;
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    config.providers_config.current_model = Some(selection.to_string());
-    fs::write(
-        &path,
-        serde_json::to_string_pretty(&config.providers_config)? + "\n",
-    )?;
-    config.config_path = Some(path);
-    Ok(())
-}
-
-fn print_current_model(selection: &ModelSelection) {
-    println!("model: {selection}");
 }
 
 async fn run_turn(
@@ -607,74 +196,4 @@ fn compact_json(value: &serde_json::Value) -> String {
 
 fn pretty_json(value: &serde_json::Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn provider(name: &str, models: &[&str]) -> ConfiguredProvider {
-        ConfiguredProvider {
-            name: name.to_string(),
-            provider_api: find_provider_api(DEFAULT_API).unwrap(),
-            api_key: None,
-            base_url: None,
-            models: models.iter().map(|model| model.to_string()).collect(),
-        }
-    }
-
-    #[test]
-    fn parses_and_displays_model_selection() {
-        let selection: ModelSelection = "openai/gpt-4.1".parse().unwrap();
-
-        assert_eq!(selection.provider_name, "openai");
-        assert_eq!(selection.model, "gpt-4.1");
-        assert_eq!(selection.to_string(), "openai/gpt-4.1");
-    }
-
-    #[test]
-    fn rejects_malformed_model_selection() {
-        assert!("gpt-4.1".parse::<ModelSelection>().is_err());
-        assert!("/gpt-4.1".parse::<ModelSelection>().is_err());
-        assert!("openai/".parse::<ModelSelection>().is_err());
-    }
-
-    #[test]
-    fn validates_model_selection_across_providers() {
-        let providers = vec![
-            provider("openai", &["gpt-4.1", "gpt-4.1-mini"]),
-            provider("anthropic", &["claude-sonnet-4"]),
-        ];
-
-        assert!(
-            validate_model_selection(
-                &providers,
-                &"anthropic/claude-sonnet-4".parse().unwrap(),
-                None
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_model_selection(&providers, &"openai/claude-sonnet-4".parse().unwrap(), None)
-                .is_err()
-        );
-        assert!(
-            validate_model_selection(&providers, &"google/gemini-pro".parse().unwrap(), None)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn chooses_first_configured_model_ref() {
-        let providers = vec![
-            provider("empty", &[]),
-            provider("anthropic", &["claude-sonnet-4"]),
-            provider("openai", &["gpt-4.1"]),
-        ];
-
-        assert_eq!(
-            first_configured_model_ref(&providers),
-            Some("anthropic/claude-sonnet-4".to_string())
-        );
-    }
 }
