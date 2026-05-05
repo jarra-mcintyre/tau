@@ -1,6 +1,6 @@
 use std::{
-    fs::OpenOptions,
     io::{self, Write},
+    path::PathBuf,
 };
 
 use clap::Parser;
@@ -9,8 +9,8 @@ use libtau::{
     providers::TokenUsage,
     tools,
 };
-use log::LevelFilter;
-use simplelog::{CombinedLogger, Config as LogConfig, WriteLogger};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod config;
 mod session;
@@ -31,7 +31,7 @@ struct Args {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_file_logging()?;
+    let _log_guard = init_file_logging()?;
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -39,22 +39,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .block_on(run())
 }
 
-fn init_file_logging() -> Result<(), Box<dyn std::error::Error>> {
-    let default_level = if cfg!(debug_assertions) {
-        LevelFilter::Debug
+fn init_file_logging() -> Result<WorkerGuard, Box<dyn std::error::Error>> {
+    let default_filter = if cfg!(debug_assertions) {
+        "debug"
     } else {
-        LevelFilter::Warn
+        "warn"
     };
-    let level = std::env::var("TAU_PROVIDER_LOG_LEVEL")
-        .ok()
-        .and_then(|value| value.parse::<LevelFilter>().ok())
-        .unwrap_or(default_level);
-    let path =
-        std::env::var("TAU_PROVIDER_LOG_FILE").unwrap_or_else(|_| "tau-providers.log".to_string());
-    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    let filter = EnvFilter::try_from_env("TAU_LOG_LEVEL")
+        .or_else(|_| EnvFilter::try_from_env("RUST_LOG"))
+        .unwrap_or_else(|_| EnvFilter::new(default_filter));
+    let log_dir = std::env::var_os("TAU_LOG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("logs"));
+    std::fs::create_dir_all(&log_dir)?;
 
-    CombinedLogger::init(vec![WriteLogger::new(level, LogConfig::default(), file)])?;
-    Ok(())
+    let file_appender = tracing_appender::rolling::daily(log_dir, "tau.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(non_blocking)
+                .with_ansi(false),
+        )
+        .try_init()?;
+
+    Ok(guard)
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {

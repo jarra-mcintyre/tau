@@ -75,11 +75,12 @@ impl Provider for OpenAiProvider {
     async fn respond(&self, session: &mut TauSession) -> Result<ProviderResponse, ProviderError> {
         let request = build_request(session)?;
         let url = format!("{}/responses", self.base_url);
-        log::debug!(
+        let request_body = serde_json::to_string_pretty(&request)?;
+        tracing::debug!(
             target: "tau::providers::openai",
-            "request url={} body={}",
-            url,
-            serde_json::to_string_pretty(&request)?
+            %url,
+            body = %request_body,
+            "request"
         );
 
         let response = self
@@ -92,11 +93,11 @@ impl Provider for OpenAiProvider {
 
         let status = response.status();
         let body = response.text().await?;
-        log::debug!(
+        tracing::debug!(
             target: "tau::providers::openai",
-            "response status={} body={}",
-            status,
-            body
+            %status,
+            body = %body,
+            "response"
         );
         if !status.is_success() {
             return Err(ProviderError::Api { status, body });
