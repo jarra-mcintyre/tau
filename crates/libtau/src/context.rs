@@ -42,10 +42,28 @@ pub enum ConversationItem {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
-    Text { text: String },
-    Json { value: Value },
-    Image { media_type: String, data: MediaData },
-    Binary { media_type: String, data: MediaData },
+    Text {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<Value>,
+    },
+    Json {
+        value: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<Value>,
+    },
+    Image {
+        media_type: String,
+        data: MediaData,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<Value>,
+    },
+    Binary {
+        media_type: String,
+        data: MediaData,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<Value>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -197,7 +215,7 @@ impl TauContext {
 
     pub fn call_tool_json(&self, name: &str, input: Value) -> Result<Value, ToolCallError> {
         match self.call_tool(name, input)?.content.as_slice() {
-            [ContentPart::Json { value }] => Ok(value.clone()),
+            [ContentPart::Json { value, .. }] => Ok(value.clone()),
             other => serde_json::to_value(other)
                 .map_err(|error| ToolCallError::OutputSerializationFailed(error.to_string())),
         }
@@ -475,11 +493,31 @@ impl From<ProviderResponse> for TauResponse {
 
 impl ContentPart {
     pub fn text(text: impl Into<String>) -> Self {
-        Self::Text { text: text.into() }
+        Self::Text {
+            text: text.into(),
+            metadata: None,
+        }
+    }
+
+    pub fn text_with_metadata(text: impl Into<String>, metadata: Value) -> Self {
+        Self::Text {
+            text: text.into(),
+            metadata: Some(metadata),
+        }
     }
 
     pub fn json(value: Value) -> Self {
-        Self::Json { value }
+        Self::Json {
+            value,
+            metadata: None,
+        }
+    }
+
+    pub fn json_with_metadata(value: Value, metadata: Value) -> Self {
+        Self::Json {
+            value,
+            metadata: Some(metadata),
+        }
     }
 }
 

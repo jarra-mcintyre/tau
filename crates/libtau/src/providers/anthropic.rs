@@ -93,9 +93,17 @@ impl Provider for AnthropicProvider {
 
     async fn respond(&self, session: &mut TauSession) -> Result<ProviderResponse, ProviderError> {
         let request = build_request(session, self.max_tokens)?;
+        let url = format!("{}/messages", self.base_url);
+        log::debug!(
+            target: "tau::providers::anthropic",
+            "request url={} body={}",
+            url,
+            serde_json::to_string_pretty(&request)?
+        );
+
         let response = self
             .client
-            .post(format!("{}/messages", self.base_url))
+            .post(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("anthropic-beta", ANTHROPIC_BETA)
@@ -105,6 +113,12 @@ impl Provider for AnthropicProvider {
 
         let status = response.status();
         let body = response.text().await?;
+        log::debug!(
+            target: "tau::providers::anthropic",
+            "response status={} body={}",
+            status,
+            body
+        );
         if !status.is_success() {
             return Err(ProviderError::Api { status, body });
         }
@@ -185,7 +199,7 @@ enum AnthropicTool {
 #[derive(Debug, Clone, Deserialize)]
 struct AnthropicResponse {
     #[serde(default)]
-    content: Vec<AnthropicResponseContent>,
+    content: Vec<Value>,
     usage: Option<AnthropicUsage>,
 }
 
@@ -196,18 +210,10 @@ struct AnthropicUsage {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum AnthropicResponseContent {
-    Text {
-        text: String,
-    },
-    ToolUse {
-        id: String,
-        name: String,
-        input: Value,
-    },
-    #[serde(other)]
-    Other,
+struct AnthropicToolUseOutput {
+    id: String,
+    name: String,
+    input: Value,
 }
 
 fn build_request(session: &TauSession, max_tokens: u32) -> Result<AnthropicRequest, ProviderError> {
@@ -324,12 +330,28 @@ fn parse_response(response: AnthropicResponse) -> Result<ProviderResponse, Provi
     let mut tool_calls = Vec::new();
 
     for part in response.content {
-        match part {
-            AnthropicResponseContent::Text { text } => content.push(ContentPart::text(text)),
-            AnthropicResponseContent::ToolUse { id, name, input } => {
-                tool_calls.push(ToolUse { id, name, input });
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                let text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    ProviderError::Response("Anthropic text block missing text".to_string())
+                })?;
+                content.push(ContentPart::text_with_metadata(
+                    text,
+                    raw_metadata("anthropic.content_block", part.clone()),
+                ));
             }
-            AnthropicResponseContent::Other => {}
+            Some("tool_use") => {
+                let tool_use: AnthropicToolUseOutput = serde_json::from_value(part)?;
+                tool_calls.push(ToolUse {
+                    id: tool_use.id,
+                    name: tool_use.name,
+                    input: tool_use.input,
+                });
+            }
+            _ => content.push(ContentPart::json_with_metadata(
+                part.clone(),
+                raw_metadata("anthropic.content_block", part),
+            )),
         }
     }
 
@@ -340,15 +362,25 @@ fn parse_response(response: AnthropicResponse) -> Result<ProviderResponse, Provi
     })
 }
 
+fn raw_metadata(kind: &str, raw: Value) -> Value {
+    serde_json::json!({
+        "provider": PROVIDER_NAME,
+        "kind": kind,
+        "raw": raw,
+    })
+}
+
 fn input_content_parts(parts: &[ContentPart]) -> Result<Vec<AnthropicContent>, ProviderError> {
     parts
         .iter()
         .map(|part| match part {
-            ContentPart::Text { text } => Ok(AnthropicContent::Text { text: text.clone() }),
-            ContentPart::Json { value } => Ok(AnthropicContent::Text {
+            ContentPart::Text { text, .. } => Ok(AnthropicContent::Text { text: text.clone() }),
+            ContentPart::Json { value, .. } => Ok(AnthropicContent::Text {
                 text: json_as_text(value)?,
             }),
-            ContentPart::Image { media_type, data } => match data {
+            ContentPart::Image {
+                media_type, data, ..
+            } => match data {
                 MediaData::Base64(data) => Ok(AnthropicContent::Image {
                     source: AnthropicImageSource::Base64 {
                         media_type: media_type.clone(),
@@ -362,7 +394,9 @@ fn input_content_parts(parts: &[ContentPart]) -> Result<Vec<AnthropicContent>, P
                     text: format!("[image content: {media_type}, path={path}]"),
                 }),
             },
-            ContentPart::Binary { media_type, data } => Ok(AnthropicContent::Text {
+            ContentPart::Binary {
+                media_type, data, ..
+            } => Ok(AnthropicContent::Text {
                 text: binary_content_as_text(media_type, data),
             }),
         })
@@ -373,7 +407,7 @@ fn output_content_parts(parts: &[ContentPart]) -> Vec<AnthropicContent> {
     parts
         .iter()
         .map(|part| match part {
-            ContentPart::Text { text } => AnthropicContent::Text { text: text.clone() },
+            ContentPart::Text { text, .. } => AnthropicContent::Text { text: text.clone() },
             part => AnthropicContent::Text {
                 text: assistant_content_as_text(part),
             },
@@ -467,25 +501,46 @@ mod tests {
                 output_tokens: Some(12),
             }),
             content: vec![
-                AnthropicResponseContent::Text {
-                    text: "I'll check.".to_string(),
-                },
-                AnthropicResponseContent::ToolUse {
-                    id: "toolu_a".to_string(),
-                    name: "read_file".to_string(),
-                    input: json!({"path":"Cargo.toml"}),
-                },
-                AnthropicResponseContent::ToolUse {
-                    id: "toolu_b".to_string(),
-                    name: "read_file".to_string(),
-                    input: json!({"path":"README.md"}),
-                },
+                json!({"type": "text", "text": "I'll check."}),
+                json!({
+                    "type": "tool_use",
+                    "id": "toolu_a",
+                    "name": "read_file",
+                    "input": {"path":"Cargo.toml"}
+                }),
+                json!({
+                    "type": "tool_use",
+                    "id": "toolu_b",
+                    "name": "read_file",
+                    "input": {"path":"README.md"}
+                }),
+                json!({"type": "server_tool_use", "id": "srv_1", "name": "web_search"}),
             ],
         };
 
         let parsed = parse_response(response).unwrap();
 
-        assert_eq!(parsed.content, vec![ContentPart::text("I'll check.")]);
+        assert_eq!(parsed.content.len(), 2);
+        match &parsed.content[0] {
+            ContentPart::Text { text, metadata } => {
+                assert_eq!(text, "I'll check.");
+                assert_eq!(
+                    metadata.as_ref().unwrap()["kind"],
+                    "anthropic.content_block"
+                );
+            }
+            other => panic!("expected text content, got {other:?}"),
+        }
+        match &parsed.content[1] {
+            ContentPart::Json { value, metadata } => {
+                assert_eq!(value["type"], "server_tool_use");
+                assert_eq!(
+                    metadata.as_ref().unwrap()["kind"],
+                    "anthropic.content_block"
+                );
+            }
+            other => panic!("expected json content, got {other:?}"),
+        }
         assert_eq!(parsed.tool_calls.len(), 2);
         assert_eq!(parsed.tool_calls[0].id, "toolu_a");
         assert_eq!(parsed.tool_calls[1].input, json!({"path":"README.md"}));

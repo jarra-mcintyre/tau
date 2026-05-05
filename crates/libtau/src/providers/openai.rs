@@ -74,9 +74,17 @@ impl Provider for OpenAiProvider {
 
     async fn respond(&self, session: &mut TauSession) -> Result<ProviderResponse, ProviderError> {
         let request = build_request(session)?;
+        let url = format!("{}/responses", self.base_url);
+        log::debug!(
+            target: "tau::providers::openai",
+            "request url={} body={}",
+            url,
+            serde_json::to_string_pretty(&request)?
+        );
+
         let response = self
             .client
-            .post(format!("{}/responses", self.base_url))
+            .post(&url)
             .bearer_auth(&self.api_key)
             .json(&request)
             .send()
@@ -84,6 +92,12 @@ impl Provider for OpenAiProvider {
 
         let status = response.status();
         let body = response.text().await?;
+        log::debug!(
+            target: "tau::providers::openai",
+            "response status={} body={}",
+            status,
+            body
+        );
         if !status.is_success() {
             return Err(ProviderError::Api { status, body });
         }
@@ -178,7 +192,7 @@ enum OpenAiTool {
 struct OpenAiResponse {
     id: String,
     #[serde(default)]
-    output: Vec<OpenAiOutputItem>,
+    output: Vec<Value>,
     usage: Option<OpenAiUsage>,
 }
 
@@ -190,31 +204,10 @@ struct OpenAiUsage {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum OpenAiOutputItem {
-    Message {
-        content: Vec<OpenAiOutputContent>,
-    },
-    FunctionCall {
-        call_id: String,
-        name: String,
-        arguments: String,
-    },
-    #[serde(other)]
-    Other,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum OpenAiOutputContent {
-    OutputText {
-        text: String,
-    },
-    Refusal {
-        refusal: String,
-    },
-    #[serde(other)]
-    Other,
+struct OpenAiFunctionCallOutput {
+    call_id: String,
+    name: String,
+    arguments: String,
 }
 
 fn build_request(session: &TauSession) -> Result<OpenAiRequest, ProviderError> {
@@ -296,9 +289,7 @@ fn openai_tools(session: &TauSession) -> Vec<OpenAiTool> {
         })
         .collect();
 
-    tools.push(OpenAiTool::Server {
-        kind: "web_search",
-    });
+    tools.push(OpenAiTool::Server { kind: "web_search" });
 
     tools
 }
@@ -329,37 +320,26 @@ fn parse_response(response: OpenAiResponse) -> Result<ProviderResponse, Provider
     let mut tool_calls = Vec::new();
 
     for item in response.output {
-        match item {
-            OpenAiOutputItem::Message { content: parts } => {
-                for part in parts {
-                    match part {
-                        OpenAiOutputContent::OutputText { text } => {
-                            content.push(ContentPart::text(text))
-                        }
-                        OpenAiOutputContent::Refusal { refusal } => {
-                            content.push(ContentPart::text(refusal))
-                        }
-                        OpenAiOutputContent::Other => {}
-                    }
-                }
-            }
-            OpenAiOutputItem::FunctionCall {
-                call_id,
-                name,
-                arguments,
-            } => {
-                let input = serde_json::from_str(&arguments).map_err(|error| {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => parse_message_output_item(item, &mut content)?,
+            Some("function_call") => {
+                let function_call: OpenAiFunctionCallOutput = serde_json::from_value(item.clone())?;
+                let input = serde_json::from_str(&function_call.arguments).map_err(|error| {
                     ProviderError::Response(format!(
-                        "function call {call_id} arguments were not JSON: {error}"
+                        "function call {} arguments were not JSON: {error}",
+                        function_call.call_id
                     ))
                 })?;
                 tool_calls.push(ToolUse {
-                    id: call_id,
-                    name,
+                    id: function_call.call_id,
+                    name: function_call.name,
                     input,
                 });
             }
-            OpenAiOutputItem::Other => {}
+            _ => content.push(ContentPart::json_with_metadata(
+                item.clone(),
+                raw_metadata("openai.output_item", item),
+            )),
         }
     }
 
@@ -370,18 +350,63 @@ fn parse_response(response: OpenAiResponse) -> Result<ProviderResponse, Provider
     })
 }
 
+fn parse_message_output_item(
+    item: Value,
+    content: &mut Vec<ContentPart>,
+) -> Result<(), ProviderError> {
+    let parts = item
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ProviderError::Response("OpenAI message output missing content array".to_string())
+        })?;
+
+    for part in parts {
+        let metadata = raw_metadata("openai.message_content", part.clone());
+        match part.get("type").and_then(Value::as_str) {
+            Some("output_text") => {
+                let text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    ProviderError::Response("OpenAI output_text missing text".to_string())
+                })?;
+                content.push(ContentPart::text_with_metadata(text, metadata));
+            }
+            Some("refusal") => {
+                let refusal = part.get("refusal").and_then(Value::as_str).ok_or_else(|| {
+                    ProviderError::Response("OpenAI refusal missing refusal text".to_string())
+                })?;
+                content.push(ContentPart::text_with_metadata(refusal, metadata));
+            }
+            _ => content.push(ContentPart::json_with_metadata(part.clone(), metadata)),
+        }
+    }
+
+    Ok(())
+}
+
+fn raw_metadata(kind: &str, raw: Value) -> Value {
+    serde_json::json!({
+        "provider": PROVIDER_NAME,
+        "kind": kind,
+        "raw": raw,
+    })
+}
+
 fn input_content_parts(parts: &[ContentPart]) -> Result<Vec<OpenAiContent>, ProviderError> {
     parts
         .iter()
         .map(|part| match part {
-            ContentPart::Text { text } => Ok(OpenAiContent::InputText { text: text.clone() }),
-            ContentPart::Json { value } => Ok(OpenAiContent::InputText {
+            ContentPart::Text { text, .. } => Ok(OpenAiContent::InputText { text: text.clone() }),
+            ContentPart::Json { value, .. } => Ok(OpenAiContent::InputText {
                 text: json_as_text(value)?,
             }),
-            ContentPart::Image { media_type, data } => Ok(OpenAiContent::InputImage {
+            ContentPart::Image {
+                media_type, data, ..
+            } => Ok(OpenAiContent::InputImage {
                 image_url: media_to_url(media_type, data),
             }),
-            ContentPart::Binary { media_type, data } => Ok(OpenAiContent::InputText {
+            ContentPart::Binary {
+                media_type, data, ..
+            } => Ok(OpenAiContent::InputText {
                 text: binary_content_as_text(media_type, data),
             }),
         })
@@ -392,7 +417,7 @@ fn output_content_parts(parts: &[ContentPart]) -> Vec<OpenAiContent> {
     parts
         .iter()
         .map(|part| match part {
-            ContentPart::Text { text } => OpenAiContent::OutputText { text: text.clone() },
+            ContentPart::Text { text, .. } => OpenAiContent::OutputText { text: text.clone() },
             part => OpenAiContent::OutputText {
                 text: assistant_content_as_text(part),
             },
@@ -512,27 +537,60 @@ mod tests {
                 total_tokens: Some(120),
             }),
             output: vec![
-                OpenAiOutputItem::Message {
-                    content: vec![OpenAiOutputContent::OutputText {
-                        text: "I'll check.".to_string(),
-                    }],
-                },
-                OpenAiOutputItem::FunctionCall {
-                    call_id: "call_a".to_string(),
-                    name: "read_file".to_string(),
-                    arguments: "{\"path\":\"Cargo.toml\"}".to_string(),
-                },
-                OpenAiOutputItem::FunctionCall {
-                    call_id: "call_b".to_string(),
-                    name: "read_file".to_string(),
-                    arguments: "{\"path\":\"README.md\"}".to_string(),
-                },
+                json!({
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "I'll check.",
+                        "annotations": [{
+                            "type": "url_citation",
+                            "start_index": 0,
+                            "end_index": 5,
+                            "url": "https://example.com",
+                            "title": "Example"
+                        }]
+                    }]
+                }),
+                json!({
+                    "type": "function_call",
+                    "call_id": "call_a",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"Cargo.toml\"}"
+                }),
+                json!({
+                    "type": "function_call",
+                    "call_id": "call_b",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"README.md\"}"
+                }),
+                json!({
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "completed",
+                    "action": {"type": "search", "query": "latest news about AI"}
+                }),
             ],
         };
 
         let parsed = parse_response(response).unwrap();
 
-        assert_eq!(parsed.content, vec![ContentPart::text("I'll check.")]);
+        assert_eq!(parsed.content.len(), 2);
+        match &parsed.content[0] {
+            ContentPart::Text { text, metadata } => {
+                assert_eq!(text, "I'll check.");
+                let metadata = metadata.as_ref().unwrap();
+                assert_eq!(metadata["kind"], "openai.message_content");
+                assert_eq!(metadata["raw"]["annotations"][0]["type"], "url_citation");
+            }
+            other => panic!("expected text content, got {other:?}"),
+        }
+        match &parsed.content[1] {
+            ContentPart::Json { value, metadata } => {
+                assert_eq!(value["type"], "web_search_call");
+                assert_eq!(metadata.as_ref().unwrap()["kind"], "openai.output_item");
+            }
+            other => panic!("expected json content, got {other:?}"),
+        }
         assert_eq!(parsed.tool_calls.len(), 2);
         assert_eq!(parsed.tool_calls[0].id, "call_a");
         assert_eq!(parsed.tool_calls[1].input, json!({"path":"README.md"}));

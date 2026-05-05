@@ -1,4 +1,7 @@
-use std::io::{self, Write};
+use std::{
+    fs::OpenOptions,
+    io::{self, Write},
+};
 
 use clap::Parser;
 use libtau::{
@@ -6,6 +9,8 @@ use libtau::{
     providers::TokenUsage,
     tools,
 };
+use log::LevelFilter;
+use simplelog::{CombinedLogger, Config as LogConfig, WriteLogger};
 
 mod config;
 mod session;
@@ -26,10 +31,30 @@ struct Args {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_file_logging()?;
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
         .block_on(run())
+}
+
+fn init_file_logging() -> Result<(), Box<dyn std::error::Error>> {
+    let default_level = if cfg!(debug_assertions) {
+        LevelFilter::Debug
+    } else {
+        LevelFilter::Warn
+    };
+    let level = std::env::var("TAU_PROVIDER_LOG_LEVEL")
+        .ok()
+        .and_then(|value| value.parse::<LevelFilter>().ok())
+        .unwrap_or(default_level);
+    let path =
+        std::env::var("TAU_PROVIDER_LOG_FILE").unwrap_or_else(|_| "tau-providers.log".to_string());
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+
+    CombinedLogger::init(vec![WriteLogger::new(level, LogConfig::default(), file)])?;
+    Ok(())
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -178,12 +203,16 @@ fn format_optional_u64(value: Option<u64>) -> String {
 fn print_content(content: &[ContentPart]) {
     for part in content {
         match part {
-            ContentPart::Text { text } => println!("{text}"),
-            ContentPart::Json { value } => println!("{}", pretty_json(value)),
-            ContentPart::Image { media_type, data } => {
+            ContentPart::Text { text, .. } => println!("{text}"),
+            ContentPart::Json { value, .. } => println!("{}", pretty_json(value)),
+            ContentPart::Image {
+                media_type, data, ..
+            } => {
                 println!("[image: {media_type}, {data:?}]");
             }
-            ContentPart::Binary { media_type, data } => {
+            ContentPart::Binary {
+                media_type, data, ..
+            } => {
                 println!("[binary: {media_type}, {data:?}]");
             }
         }

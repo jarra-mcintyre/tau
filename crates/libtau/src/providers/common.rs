@@ -11,9 +11,14 @@ pub fn json_as_text(value: &Value) -> Result<String, ProviderError> {
 
 pub fn assistant_content_as_text(part: &ContentPart) -> String {
     match part {
-        ContentPart::Text { text } => text.clone(),
-        ContentPart::Json { value } => value.to_string(),
-        ContentPart::Image { media_type, data } | ContentPart::Binary { media_type, data } => {
+        ContentPart::Text { text, .. } => text.clone(),
+        ContentPart::Json { value, .. } => value.to_string(),
+        ContentPart::Image {
+            media_type, data, ..
+        }
+        | ContentPart::Binary {
+            media_type, data, ..
+        } => {
             format!("[media content: {media_type}, {}]", media_data_label(data))
         }
     }
