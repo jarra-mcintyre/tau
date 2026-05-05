@@ -131,7 +131,9 @@ fn apply_line_range(contents: &str, first_line: Option<i64>, last_line: Option<i
         .enumerate()
         .filter_map(|(index, line)| {
             let line_number = index + 1;
-            if line_number < first_line || last_line.is_some_and(|last_line| line_number > last_line) {
+            if line_number < first_line
+                || last_line.is_some_and(|last_line| line_number > last_line)
+            {
                 None
             } else {
                 Some(line)

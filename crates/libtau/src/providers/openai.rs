@@ -159,12 +159,19 @@ struct OpenAiFunctionCallOutputItem {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
-struct OpenAiTool {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    name: String,
-    description: String,
-    parameters: Value,
+#[serde(untagged)]
+enum OpenAiTool {
+    Function {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        name: String,
+        description: String,
+        parameters: Value,
+    },
+    Server {
+        #[serde(rename = "type")]
+        kind: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -266,16 +273,7 @@ fn build_request(session: &TauSession) -> Result<OpenAiRequest, ProviderError> {
         }
     }
 
-    let tools = session
-        .context()
-        .tools()
-        .map(|tool| OpenAiTool {
-            kind: "function",
-            name: tool.name.clone(),
-            description: tool.description.clone(),
-            parameters: tool.input_schema.clone(),
-        })
-        .collect();
+    let tools = openai_tools(session);
 
     Ok(OpenAiRequest {
         model,
@@ -284,6 +282,25 @@ fn build_request(session: &TauSession) -> Result<OpenAiRequest, ProviderError> {
         parallel_tool_calls: true,
         previous_response_id,
     })
+}
+
+fn openai_tools(session: &TauSession) -> Vec<OpenAiTool> {
+    let mut tools: Vec<_> = session
+        .context()
+        .tools()
+        .map(|tool| OpenAiTool::Function {
+            kind: "function",
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+            parameters: tool.input_schema.clone(),
+        })
+        .collect();
+
+    tools.push(OpenAiTool::Server {
+        kind: "web_search",
+    });
+
+    tools
 }
 
 fn incremental_input_items<'a>(
@@ -433,6 +450,7 @@ mod tests {
         assert_eq!(value["parallel_tool_calls"], true);
         assert!(value.get("previous_response_id").is_none());
         assert_eq!(value["tools"][0]["type"], "function");
+        assert_eq!(value["tools"][1]["type"], "web_search");
         assert_eq!(value["input"][0]["role"], "system");
         assert_eq!(value["input"][2]["type"], "function_call");
         assert_eq!(value["input"][3]["type"], "function_call_output");

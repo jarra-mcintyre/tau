@@ -25,7 +25,10 @@ pub const API: ProviderApi = ProviderApi {
 };
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+const ANTHROPIC_BETA: &str = "web-fetch-2025-09-10";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
+const WEB_SEARCH_TOOL_TYPE: &str = "web_search_20250305";
+const WEB_FETCH_TOOL_TYPE: &str = "web_fetch_20250910";
 
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
@@ -95,6 +98,7 @@ impl Provider for AnthropicProvider {
             .post(format!("{}/messages", self.base_url))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("anthropic-beta", ANTHROPIC_BETA)
             .json(&request)
             .send()
             .await?;
@@ -164,10 +168,18 @@ enum AnthropicImageSource {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
-struct AnthropicTool {
-    name: String,
-    description: String,
-    input_schema: Value,
+#[serde(untagged)]
+enum AnthropicTool {
+    Custom {
+        name: String,
+        description: String,
+        input_schema: Value,
+    },
+    Server {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        name: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -243,15 +255,7 @@ fn build_request(session: &TauSession, max_tokens: u32) -> Result<AnthropicReque
         }
     }
 
-    let tools = session
-        .context()
-        .tools()
-        .map(|tool| AnthropicTool {
-            name: tool.name.clone(),
-            description: tool.description.clone(),
-            input_schema: tool.input_schema.clone(),
-        })
-        .collect();
+    let tools = anthropic_tools(session);
 
     Ok(AnthropicRequest {
         model,
@@ -260,6 +264,29 @@ fn build_request(session: &TauSession, max_tokens: u32) -> Result<AnthropicReque
         messages,
         tools,
     })
+}
+
+fn anthropic_tools(session: &TauSession) -> Vec<AnthropicTool> {
+    let mut tools: Vec<_> = session
+        .context()
+        .tools()
+        .map(|tool| AnthropicTool::Custom {
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+            input_schema: tool.input_schema.clone(),
+        })
+        .collect();
+
+    tools.push(AnthropicTool::Server {
+        kind: WEB_SEARCH_TOOL_TYPE,
+        name: "web_search",
+    });
+    tools.push(AnthropicTool::Server {
+        kind: WEB_FETCH_TOOL_TYPE,
+        name: "web_fetch",
+    });
+
+    tools
 }
 
 fn push_message(
@@ -421,6 +448,10 @@ mod tests {
         assert_eq!(value["max_tokens"], DEFAULT_MAX_TOKENS);
         assert_eq!(value["system"][0]["type"], "text");
         assert_eq!(value["tools"][0]["name"], "echo");
+        assert_eq!(value["tools"][1]["type"], WEB_SEARCH_TOOL_TYPE);
+        assert_eq!(value["tools"][1]["name"], "web_search");
+        assert_eq!(value["tools"][2]["type"], WEB_FETCH_TOOL_TYPE);
+        assert_eq!(value["tools"][2]["name"], "web_fetch");
         assert_eq!(value["messages"][0]["role"], "user");
         assert_eq!(value["messages"][1]["role"], "assistant");
         assert_eq!(value["messages"][1]["content"][0]["type"], "text");
