@@ -7,13 +7,16 @@ use std::{
 };
 
 use libtau::{
-    context::{ContentPart, TauContext, TauResponse, TauSession, ToolResult, ToolUse},
+    context::{
+        ContentPart, Conversation, TauContext, TauResponse, TauSession, ToolResult, ToolUse,
+    },
     providers::{Provider, ProviderApi, ProviderApiConfig, TokenUsage, find_provider_api, openai},
     tools,
 };
 use serde::{Deserialize, Serialize};
 
 const CONFIG_PATH: &str = ".tau/providers.json";
+const SESSIONS_DIR: &str = ".tau/sessions";
 const DEFAULT_PROVIDER: &str = "openai";
 const DEFAULT_API: &str = openai::API_NAME;
 const DEFAULT_MODEL: &str = "gpt-4.1-mini";
@@ -70,6 +73,20 @@ struct CliConfig {
     config_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedSession {
+    id: String,
+    current_model: String,
+    conversation: Conversation,
+}
+
+#[derive(Debug, Clone)]
+struct SessionPersistence {
+    id: String,
+    path: PathBuf,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -82,12 +99,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut context = TauContext::new();
     tools::register_builtin_tools(&mut context)?;
 
-    let provider = build_provider_for_selection(&cli_config, &cli_config.current_model)?;
-    let mut session =
-        context.session_with_provider_arc(provider, cli_config.current_model.model.clone());
-    session.set_system_message(SYSTEM_MESSAGE);
+    let (mut session, persistence) = load_or_create_session(&context, &mut cli_config)?;
+    save_session(&persistence, &cli_config.current_model, &session)?;
 
     println!("Tau interactive shell");
+    println!("session: {}", persistence.id);
     print_current_model(&cli_config.current_model);
     if let Some(path) = &cli_config.config_path {
         println!("config: {}", path.display());
@@ -96,6 +112,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("type /models to list configured models");
     println!("type /model provider/model to switch models");
+    println!("resume later with: tau --resume {}", persistence.id);
     println!("type /exit or press Ctrl-D to quit\n");
 
     let stdin = io::stdin();
@@ -123,14 +140,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(model_ref) = line.strip_prefix("/model ") {
             match switch_model(&mut cli_config, &mut session, model_ref.trim()) {
-                Ok(()) => print_current_model(&cli_config.current_model),
+                Ok(()) => {
+                    save_session(&persistence, &cli_config.current_model, &session)?;
+                    print_current_model(&cli_config.current_model);
+                }
                 Err(error) => eprintln!("error: {error}"),
             }
             continue;
         }
 
-        if let Err(error) = run_turn(&mut session, line).await {
-            eprintln!("error: {error}");
+        match run_turn(&mut session, line).await {
+            Ok(()) => save_session(&persistence, &cli_config.current_model, &session)?,
+            Err(error) => {
+                let _ = save_session(&persistence, &cli_config.current_model, &session);
+                eprintln!("error: {error}");
+            }
         }
     }
 
@@ -154,6 +178,100 @@ fn load_cli_config() -> Result<CliConfig, Box<dyn std::error::Error>> {
         providers,
         config_path,
     })
+}
+
+fn load_or_create_session(
+    context: &TauContext,
+    config: &mut CliConfig,
+) -> Result<(TauSession, SessionPersistence), Box<dyn std::error::Error>> {
+    let session_id = resume_session_id()?;
+    if let Some(session_id) = session_id {
+        let path = session_path(&session_id)?;
+        let persisted = read_session(&path)?;
+        let current_model: ModelSelection = persisted.current_model.parse()?;
+        validate_model_selection(
+            &config.providers,
+            &current_model,
+            config.config_path.as_ref(),
+        )?;
+        config.current_model = current_model;
+
+        let provider = build_provider_for_selection(config, &config.current_model)?;
+        let mut session =
+            context.session_with_provider_arc(provider, config.current_model.model.clone());
+        *session.conversation_mut() = persisted.conversation;
+        session.set_model(config.current_model.model.clone());
+
+        return Ok((
+            session,
+            SessionPersistence {
+                id: persisted.id,
+                path,
+            },
+        ));
+    }
+
+    let provider = build_provider_for_selection(config, &config.current_model)?;
+    let mut session =
+        context.session_with_provider_arc(provider, config.current_model.model.clone());
+    session.set_system_message(SYSTEM_MESSAGE);
+    let id = format!("session-{}", uuid::Uuid::new_v4());
+    let path = session_path(&id)?;
+
+    Ok((session, SessionPersistence { id, path }))
+}
+
+fn resume_session_id() -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(1);
+    let Some(first) = args.next() else {
+        return Ok(None);
+    };
+
+    if first == "--resume" {
+        let id = args
+            .next()
+            .ok_or("--resume requires a session id, e.g. --resume session-...")?;
+        return Ok(Some(id));
+    }
+
+    Ok(Some(first))
+}
+
+fn read_session(path: &PathBuf) -> Result<PersistedSession, Box<dyn std::error::Error>> {
+    let contents = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read session {}: {error}", path.display()))?;
+    serde_json::from_str(&contents)
+        .map_err(|error| format!("failed to parse session {}: {error}", path.display()).into())
+}
+
+fn save_session(
+    persistence: &SessionPersistence,
+    current_model: &ModelSelection,
+    session: &TauSession,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = persistence.path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let persisted = PersistedSession {
+        id: persistence.id.clone(),
+        current_model: current_model.to_string(),
+        conversation: session.conversation().clone(),
+    };
+    fs::write(
+        &persistence.path,
+        serde_json::to_string_pretty(&persisted)? + "\n",
+    )?;
+    Ok(())
+}
+
+fn session_path(session_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Err("cannot persist session because HOME is not set".into());
+    };
+    Ok(PathBuf::from(home)
+        .join(SESSIONS_DIR)
+        .join(format!("{session_id}.json")))
 }
 
 fn configured_providers(
