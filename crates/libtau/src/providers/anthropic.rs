@@ -167,6 +167,14 @@ enum AnthropicContent {
         name: String,
         input: Value,
     },
+    Thinking {
+        thinking: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    RedactedThinking {
+        data: String,
+    },
     ToolResult {
         tool_use_id: String,
         content: String,
@@ -349,6 +357,29 @@ fn parse_response(response: AnthropicResponse) -> Result<ProviderResponse, Provi
                     input: tool_use.input,
                 });
             }
+            Some("thinking") => {
+                let text = part
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ProviderError::Response(
+                            "Anthropic thinking block missing thinking".to_string(),
+                        )
+                    })?;
+                let signature = part
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                content.push(ContentPart::thinking_with_metadata(
+                    text,
+                    signature,
+                    raw_metadata("anthropic.content_block", part.clone()),
+                ));
+            }
+            Some("redacted_thinking") => content.push(ContentPart::json_with_metadata(
+                part.clone(),
+                raw_metadata("anthropic.content_block", part),
+            )),
             _ => content.push(ContentPart::json_with_metadata(
                 part.clone(),
                 raw_metadata("anthropic.content_block", part),
@@ -400,6 +431,9 @@ fn input_content_parts(parts: &[ContentPart]) -> Result<Vec<AnthropicContent>, P
             } => Ok(AnthropicContent::Text {
                 text: binary_content_as_text(media_type, data),
             }),
+            ContentPart::Thinking { text, .. } => Ok(AnthropicContent::Text {
+                text: format!("[thinking: {text}]"),
+            }),
         })
         .collect()
 }
@@ -409,11 +443,37 @@ fn output_content_parts(parts: &[ContentPart]) -> Vec<AnthropicContent> {
         .iter()
         .map(|part| match part {
             ContentPart::Text { text, .. } => AnthropicContent::Text { text: text.clone() },
+            ContentPart::Thinking {
+                text, signature, ..
+            } => AnthropicContent::Thinking {
+                thinking: text.clone(),
+                signature: signature.clone(),
+            },
+            ContentPart::Json { value, metadata }
+                if is_anthropic_redacted_thinking(value, metadata) =>
+            {
+                AnthropicContent::RedactedThinking {
+                    data: value
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                }
+            }
             part => AnthropicContent::Text {
                 text: assistant_content_as_text(part),
             },
         })
         .collect()
+}
+
+fn is_anthropic_redacted_thinking(value: &Value, metadata: &Option<Value>) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("redacted_thinking")
+        && metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("provider"))
+            .and_then(Value::as_str)
+            == Some(PROVIDER_NAME)
 }
 
 fn tool_result_content(result: &ToolResult) -> Result<AnthropicContent, ProviderError> {
@@ -460,7 +520,16 @@ mod tests {
         let mut session = context.session(AnthropicProvider::new("test-key"), "claude-sonnet-4-5");
         session.push_system_text("be helpful");
         session.push_user_text("hello");
-        session.push_agent_text("I'll call a tool.");
+        session.push_item(ConversationItem::Agent {
+            content: vec![
+                ContentPart::text("I'll call a tool."),
+                ContentPart::Thinking {
+                    text: "Need to echo.".to_string(),
+                    signature: Some("sig_1".to_string()),
+                    metadata: None,
+                },
+            ],
+        });
         session.push_item(ConversationItem::ToolUse {
             calls: vec![ToolUse {
                 id: "toolu_1".to_string(),
@@ -490,7 +559,9 @@ mod tests {
         assert_eq!(value["messages"][0]["role"], "user");
         assert_eq!(value["messages"][1]["role"], "assistant");
         assert_eq!(value["messages"][1]["content"][0]["type"], "text");
-        assert_eq!(value["messages"][1]["content"][1]["type"], "tool_use");
+        assert_eq!(value["messages"][1]["content"][1]["type"], "thinking");
+        assert_eq!(value["messages"][1]["content"][1]["signature"], "sig_1");
+        assert_eq!(value["messages"][1]["content"][2]["type"], "tool_use");
         assert_eq!(value["messages"][2]["content"][0]["type"], "tool_result");
     }
 
@@ -503,6 +574,7 @@ mod tests {
             }),
             content: vec![
                 json!({"type": "text", "text": "I'll check."}),
+                json!({"type": "thinking", "thinking": "I should inspect the files.", "signature": "sig_1"}),
                 json!({
                     "type": "tool_use",
                     "id": "toolu_a",
@@ -521,7 +593,7 @@ mod tests {
 
         let parsed = parse_response(response).unwrap();
 
-        assert_eq!(parsed.content.len(), 2);
+        assert_eq!(parsed.content.len(), 3);
         match &parsed.content[0] {
             ContentPart::Text { text, metadata } => {
                 assert_eq!(text, "I'll check.");
@@ -533,6 +605,21 @@ mod tests {
             other => panic!("expected text content, got {other:?}"),
         }
         match &parsed.content[1] {
+            ContentPart::Thinking {
+                text,
+                signature,
+                metadata,
+            } => {
+                assert_eq!(text, "I should inspect the files.");
+                assert_eq!(signature.as_deref(), Some("sig_1"));
+                assert_eq!(
+                    metadata.as_ref().unwrap()["kind"],
+                    "anthropic.content_block"
+                );
+            }
+            other => panic!("expected thinking content, got {other:?}"),
+        }
+        match &parsed.content[2] {
             ContentPart::Json { value, metadata } => {
                 assert_eq!(value["type"], "server_tool_use");
                 assert_eq!(

@@ -216,6 +216,7 @@ fn print_content(content: &[ContentPart]) {
         match part {
             ContentPart::Text { text, .. } => println!("{text}"),
             ContentPart::Json { value, .. } => println!("{}", pretty_json(value)),
+            ContentPart::Thinking { text, .. } => println!("[thinking]\n{text}"),
             ContentPart::Image {
                 media_type, data, ..
             } => {

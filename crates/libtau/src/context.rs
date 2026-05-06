@@ -64,6 +64,13 @@ pub enum ContentPart {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<Value>,
     },
+    Thinking {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<Value>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -516,6 +523,26 @@ impl ContentPart {
     pub fn json_with_metadata(value: Value, metadata: Value) -> Self {
         Self::Json {
             value,
+            metadata: Some(metadata),
+        }
+    }
+
+    pub fn thinking(text: impl Into<String>) -> Self {
+        Self::Thinking {
+            text: text.into(),
+            signature: None,
+            metadata: None,
+        }
+    }
+
+    pub fn thinking_with_metadata(
+        text: impl Into<String>,
+        signature: Option<String>,
+        metadata: Value,
+    ) -> Self {
+        Self::Thinking {
+            text: text.into(),
+            signature,
             metadata: Some(metadata),
         }
     }

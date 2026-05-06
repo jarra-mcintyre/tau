@@ -337,6 +337,7 @@ fn parse_response(response: OpenAiResponse) -> Result<ProviderResponse, Provider
                     input,
                 });
             }
+            Some("reasoning") => content.push(openai_reasoning_content(item.clone())),
             _ => content.push(ContentPart::json_with_metadata(
                 item.clone(),
                 raw_metadata("openai.output_item", item),
@@ -384,6 +385,26 @@ fn parse_message_output_item(
     Ok(())
 }
 
+fn openai_reasoning_content(item: Value) -> ContentPart {
+    let text = item
+        .get("summary")
+        .and_then(Value::as_array)
+        .map(|summary| {
+            summary
+                .iter()
+                .filter_map(|part| {
+                    part.get("text")
+                        .or_else(|| part.get("summary"))
+                        .and_then(Value::as_str)
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+
+    ContentPart::thinking_with_metadata(text, None, raw_metadata("openai.reasoning", item))
+}
+
 fn raw_metadata(kind: &str, raw: Value) -> Value {
     serde_json::json!({
         "provider": PROVIDER_NAME,
@@ -410,6 +431,9 @@ fn input_content_parts(parts: &[ContentPart]) -> Result<Vec<OpenAiContent>, Prov
             } => Ok(OpenAiContent::InputText {
                 text: binary_content_as_text(media_type, data),
             }),
+            ContentPart::Thinking { text, .. } => Ok(OpenAiContent::InputText {
+                text: format!("[thinking: {text}]"),
+            }),
         })
         .collect()
 }
@@ -419,6 +443,9 @@ fn output_content_parts(parts: &[ContentPart]) -> Vec<OpenAiContent> {
         .iter()
         .map(|part| match part {
             ContentPart::Text { text, .. } => OpenAiContent::OutputText { text: text.clone() },
+            ContentPart::Thinking { text, .. } => OpenAiContent::OutputText {
+                text: format!("[thinking: {text}]"),
+            },
             part => OpenAiContent::OutputText {
                 text: assistant_content_as_text(part),
             },
@@ -565,6 +592,10 @@ mod tests {
                     "arguments": "{\"path\":\"README.md\"}"
                 }),
                 json!({
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "I should inspect the files."}]
+                }),
+                json!({
                     "type": "web_search_call",
                     "id": "ws_1",
                     "status": "completed",
@@ -575,7 +606,7 @@ mod tests {
 
         let parsed = parse_response(response).unwrap();
 
-        assert_eq!(parsed.content.len(), 2);
+        assert_eq!(parsed.content.len(), 3);
         match &parsed.content[0] {
             ContentPart::Text { text, metadata } => {
                 assert_eq!(text, "I'll check.");
@@ -586,6 +617,13 @@ mod tests {
             other => panic!("expected text content, got {other:?}"),
         }
         match &parsed.content[1] {
+            ContentPart::Thinking { text, metadata, .. } => {
+                assert_eq!(text, "I should inspect the files.");
+                assert_eq!(metadata.as_ref().unwrap()["kind"], "openai.reasoning");
+            }
+            other => panic!("expected thinking content, got {other:?}"),
+        }
+        match &parsed.content[2] {
             ContentPart::Json { value, metadata } => {
                 assert_eq!(value["type"], "web_search_call");
                 assert_eq!(metadata.as_ref().unwrap()["kind"], "openai.output_item");

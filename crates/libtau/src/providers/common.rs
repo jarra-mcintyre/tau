@@ -13,6 +13,7 @@ pub fn assistant_content_as_text(part: &ContentPart) -> String {
     match part {
         ContentPart::Text { text, .. } => text.clone(),
         ContentPart::Json { value, .. } => value.to_string(),
+        ContentPart::Thinking { text, .. } => format!("[thinking: {text}]"),
         ContentPart::Image {
             media_type, data, ..
         }
