@@ -1,7 +1,7 @@
---
+---
 name: anthropic-api
 description: documents latest Anthropic API capabilities and behaviours
---
+---
 
 Latest available Anthropic models are: Opus 4.7, Opus 4.6, Sonnet 4.6, Haiku 4.6
 
