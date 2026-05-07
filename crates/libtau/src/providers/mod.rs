@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::context::{ContentPart, TauSession, ToolUse};
+use crate::context::{ContentPart, ResponsePart, TauSession, ToolUse};
 
 pub mod anthropic;
 pub mod common;
@@ -10,7 +10,11 @@ pub mod openai;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderResponse {
+    /// Ordered response blocks as returned by the provider.
+    pub parts: Vec<ResponsePart>,
+    /// Convenience view of all agent content blocks in `parts`.
     pub content: Vec<ContentPart>,
+    /// Convenience view of all client-executable tool calls in `parts`.
     pub tool_calls: Vec<ToolUse>,
     pub usage: Option<TokenUsage>,
 }

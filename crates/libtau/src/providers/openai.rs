@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    context::{ContentPart, ConversationItem, TauSession, ToolUse},
+    context::{ContentPart, ConversationItem, ResponsePart, TauSession, ToolResult, ToolUse},
     providers::{
         Provider, ProviderApi, ProviderApiConfig, ProviderError, ProviderResponse, TokenUsage,
         common::{
@@ -317,12 +317,13 @@ fn parse_response(response: OpenAiResponse) -> Result<ProviderResponse, Provider
         output_tokens: usage.output_tokens,
         total_tokens: usage.total_tokens,
     });
+    let mut parts = Vec::new();
     let mut content = Vec::new();
     let mut tool_calls = Vec::new();
 
     for item in response.output {
         match item.get("type").and_then(Value::as_str) {
-            Some("message") => parse_message_output_item(item, &mut content)?,
+            Some("message") => parse_message_output_item(item, &mut parts, &mut content)?,
             Some("function_call") => {
                 let function_call: OpenAiFunctionCallOutput = serde_json::from_value(item.clone())?;
                 let input = serde_json::from_str(&function_call.arguments).map_err(|error| {
@@ -331,21 +332,36 @@ fn parse_response(response: OpenAiResponse) -> Result<ProviderResponse, Provider
                         function_call.call_id
                     ))
                 })?;
-                tool_calls.push(ToolUse {
+                let call = ToolUse {
                     id: function_call.call_id,
                     name: function_call.name,
                     input,
-                });
+                };
+                parts.push(ResponsePart::ToolUse { call: call.clone() });
+                tool_calls.push(call);
             }
-            Some("reasoning") => content.push(openai_reasoning_content(item.clone())),
-            _ => content.push(ContentPart::json_with_metadata(
-                item.clone(),
-                raw_metadata("openai.output_item", item),
-            )),
+            Some("reasoning") => {
+                let content_part = openai_reasoning_content(item.clone());
+                parts.push(ResponsePart::Content {
+                    content: content_part.clone(),
+                });
+                content.push(content_part);
+            }
+            _ => {
+                let content_part = ContentPart::json_with_metadata(
+                    item.clone(),
+                    raw_metadata("openai.output_item", item),
+                );
+                parts.push(ResponsePart::Content {
+                    content: content_part.clone(),
+                });
+                content.push(content_part);
+            }
         }
     }
 
     Ok(ProviderResponse {
+        parts,
         content,
         tool_calls,
         usage,
@@ -354,6 +370,7 @@ fn parse_response(response: OpenAiResponse) -> Result<ProviderResponse, Provider
 
 fn parse_message_output_item(
     item: Value,
+    parts_out: &mut Vec<ResponsePart>,
     content: &mut Vec<ContentPart>,
 ) -> Result<(), ProviderError> {
     let parts = item
@@ -370,15 +387,29 @@ fn parse_message_output_item(
                 let text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
                     ProviderError::Response("OpenAI output_text missing text".to_string())
                 })?;
-                content.push(ContentPart::text_with_metadata(text, metadata));
+                let content_part = ContentPart::text_with_metadata(text, metadata);
+                parts_out.push(ResponsePart::Content {
+                    content: content_part.clone(),
+                });
+                content.push(content_part);
             }
             Some("refusal") => {
                 let refusal = part.get("refusal").and_then(Value::as_str).ok_or_else(|| {
                     ProviderError::Response("OpenAI refusal missing refusal text".to_string())
                 })?;
-                content.push(ContentPart::text_with_metadata(refusal, metadata));
+                let content_part = ContentPart::text_with_metadata(refusal, metadata);
+                parts_out.push(ResponsePart::Content {
+                    content: content_part.clone(),
+                });
+                content.push(content_part);
             }
-            _ => content.push(ContentPart::json_with_metadata(part.clone(), metadata)),
+            _ => {
+                let content_part = ContentPart::json_with_metadata(part.clone(), metadata);
+                parts_out.push(ResponsePart::Content {
+                    content: content_part.clone(),
+                });
+                content.push(content_part);
+            }
         }
     }
 
@@ -453,17 +484,20 @@ fn output_content_parts(parts: &[ContentPart]) -> Vec<OpenAiContent> {
         .collect()
 }
 
-fn tool_result_output(result: &crate::context::ToolResult) -> Result<String, ProviderError> {
+fn tool_result_output(result: &ToolResult) -> Result<String, ProviderError> {
     tool_result_json(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{ToolDefinition, ToolOutput, ToolResult};
+    use crate::{
+        context::ToolResult,
+        tools::{ToolDefinition, ToolOutput},
+    };
     use serde_json::json;
 
-    fn callback(input: Value) -> Result<ToolOutput, crate::context::ToolCallError> {
+    fn callback(input: Value) -> Result<ToolOutput, crate::tools::ToolCallError> {
         Ok(ToolOutput::json(input))
     }
 

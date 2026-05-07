@@ -1,12 +1,13 @@
 use std::{any::Any, collections::BTreeMap, fmt, sync::Arc};
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::providers::{Provider, ProviderError, ProviderResponse, TokenUsage};
+use crate::{
+    providers::{Provider, ProviderError, ProviderResponse, TokenUsage},
+    tools::{ToolCallError, ToolDefinition, ToolOutput, ToolRegistrationError},
+};
 
-pub type ToolCallback = fn(Value) -> Result<ToolOutput, ToolCallError>;
 pub type ProviderState = Arc<dyn Any + Send + Sync>;
 
 #[derive(Clone, Default)]
@@ -98,18 +99,25 @@ pub struct ToolResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ToolOutput {
-    pub content: Vec<ContentPart>,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponsePart {
+    Content { content: ContentPart },
+    ToolUse { call: ToolUse },
+    ServerToolUse { call: ServerToolUse },
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum TauResponse {
-    Message(Vec<ContentPart>),
-    ToolUse(Vec<ToolUse>),
-    MessageAndToolUse {
-        content: Vec<ContentPart>,
-        tool_calls: Vec<ToolUse>,
-    },
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServerToolUse {
+    pub id: Option<String>,
+    pub name: String,
+    pub input: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TauResponse {
+    pub parts: Vec<ResponsePart>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -117,34 +125,8 @@ pub enum TauEvent {
     UserMessage(Vec<ContentPart>),
     AgentMessage(Vec<ContentPart>),
     ToolUseRequested(Vec<ToolUse>),
+    ServerToolUse(Vec<ServerToolUse>),
     ToolResult(Vec<ToolResult>),
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ToolDefinition {
-    pub name: String,
-    pub description: String,
-    pub input_schema: Value,
-    #[serde(skip_serializing)]
-    pub callback: ToolCallback,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ToolRegistrationError {
-    #[error("duplicate tool name: {0}")]
-    DuplicateName(String),
-    #[error("failed to serialize tool schema: {0}")]
-    SchemaSerializationFailed(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ToolCallError {
-    #[error("unknown tool: {0}")]
-    UnknownTool(String),
-    #[error("invalid tool input: {0}")]
-    InvalidInput(String),
-    #[error("failed to serialize tool output: {0}")]
-    OutputSerializationFailed(String),
 }
 
 impl fmt::Debug for TauContext {
@@ -456,45 +438,133 @@ impl TauSession {
     }
 
     fn record_provider_response(&mut self, response: &ProviderResponse) {
-        if !response.content.is_empty() {
-            self.push_item(ConversationItem::Agent {
-                content: response.content.clone(),
-            });
+        let mut content = Vec::new();
+        let mut tool_calls = Vec::new();
+
+        for part in &response.parts {
+            match part {
+                ResponsePart::Content { content: part } => content.push(part.clone()),
+                ResponsePart::ToolUse { call } => tool_calls.push(call.clone()),
+                ResponsePart::ServerToolUse { .. } => {}
+            }
         }
-        if !response.tool_calls.is_empty() {
-            self.push_item(ConversationItem::ToolUse {
-                calls: response.tool_calls.clone(),
-            });
+
+        if response.parts.is_empty() {
+            content = response.content.clone();
+            tool_calls = response.tool_calls.clone();
+        }
+
+        if !content.is_empty() {
+            self.push_item(ConversationItem::Agent { content });
+        }
+        if !tool_calls.is_empty() {
+            self.push_item(ConversationItem::ToolUse { calls: tool_calls });
         }
     }
 }
 
 fn emit_tau_response(response: &TauResponse, on_event: &mut impl FnMut(TauEvent)) {
-    match response {
-        TauResponse::Message(content) => on_event(TauEvent::AgentMessage(content.clone())),
-        TauResponse::ToolUse(tool_calls) => {
-            on_event(TauEvent::ToolUseRequested(tool_calls.clone()));
+    fn flush_events(
+        content: &mut Vec<ContentPart>,
+        tool_calls: &mut Vec<ToolUse>,
+        server_tool_calls: &mut Vec<ServerToolUse>,
+        on_event: &mut impl FnMut(TauEvent),
+    ) {
+        if !content.is_empty() {
+            on_event(TauEvent::AgentMessage(std::mem::take(content)));
         }
-        TauResponse::MessageAndToolUse {
-            content,
-            tool_calls,
-        } => {
-            on_event(TauEvent::AgentMessage(content.clone()));
-            on_event(TauEvent::ToolUseRequested(tool_calls.clone()));
+        if !tool_calls.is_empty() {
+            on_event(TauEvent::ToolUseRequested(std::mem::take(tool_calls)));
         }
+        if !server_tool_calls.is_empty() {
+            on_event(TauEvent::ServerToolUse(std::mem::take(server_tool_calls)));
+        }
+    }
+
+    let mut content = Vec::new();
+    let mut tool_calls = Vec::new();
+    let mut server_tool_calls = Vec::new();
+
+    for part in &response.parts {
+        match part {
+            ResponsePart::Content { content: part } => content.push(part.clone()),
+            ResponsePart::ToolUse { call } => {
+                if !content.is_empty() || !server_tool_calls.is_empty() {
+                    flush_events(
+                        &mut content,
+                        &mut tool_calls,
+                        &mut server_tool_calls,
+                        on_event,
+                    );
+                }
+                tool_calls.push(call.clone());
+            }
+            ResponsePart::ServerToolUse { call } => {
+                if !content.is_empty() || !tool_calls.is_empty() {
+                    flush_events(
+                        &mut content,
+                        &mut tool_calls,
+                        &mut server_tool_calls,
+                        on_event,
+                    );
+                }
+                server_tool_calls.push(call.clone());
+            }
+        }
+    }
+
+    flush_events(
+        &mut content,
+        &mut tool_calls,
+        &mut server_tool_calls,
+        on_event,
+    );
+}
+
+impl TauResponse {
+    pub fn content(&self) -> Vec<ContentPart> {
+        self.parts
+            .iter()
+            .filter_map(|part| match part {
+                ResponsePart::Content { content } => Some(content.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn tool_calls(&self) -> Vec<ToolUse> {
+        self.parts
+            .iter()
+            .filter_map(|part| match part {
+                ResponsePart::ToolUse { call } => Some(call.clone()),
+                _ => None,
+            })
+            .collect()
     }
 }
 
 impl From<ProviderResponse> for TauResponse {
     fn from(response: ProviderResponse) -> Self {
-        match (response.content.is_empty(), response.tool_calls.is_empty()) {
-            (false, true) => Self::Message(response.content),
-            (true, false) => Self::ToolUse(response.tool_calls),
-            _ => Self::MessageAndToolUse {
-                content: response.content,
-                tool_calls: response.tool_calls,
-            },
+        if !response.parts.is_empty() {
+            return Self {
+                parts: response.parts,
+            };
         }
+
+        let mut parts = Vec::new();
+        parts.extend(
+            response
+                .content
+                .into_iter()
+                .map(|content| ResponsePart::Content { content }),
+        );
+        parts.extend(
+            response
+                .tool_calls
+                .into_iter()
+                .map(|call| ResponsePart::ToolUse { call }),
+        );
+        Self { parts }
     }
 }
 
@@ -548,41 +618,6 @@ impl ContentPart {
     }
 }
 
-impl ToolOutput {
-    pub fn json(value: Value) -> Self {
-        Self {
-            content: vec![ContentPart::json(value)],
-        }
-    }
-
-    pub fn text(text: impl Into<String>) -> Self {
-        Self {
-            content: vec![ContentPart::text(text)],
-        }
-    }
-}
-
-impl ToolDefinition {
-    pub fn new<Input>(
-        name: &str,
-        description: &str,
-        callback: ToolCallback,
-    ) -> Result<Self, ToolRegistrationError>
-    where
-        Input: JsonSchema,
-    {
-        let input_schema = serde_json::to_value(schemars::schema_for!(Input))
-            .map_err(|error| ToolRegistrationError::SchemaSerializationFailed(error.to_string()))?;
-
-        Ok(Self {
-            name: name.to_string(),
-            description: description.to_string(),
-            input_schema,
-            callback,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,13 +636,15 @@ mod tests {
             &self,
             _session: &mut TauSession,
         ) -> Result<ProviderResponse, ProviderError> {
+            let call = ToolUse {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path":"README.md"}),
+            };
             Ok(ProviderResponse {
+                parts: vec![ResponsePart::ToolUse { call: call.clone() }],
                 content: vec![],
-                tool_calls: vec![ToolUse {
-                    id: "call_1".to_string(),
-                    name: "read_file".to_string(),
-                    input: serde_json::json!({"path":"README.md"}),
-                }],
+                tool_calls: vec![call],
                 usage: Some(TokenUsage {
                     input_tokens: Some(10),
                     output_tokens: Some(5),
@@ -674,11 +711,15 @@ mod tests {
 
                 assert_eq!(
                     response,
-                    TauResponse::ToolUse(vec![ToolUse {
-                        id: "call_1".to_string(),
-                        name: "read_file".to_string(),
-                        input: serde_json::json!({"path":"README.md"}),
-                    }])
+                    TauResponse {
+                        parts: vec![ResponsePart::ToolUse {
+                            call: ToolUse {
+                                id: "call_1".to_string(),
+                                name: "read_file".to_string(),
+                                input: serde_json::json!({"path":"README.md"}),
+                            }
+                        }]
+                    }
                 );
                 assert_eq!(
                     events,

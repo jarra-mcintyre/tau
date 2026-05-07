@@ -13,6 +13,7 @@ Source: https://platform.claude.com/docs/en/build-with-claude/working-with-messa
 - Messages API is stateless. Always send the full conversation history.
 - Add cache control headers to control caching
 
+```bash
 #!/bin/sh
 curl https://api.anthropic.com/v1/messages \
      --header "x-api-key: $ANTHROPIC_API_KEY" \
@@ -29,6 +30,32 @@ curl https://api.anthropic.com/v1/messages \
 
     ]
 }'
+```
+
+If a cache control header is added then the system caches prompts
+- For automatic caching add a top-level single `cache_control` block to the request. The cache breakpoint is moved forward automatically
+- For fine-grained cache add `cache_control` block to each message where caching should be run up-to
+
+By default cache has a 5-minute life-time. This is automatically refreshed on each requests. Add `"ttl": "1h"` to the cache block to switch to 1 hour caching. This has an additionally cost.
+
+Automatic caching example (as per Anthropic docs):
+```json
+{
+  "model": "claude-opus-4-7",
+  "max_tokens": 1024,
+  "cache_control": {"type": "ephemeral"},
+  "system": "You are an AI assistant tasked with analyzing literary works. Your goal is to provide insightful commentary on themes, characters, and writing style.",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Analyze the major themes in Pride and Prejudice."
+    }
+  ]
+}
+```
+
+
+   
 
 # More information
 

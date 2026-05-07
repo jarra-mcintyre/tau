@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    context::{ContentPart, ConversationItem, MediaData, TauSession, ToolResult, ToolUse},
+    context::{
+        ContentPart, ConversationItem, MediaData, ResponsePart, TauSession, ToolResult, ToolUse,
+    },
     providers::{
         Provider, ProviderApi, ProviderApiConfig, ProviderError, ProviderResponse, TokenUsage,
         common::{
@@ -335,6 +337,7 @@ fn parse_response(response: AnthropicResponse) -> Result<ProviderResponse, Provi
             total_tokens,
         }
     });
+    let mut parts = Vec::new();
     let mut content = Vec::new();
     let mut tool_calls = Vec::new();
 
@@ -344,18 +347,24 @@ fn parse_response(response: AnthropicResponse) -> Result<ProviderResponse, Provi
                 let text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
                     ProviderError::Response("Anthropic text block missing text".to_string())
                 })?;
-                content.push(ContentPart::text_with_metadata(
+                let content_part = ContentPart::text_with_metadata(
                     text,
                     raw_metadata("anthropic.content_block", part.clone()),
-                ));
+                );
+                parts.push(ResponsePart::Content {
+                    content: content_part.clone(),
+                });
+                content.push(content_part);
             }
             Some("tool_use") => {
                 let tool_use: AnthropicToolUseOutput = serde_json::from_value(part)?;
-                tool_calls.push(ToolUse {
+                let call = ToolUse {
                     id: tool_use.id,
                     name: tool_use.name,
                     input: tool_use.input,
-                });
+                };
+                parts.push(ResponsePart::ToolUse { call: call.clone() });
+                tool_calls.push(call);
             }
             Some("thinking") => {
                 let text = part
@@ -370,24 +379,41 @@ fn parse_response(response: AnthropicResponse) -> Result<ProviderResponse, Provi
                     .get("signature")
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
-                content.push(ContentPart::thinking_with_metadata(
+                let content_part = ContentPart::thinking_with_metadata(
                     text,
                     signature,
                     raw_metadata("anthropic.content_block", part.clone()),
-                ));
+                );
+                parts.push(ResponsePart::Content {
+                    content: content_part.clone(),
+                });
+                content.push(content_part);
             }
-            Some("redacted_thinking") => content.push(ContentPart::json_with_metadata(
-                part.clone(),
-                raw_metadata("anthropic.content_block", part),
-            )),
-            _ => content.push(ContentPart::json_with_metadata(
-                part.clone(),
-                raw_metadata("anthropic.content_block", part),
-            )),
+            Some("redacted_thinking") => {
+                let content_part = ContentPart::json_with_metadata(
+                    part.clone(),
+                    raw_metadata("anthropic.content_block", part),
+                );
+                parts.push(ResponsePart::Content {
+                    content: content_part.clone(),
+                });
+                content.push(content_part);
+            }
+            _ => {
+                let content_part = ContentPart::json_with_metadata(
+                    part.clone(),
+                    raw_metadata("anthropic.content_block", part),
+                );
+                parts.push(ResponsePart::Content {
+                    content: content_part.clone(),
+                });
+                content.push(content_part);
+            }
         }
     }
 
     Ok(ProviderResponse {
+        parts,
         content,
         tool_calls,
         usage,
@@ -487,10 +513,10 @@ fn tool_result_content(result: &ToolResult) -> Result<AnthropicContent, Provider
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{ToolDefinition, ToolOutput};
+    use crate::tools::{ToolDefinition, ToolOutput};
     use serde_json::json;
 
-    fn callback(input: Value) -> Result<ToolOutput, crate::context::ToolCallError> {
+    fn callback(input: Value) -> Result<ToolOutput, crate::tools::ToolCallError> {
         Ok(ToolOutput::json(input))
     }
 

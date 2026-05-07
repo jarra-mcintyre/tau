@@ -5,7 +5,7 @@ use std::{
 
 use clap::Parser;
 use libtau::{
-    context::{ContentPart, TauResponse, TauSession, ToolResult, ToolUse},
+    context::{ContentPart, ResponsePart, TauSession, ToolResult, ToolUse},
     providers::TokenUsage,
     tools,
 };
@@ -145,26 +145,24 @@ async fn run_turn(
     print_token_usage(context.last_token_usage());
 
     loop {
-        match response {
-            TauResponse::Message(content) => {
-                print_content(&content);
-                return Ok(());
-            }
-            TauResponse::ToolUse(tool_calls) => {
-                run_tools(context, &tool_calls);
-                response = context.request_response().await?;
-                print_token_usage(context.last_token_usage());
-            }
-            TauResponse::MessageAndToolUse {
-                content,
-                tool_calls,
-            } => {
-                print_content(&content);
-                run_tools(context, &tool_calls);
-                response = context.request_response().await?;
-                print_token_usage(context.last_token_usage());
+        let mut tool_calls = Vec::new();
+        for part in response.parts {
+            match part {
+                ResponsePart::Content { content } => print_content(&[content]),
+                ResponsePart::ToolUse { call } => tool_calls.push(call),
+                ResponsePart::ServerToolUse { call } => {
+                    println!("[server tool] {}", call.name);
+                }
             }
         }
+
+        if tool_calls.is_empty() {
+            return Ok(());
+        }
+
+        run_tools(context, &tool_calls);
+        response = context.request_response().await?;
+        print_token_usage(context.last_token_usage());
     }
 }
 

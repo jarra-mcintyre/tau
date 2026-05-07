@@ -4,8 +4,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::context::{
-    TauContext, ToolCallError, ToolDefinition, ToolOutput, ToolRegistrationError,
+use crate::{
+    context::TauContext,
+    tools::{ToolCallError, ToolDefinition, ToolOutput, ToolRegistrationError},
 };
 
 pub const NAME: &str = "edit_file";
