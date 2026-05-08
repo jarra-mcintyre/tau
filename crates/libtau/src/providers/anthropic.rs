@@ -30,6 +30,7 @@ const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 const WEB_SEARCH_TOOL_TYPE: &str = "web_search_20260209";
+const WEB_SEARCH_TOOL_NAME: &str = "web_search";
 
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
@@ -75,7 +76,7 @@ impl AnthropicProvider {
             base_url: DEFAULT_BASE_URL.to_string(),
             max_tokens: DEFAULT_MAX_TOKENS,
             cache_ttl: Some(AnthropicCacheTtl::FiveMinutes),
-            web_search: Some(AnthropicWebSearchConfig::enabled())
+            web_search: Some(AnthropicWebSearchConfig::enabled()),
         }
     }
 
@@ -236,8 +237,30 @@ impl AnthropicWebSearchConfig {
             enabled: true,
             max_uses: None,
             allowed_domains: None,
-            blocked_domains: None
+            blocked_domains: None,
         }
+    }
+
+    fn options(&self) -> serde_json::Map<String, Value> {
+        let mut options = serde_json::Map::new();
+
+        if let Some(max_uses) = self.max_uses {
+            options.insert("max_uses".to_string(), Value::from(max_uses));
+        }
+        if let Some(allowed_domains) = &self.allowed_domains {
+            options.insert(
+                "allowed_domains".to_string(),
+                Value::Array(allowed_domains.iter().cloned().map(Value::String).collect()),
+            );
+        }
+        if let Some(blocked_domains) = &self.blocked_domains {
+            options.insert(
+                "blocked_domains".to_string(),
+                Value::Array(blocked_domains.iter().cloned().map(Value::String).collect()),
+            );
+        }
+
+        options
     }
 }
 
@@ -330,12 +353,8 @@ enum AnthropicTool {
         #[serde(rename = "type")]
         kind: &'static str,
         name: &'static str,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        max_uses: Option<u32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        allowed_domains: Option<Vec<String>>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        blocked_domains: Option<Vec<String>>,
+        #[serde(flatten)]
+        options: serde_json::Map<String, Value>,
     },
 }
 
@@ -443,15 +462,15 @@ fn anthropic_tools(
     if let Some(web_search) = web_search.filter(|config| config.enabled) {
         tools.push(AnthropicTool::Server {
             kind: WEB_SEARCH_TOOL_TYPE,
-            name: "web_search",
-            max_uses: web_search.max_uses,
-            allowed_domains: web_search.allowed_domains.clone(),
-            blocked_domains: web_search.blocked_domains.clone(),
+            name: WEB_SEARCH_TOOL_NAME,
+            options: web_search.options(),
         });
     }
 
     tools
 }
+
+
 
 fn push_message(
     messages: &mut Vec<AnthropicMessage>,
@@ -867,8 +886,14 @@ mod tests {
         let web_search = options.web_search.unwrap();
         assert!(web_search.enabled);
         assert_eq!(web_search.max_uses, Some(2));
-        assert_eq!(web_search.allowed_domains, Some(vec!["example.com".to_string()]));
-        assert_eq!(web_search.blocked_domains, Some(vec!["spam.example".to_string()]));
+        assert_eq!(
+            web_search.allowed_domains,
+            Some(vec!["example.com".to_string()])
+        );
+        assert_eq!(
+            web_search.blocked_domains,
+            Some(vec!["spam.example".to_string()])
+        );
     }
 
     #[test]
