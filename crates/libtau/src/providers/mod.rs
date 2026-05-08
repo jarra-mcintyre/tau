@@ -64,6 +64,7 @@ pub trait Provider: Send + Sync {
 pub struct ProviderApiConfig {
     pub api_key: String,
     pub base_url: Option<String>,
+    pub options: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -71,11 +72,14 @@ pub struct ProviderApi {
     pub name: &'static str,
     pub api_key_env: &'static str,
     pub display_name: &'static str,
-    pub build: fn(ProviderApiConfig) -> Arc<dyn Provider>,
+    pub build: fn(ProviderApiConfig) -> Result<Arc<dyn Provider>, ProviderError>,
 }
 
 impl ProviderApi {
-    pub fn build_provider(&self, config: ProviderApiConfig) -> Arc<dyn Provider> {
+    pub fn build_provider(
+        &self,
+        config: ProviderApiConfig,
+    ) -> Result<Arc<dyn Provider>, ProviderError> {
         (self.build)(config)
     }
 }

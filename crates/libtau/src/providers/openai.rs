@@ -38,11 +38,11 @@ pub struct OpenAiState {
     pub previous_response_id: Option<String>,
 }
 
-fn build_provider(config: ProviderApiConfig) -> Arc<dyn Provider> {
-    match config.base_url {
+fn build_provider(config: ProviderApiConfig) -> Result<Arc<dyn Provider>, ProviderError> {
+    Ok(match config.base_url {
         Some(base_url) => Arc::new(OpenAiProvider::with_base_url(config.api_key, base_url)),
         None => Arc::new(OpenAiProvider::new(config.api_key)),
-    }
+    })
 }
 
 impl OpenAiProvider {

@@ -6,7 +6,8 @@ use serde_json::Value;
 
 use crate::{
     context::{
-        ContentPart, ConversationItem, MediaData, ResponsePart, TauSession, ToolResult, ToolUse,
+        ContentPart, ConversationItem, MediaData, ResponsePart, ServerToolUse, TauSession,
+        ToolResult, ToolUse,
     },
     providers::{
         Provider, ProviderApi, ProviderApiConfig, ProviderError, ProviderResponse, TokenUsage,
@@ -27,10 +28,8 @@ pub const API: ProviderApi = ProviderApi {
 };
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const ANTHROPIC_BETA: &str = "web-fetch-2025-09-10";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
-const WEB_SEARCH_TOOL_TYPE: &str = "web_search_20250305";
-const WEB_FETCH_TOOL_TYPE: &str = "web_fetch_20250910";
+const WEB_SEARCH_TOOL_TYPE: &str = "web_search_20260209";
 
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
@@ -38,13 +37,20 @@ pub struct AnthropicProvider {
     api_key: String,
     base_url: String,
     max_tokens: u32,
+    cache_ttl: Option<AnthropicCacheTtl>,
+    web_search: Option<AnthropicWebSearchConfig>,
 }
 
-fn build_provider(config: ProviderApiConfig) -> Arc<dyn Provider> {
-    match config.base_url {
-        Some(base_url) => Arc::new(AnthropicProvider::with_base_url(config.api_key, base_url)),
-        None => Arc::new(AnthropicProvider::new(config.api_key)),
+fn build_provider(config: ProviderApiConfig) -> Result<Arc<dyn Provider>, ProviderError> {
+    let options = AnthropicOptions::from_value(config.options)?;
+    let provider = match config.base_url {
+        Some(base_url) => AnthropicProvider::with_base_url(config.api_key, base_url),
+        None => AnthropicProvider::new(config.api_key),
     }
+    .with_cache_ttl(options.cache_ttl)
+    .with_web_search(options.web_search);
+
+    Ok(Arc::new(provider))
 }
 
 fn normalize_base_url(base_url: impl Into<String>) -> String {
@@ -62,7 +68,15 @@ fn normalize_base_url(base_url: impl Into<String>) -> String {
 
 impl AnthropicProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self::with_base_url(api_key, DEFAULT_BASE_URL)
+        //Self::with_base_url(api_key, DEFAULT_BASE_URL)
+        Self {
+            client: reqwest::Client::new(),
+            api_key: api_key.into(),
+            base_url: DEFAULT_BASE_URL.to_string(),
+            max_tokens: DEFAULT_MAX_TOKENS,
+            cache_ttl: Some(AnthropicCacheTtl::FiveMinutes),
+            web_search: Some(AnthropicWebSearchConfig::enabled())
+        }
     }
 
     pub fn from_env() -> Result<Self, ProviderError> {
@@ -78,11 +92,23 @@ impl AnthropicProvider {
             api_key: api_key.into(),
             base_url: normalize_base_url(base_url),
             max_tokens: DEFAULT_MAX_TOKENS,
+            cache_ttl: Some(AnthropicCacheTtl::FiveMinutes),
+            web_search: None,
         }
     }
 
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    pub fn with_cache_ttl(mut self, cache_ttl: Option<AnthropicCacheTtl>) -> Self {
+        self.cache_ttl = cache_ttl;
+        self
+    }
+
+    pub fn with_web_search(mut self, web_search: Option<AnthropicWebSearchConfig>) -> Self {
+        self.web_search = web_search;
         self
     }
 }
@@ -94,7 +120,12 @@ impl Provider for AnthropicProvider {
     }
 
     async fn respond(&self, session: &mut TauSession) -> Result<ProviderResponse, ProviderError> {
-        let request = build_request(session, self.max_tokens)?;
+        let request = build_request(
+            session,
+            self.max_tokens,
+            self.cache_ttl,
+            self.web_search.as_ref(),
+        )?;
         let url = format!("{}/messages", self.base_url);
         let request_body = serde_json::to_string_pretty(&request)?;
         tracing::debug!(
@@ -109,7 +140,6 @@ impl Provider for AnthropicProvider {
             .post(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("anthropic-beta", ANTHROPIC_BETA)
             .json(&request)
             .send()
             .await?;
@@ -135,11 +165,97 @@ impl Provider for AnthropicProvider {
 struct AnthropicRequest {
     model: String,
     max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<AnthropicCacheControl>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     system: Vec<AnthropicContent>,
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<AnthropicTool>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase", deny_unknown_fields)]
+struct AnthropicOptions {
+    #[serde(default = "default_cache_ttl")]
+    cache_ttl: Option<AnthropicCacheTtl>,
+    #[serde(default)]
+    web_search: Option<AnthropicWebSearchConfig>,
+}
+
+impl Default for AnthropicOptions {
+    fn default() -> Self {
+        Self {
+            cache_ttl: default_cache_ttl(),
+            web_search: None,
+        }
+    }
+}
+
+impl AnthropicOptions {
+    fn from_value(value: Value) -> Result<Self, ProviderError> {
+        if value.is_null() {
+            return Ok(Self::default());
+        }
+
+        serde_json::from_value(value).map_err(|error| {
+            ProviderError::Configuration(format!("invalid Anthropic options: {error}"))
+        })
+    }
+}
+
+fn default_cache_ttl() -> Option<AnthropicCacheTtl> {
+    Some(AnthropicCacheTtl::FiveMinutes)
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AnthropicCacheTtl {
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    #[serde(rename = "1h")]
+    OneHour,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase", deny_unknown_fields)]
+pub struct AnthropicWebSearchConfig {
+    #[serde(default = "default_web_search_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub max_uses: Option<u32>,
+    #[serde(default)]
+    pub allowed_domains: Option<Vec<String>>,
+    #[serde(default)]
+    pub blocked_domains: Option<Vec<String>>,
+}
+
+impl AnthropicWebSearchConfig {
+    fn enabled() -> Self {
+        Self {
+            enabled: true,
+            max_uses: None,
+            allowed_domains: None,
+            blocked_domains: None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+struct AnthropicCacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<AnthropicCacheTtl>,
+}
+
+impl AnthropicCacheControl {
+    fn new(ttl: AnthropicCacheTtl) -> Self {
+        Self {
+            kind: "ephemeral",
+            ttl: (ttl == AnthropicCacheTtl::OneHour).then_some(ttl),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -168,6 +284,15 @@ enum AnthropicContent {
         id: String,
         name: String,
         input: Value,
+    },
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    WebSearchToolResult {
+        tool_use_id: String,
+        content: Value,
     },
     Thinking {
         thinking: String,
@@ -198,12 +323,19 @@ enum AnthropicTool {
     Custom {
         name: String,
         description: String,
+        strict: bool,
         input_schema: Value,
     },
     Server {
         #[serde(rename = "type")]
         kind: &'static str,
         name: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_uses: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        allowed_domains: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        blocked_domains: Option<Vec<String>>,
     },
 }
 
@@ -227,7 +359,12 @@ struct AnthropicToolUseOutput {
     input: Value,
 }
 
-fn build_request(session: &TauSession, max_tokens: u32) -> Result<AnthropicRequest, ProviderError> {
+fn build_request(
+    session: &TauSession,
+    max_tokens: u32,
+    cache_ttl: Option<AnthropicCacheTtl>,
+    web_search: Option<&AnthropicWebSearchConfig>,
+) -> Result<AnthropicRequest, ProviderError> {
     let model = session
         .model()
         .ok_or(ProviderError::MissingModel)?
@@ -272,36 +409,46 @@ fn build_request(session: &TauSession, max_tokens: u32) -> Result<AnthropicReque
         }
     }
 
-    let tools = anthropic_tools(session);
+    let tools = anthropic_tools(session, web_search);
 
     Ok(AnthropicRequest {
         model,
         max_tokens,
+        cache_control: cache_ttl.map(AnthropicCacheControl::new),
         system,
         messages,
         tools,
     })
 }
 
-fn anthropic_tools(session: &TauSession) -> Vec<AnthropicTool> {
+fn default_web_search_enabled() -> bool {
+    true
+}
+
+fn anthropic_tools(
+    session: &TauSession,
+    web_search: Option<&AnthropicWebSearchConfig>,
+) -> Vec<AnthropicTool> {
     let mut tools: Vec<_> = session
         .context()
         .tools()
         .map(|tool| AnthropicTool::Custom {
             name: tool.name.clone(),
             description: tool.description.clone(),
+            strict: true,
             input_schema: tool.input_schema.clone(),
         })
         .collect();
 
-    tools.push(AnthropicTool::Server {
-        kind: WEB_SEARCH_TOOL_TYPE,
-        name: "web_search",
-    });
-    tools.push(AnthropicTool::Server {
-        kind: WEB_FETCH_TOOL_TYPE,
-        name: "web_fetch",
-    });
+    if let Some(web_search) = web_search.filter(|config| config.enabled) {
+        tools.push(AnthropicTool::Server {
+            kind: WEB_SEARCH_TOOL_TYPE,
+            name: "web_search",
+            max_uses: web_search.max_uses,
+            allowed_domains: web_search.allowed_domains.clone(),
+            blocked_domains: web_search.blocked_domains.clone(),
+        });
+    }
 
     tools
 }
@@ -347,10 +494,8 @@ fn parse_response(response: AnthropicResponse) -> Result<ProviderResponse, Provi
                 let text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
                     ProviderError::Response("Anthropic text block missing text".to_string())
                 })?;
-                let content_part = ContentPart::text_with_metadata(
-                    text,
-                    raw_metadata("anthropic.content_block", part.clone()),
-                );
+                let content_part =
+                    ContentPart::text_with_metadata(text, content_block_metadata(part.clone()));
                 parts.push(ResponsePart::Content {
                     content: content_part.clone(),
                 });
@@ -365,6 +510,28 @@ fn parse_response(response: AnthropicResponse) -> Result<ProviderResponse, Provi
                 };
                 parts.push(ResponsePart::ToolUse { call: call.clone() });
                 tool_calls.push(call);
+            }
+            Some("server_tool_use") => {
+                let call = ServerToolUse {
+                    id: part
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                    name: part
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("web_search")
+                        .to_string(),
+                    input: part.get("input").cloned().unwrap_or(Value::Null),
+                    metadata: Some(content_block_metadata(part.clone())),
+                };
+                parts.push(ResponsePart::ServerToolUse { call });
+                let content_part =
+                    ContentPart::json_with_metadata(part.clone(), content_block_metadata(part));
+                parts.push(ResponsePart::Content {
+                    content: content_part.clone(),
+                });
+                content.push(content_part);
             }
             Some("thinking") => {
                 let text = part
@@ -418,6 +585,20 @@ fn parse_response(response: AnthropicResponse) -> Result<ProviderResponse, Provi
         tool_calls,
         usage,
     })
+}
+
+fn content_block_metadata(raw: Value) -> Value {
+    let mut metadata = serde_json::json!({
+        "provider": PROVIDER_NAME,
+        "kind": "anthropic.content_block",
+        "raw": raw,
+    });
+
+    if let Some(citations) = metadata["raw"].get("citations").cloned() {
+        metadata["citations"] = citations;
+    }
+
+    metadata
 }
 
 fn raw_metadata(kind: &str, raw: Value) -> Value {
@@ -486,6 +667,35 @@ fn output_content_parts(parts: &[ContentPart]) -> Vec<AnthropicContent> {
                         .to_string(),
                 }
             }
+            ContentPart::Json { value, metadata }
+                if is_anthropic_server_tool_use(value, metadata) =>
+            {
+                AnthropicContent::ServerToolUse {
+                    id: value
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    name: value
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("web_search")
+                        .to_string(),
+                    input: value.get("input").cloned().unwrap_or(Value::Null),
+                }
+            }
+            ContentPart::Json { value, metadata }
+                if is_anthropic_web_search_tool_result(value, metadata) =>
+            {
+                AnthropicContent::WebSearchToolResult {
+                    tool_use_id: value
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    content: value.get("content").cloned().unwrap_or(Value::Null),
+                }
+            }
             part => AnthropicContent::Text {
                 text: assistant_content_as_text(part),
             },
@@ -494,7 +704,19 @@ fn output_content_parts(parts: &[ContentPart]) -> Vec<AnthropicContent> {
 }
 
 fn is_anthropic_redacted_thinking(value: &Value, metadata: &Option<Value>) -> bool {
-    value.get("type").and_then(Value::as_str) == Some("redacted_thinking")
+    is_anthropic_content_block(value, metadata, "redacted_thinking")
+}
+
+fn is_anthropic_server_tool_use(value: &Value, metadata: &Option<Value>) -> bool {
+    is_anthropic_content_block(value, metadata, "server_tool_use")
+}
+
+fn is_anthropic_web_search_tool_result(value: &Value, metadata: &Option<Value>) -> bool {
+    is_anthropic_content_block(value, metadata, "web_search_tool_result")
+}
+
+fn is_anthropic_content_block(value: &Value, metadata: &Option<Value>, block_type: &str) -> bool {
+    value.get("type").and_then(Value::as_str) == Some(block_type)
         && metadata
             .as_ref()
             .and_then(|metadata| metadata.get("provider"))
@@ -571,17 +793,34 @@ mod tests {
                 error: None,
             }],
         });
-        let request = build_request(&session, DEFAULT_MAX_TOKENS).unwrap();
+        let web_search = AnthropicWebSearchConfig {
+            enabled: true,
+            max_uses: Some(3),
+            allowed_domains: Some(vec!["example.com".to_string()]),
+            blocked_domains: Some(vec!["bad.example".to_string()]),
+        };
+        let request = build_request(
+            &session,
+            DEFAULT_MAX_TOKENS,
+            Some(AnthropicCacheTtl::FiveMinutes),
+            Some(&web_search),
+        )
+        .unwrap();
         let value = serde_json::to_value(request).unwrap();
 
         assert_eq!(value["model"], "claude-sonnet-4-5");
         assert_eq!(value["max_tokens"], DEFAULT_MAX_TOKENS);
+        assert_eq!(value["cache_control"]["type"], "ephemeral");
+        assert!(value["cache_control"].get("ttl").is_none());
         assert_eq!(value["system"][0]["type"], "text");
         assert_eq!(value["tools"][0]["name"], "echo");
+        assert_eq!(value["tools"][0]["strict"], true);
         assert_eq!(value["tools"][1]["type"], WEB_SEARCH_TOOL_TYPE);
         assert_eq!(value["tools"][1]["name"], "web_search");
-        assert_eq!(value["tools"][2]["type"], WEB_FETCH_TOOL_TYPE);
-        assert_eq!(value["tools"][2]["name"], "web_fetch");
+        assert_eq!(value["tools"][1]["max_uses"], 3);
+        assert_eq!(value["tools"][1]["allowed_domains"], json!(["example.com"]));
+        assert_eq!(value["tools"][1]["blocked_domains"], json!(["bad.example"]));
+        assert_eq!(value["tools"].as_array().unwrap().len(), 2);
         assert_eq!(value["messages"][0]["role"], "user");
         assert_eq!(value["messages"][1]["role"], "assistant");
         assert_eq!(value["messages"][1]["content"][0]["type"], "text");
@@ -592,6 +831,69 @@ mod tests {
     }
 
     #[test]
+    fn configures_one_hour_automatic_cache_ttl() {
+        let context = crate::context::TauContext::new();
+        let session = context.session(AnthropicProvider::new("test-key"), "claude-sonnet-4-5");
+        let request = build_request(
+            &session,
+            DEFAULT_MAX_TOKENS,
+            Some(AnthropicCacheTtl::OneHour),
+            None,
+        )
+        .unwrap();
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(
+            value["cache_control"],
+            json!({"type": "ephemeral", "ttl": "1h"})
+        );
+        assert!(value.get("tools").is_none());
+    }
+
+    #[test]
+    fn parses_provider_options_with_web_search() {
+        let options = AnthropicOptions::from_value(json!({
+            "cache_ttl": "1h",
+            "web_search": {
+                "enabled": true,
+                "max_uses": 2,
+                "allowed_domains": ["example.com"],
+                "blocked_domains": ["spam.example"]
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(options.cache_ttl, Some(AnthropicCacheTtl::OneHour));
+        let web_search = options.web_search.unwrap();
+        assert!(web_search.enabled);
+        assert_eq!(web_search.max_uses, Some(2));
+        assert_eq!(web_search.allowed_domains, Some(vec!["example.com".to_string()]));
+        assert_eq!(web_search.blocked_domains, Some(vec!["spam.example".to_string()]));
+    }
+
+    #[test]
+    fn disables_web_search_when_configured_off() {
+        let context = crate::context::TauContext::new();
+        let session = context.session(AnthropicProvider::new("test-key"), "claude-sonnet-4-5");
+        let web_search = AnthropicWebSearchConfig {
+            enabled: false,
+            max_uses: Some(1),
+            allowed_domains: None,
+            blocked_domains: None,
+        };
+        let request = build_request(
+            &session,
+            DEFAULT_MAX_TOKENS,
+            Some(AnthropicCacheTtl::FiveMinutes),
+            Some(&web_search),
+        )
+        .unwrap();
+        let value = serde_json::to_value(request).unwrap();
+
+        assert!(value.get("tools").is_none());
+    }
+
+    #[test]
     fn parses_text_and_parallel_tool_calls() {
         let response = AnthropicResponse {
             usage: Some(AnthropicUsage {
@@ -599,7 +901,7 @@ mod tests {
                 output_tokens: Some(12),
             }),
             content: vec![
-                json!({"type": "text", "text": "I'll check."}),
+                json!({"type": "text", "text": "I'll check.", "citations": [{"type":"web_search_result_location","url":"https://example.com","title":"Example"}]}),
                 json!({"type": "thinking", "thinking": "I should inspect the files.", "signature": "sig_1"}),
                 json!({
                     "type": "tool_use",
@@ -626,6 +928,10 @@ mod tests {
                 assert_eq!(
                     metadata.as_ref().unwrap()["kind"],
                     "anthropic.content_block"
+                );
+                assert_eq!(
+                    metadata.as_ref().unwrap()["citations"][0]["url"],
+                    "https://example.com"
                 );
             }
             other => panic!("expected text content, got {other:?}"),
@@ -655,6 +961,11 @@ mod tests {
             }
             other => panic!("expected json content, got {other:?}"),
         }
+        assert!(matches!(
+            &parsed.parts[4],
+            ResponsePart::ServerToolUse { call }
+                if call.id.as_deref() == Some("srv_1") && call.name == "web_search"
+        ));
         assert_eq!(parsed.tool_calls.len(), 2);
         assert_eq!(parsed.tool_calls[0].id, "toolu_a");
         assert_eq!(parsed.tool_calls[1].input, json!({"path":"README.md"}));

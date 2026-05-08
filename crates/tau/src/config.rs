@@ -5,6 +5,7 @@ use libtau::{
     providers::{Provider, ProviderApi, ProviderApiConfig, find_provider_api, openai},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 const CONFIG_PATH: &str = ".tau/providers.json";
 const DEFAULT_PROVIDER: &str = "openai";
@@ -34,6 +35,8 @@ struct ProviderConfig {
     #[serde(default)]
     base_url: Option<String>,
     #[serde(default)]
+    options: Value,
+    #[serde(default)]
     models: Vec<String>,
 }
 
@@ -43,6 +46,7 @@ struct ConfiguredProvider {
     provider_api: &'static ProviderApi,
     api_key: Option<String>,
     base_url: Option<String>,
+    options: Value,
     models: Vec<String>,
 }
 
@@ -170,7 +174,8 @@ impl CliConfig {
         Ok(provider.provider_api.build_provider(ProviderApiConfig {
             api_key,
             base_url: provider.base_url.clone(),
-        }))
+            options: provider.options.clone(),
+        })?)
     }
 
     fn save_current_model(
@@ -262,6 +267,7 @@ fn configured_providers(
             provider_api,
             api_key: provider_config.api_key.clone(),
             base_url: provider_config.base_url.clone(),
+            options: provider_config.options.clone(),
             models: provider_config.models.clone(),
         });
     }
@@ -273,6 +279,7 @@ fn configured_providers(
                 .expect("default provider API is registered"),
             api_key: None,
             base_url: None,
+            options: Value::Null,
             models: vec![DEFAULT_MODEL.to_string()],
         });
     }
@@ -361,6 +368,7 @@ mod tests {
             provider_api: find_provider_api(DEFAULT_API).unwrap(),
             api_key: None,
             base_url: None,
+            options: Value::Null,
             models: models.iter().map(|model| model.to_string()).collect(),
         }
     }
