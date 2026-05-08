@@ -67,7 +67,6 @@ fn normalize_base_url(base_url: impl Into<String>) -> String {
 
 impl AnthropicProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
-        //Self::with_base_url(api_key, DEFAULT_BASE_URL)
         Self {
             client: reqwest::Client::new(),
             api_key: api_key.into(),
@@ -216,11 +215,12 @@ pub enum AnthropicCacheTtl {
     OneHour,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase", deny_unknown_fields)]
 pub struct AnthropicWebSearchConfig {
-    #[serde(default = "default_web_search_enabled")]
-    pub enabled: bool,
+    // is this tool enabled (defaults to true)
+    #[serde(default)]
+    pub enabled: Option<bool>,
     #[serde(default)]
     pub max_uses: Option<u32>,
     #[serde(default)]
@@ -231,12 +231,7 @@ pub struct AnthropicWebSearchConfig {
 
 impl AnthropicWebSearchConfig {
     fn enabled() -> Self {
-        Self {
-            enabled: true,
-            max_uses: None,
-            allowed_domains: None,
-            blocked_domains: None,
-        }
+        Self::default()
     }
 
     fn options(&self) -> serde_json::Map<String, Value> {
@@ -441,10 +436,6 @@ fn build_request(
     })
 }
 
-fn default_web_search_enabled() -> bool {
-    true
-}
-
 fn anthropic_tools(
     session: &TauSession,
     web_search: Option<&AnthropicWebSearchConfig>,
@@ -460,7 +451,7 @@ fn anthropic_tools(
         })
         .collect();
 
-    if let Some(web_search) = web_search.filter(|config| config.enabled) {
+    if let Some(web_search) = web_search.filter(|config| config.enabled.unwrap_or(true)) {
         tools.push(AnthropicTool::Server {
             type_id: "web_search_20260209",
             name: "web_search",
@@ -827,7 +818,7 @@ mod tests {
             }],
         });
         let web_search = AnthropicWebSearchConfig {
-            enabled: true,
+            enabled: Some(true),
             max_uses: Some(3),
             allowed_domains: Some(vec!["example.com".to_string()]),
             blocked_domains: Some(vec!["bad.example".to_string()]),
@@ -897,7 +888,7 @@ mod tests {
 
         assert_eq!(options.cache_ttl, Some(AnthropicCacheTtl::OneHour));
         let web_search = options.web_search.unwrap();
-        assert!(web_search.enabled);
+        assert_eq!(web_search.enabled, Some(true));
         assert_eq!(web_search.max_uses, Some(2));
         assert_eq!(
             web_search.allowed_domains,
@@ -914,7 +905,7 @@ mod tests {
         let context = crate::context::TauContext::new();
         let session = context.session(AnthropicProvider::new("test-key"), "claude-sonnet-4-5");
         let web_search = AnthropicWebSearchConfig {
-            enabled: false,
+            enabled: Some(false),
             max_uses: Some(1),
             allowed_domains: None,
             blocked_domains: None,
