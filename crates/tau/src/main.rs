@@ -153,6 +153,7 @@ async fn run_turn(
                 ResponsePart::ServerToolUse { call } => {
                     println!("[server tool] {}", call.name);
                 }
+                ResponsePart::Stop { .. } => {}
             }
         }
 
@@ -215,6 +216,7 @@ fn print_content(content: &[ContentPart]) {
             ContentPart::Text { text, .. } => println!("{text}"),
             ContentPart::Json { value, .. } => println!("{}", pretty_json(value)),
             ContentPart::Thinking { text, .. } => println!("[thinking]\n{text}"),
+            ContentPart::Refusal { text, .. } => println!("[refusal]\n{text}"),
             ContentPart::Image {
                 media_type, data, ..
             } => {

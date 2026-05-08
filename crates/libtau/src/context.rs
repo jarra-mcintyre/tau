@@ -38,6 +38,7 @@ pub enum ConversationItem {
     Agent { content: Vec<ContentPart> },
     ToolUse { calls: Vec<ToolUse> },
     ToolResult { results: Vec<ToolResult> },
+    ResponseStop { stop: ResponseStop },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -69,6 +70,11 @@ pub enum ContentPart {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<Value>,
+    },
+    Refusal {
+        text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<Value>,
     },
@@ -104,6 +110,31 @@ pub enum ResponsePart {
     Content { content: ContentPart },
     ToolUse { call: ToolUse },
     ServerToolUse { call: ServerToolUse },
+    Stop { stop: ResponseStop },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseStopReason {
+    EndTurn,
+    MaxTokens,
+    StopSequence {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sequence: Option<String>,
+    },
+    ToolUse,
+    PauseTurn,
+    Refusal,
+    Other {
+        value: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResponseStop {
+    pub reason: ResponseStopReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -440,12 +471,14 @@ impl TauSession {
     fn record_provider_response(&mut self, response: &ProviderResponse) {
         let mut content = Vec::new();
         let mut tool_calls = Vec::new();
+        let mut stops = Vec::new();
 
         for part in &response.parts {
             match part {
                 ResponsePart::Content { content: part } => content.push(part.clone()),
                 ResponsePart::ToolUse { call } => tool_calls.push(call.clone()),
                 ResponsePart::ServerToolUse { .. } => {}
+                ResponsePart::Stop { stop } => stops.push(stop.clone()),
             }
         }
 
@@ -459,6 +492,9 @@ impl TauSession {
         }
         if !tool_calls.is_empty() {
             self.push_item(ConversationItem::ToolUse { calls: tool_calls });
+        }
+        for stop in stops {
+            self.push_item(ConversationItem::ResponseStop { stop });
         }
     }
 }
@@ -510,6 +546,7 @@ fn emit_tau_response(response: &TauResponse, on_event: &mut impl FnMut(TauEvent)
                 }
                 server_tool_calls.push(call.clone());
             }
+            ResponsePart::Stop { .. } => {}
         }
     }
 
@@ -613,6 +650,13 @@ impl ContentPart {
         Self::Thinking {
             text: text.into(),
             signature,
+            metadata: Some(metadata),
+        }
+    }
+
+    pub fn refusal_with_metadata(text: impl Into<String>, metadata: Value) -> Self {
+        Self::Refusal {
+            text: text.into(),
             metadata: Some(metadata),
         }
     }

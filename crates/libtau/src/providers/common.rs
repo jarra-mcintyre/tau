@@ -14,6 +14,7 @@ pub fn assistant_content_as_text(part: &ContentPart) -> String {
         ContentPart::Text { text, .. } => text.clone(),
         ContentPart::Json { value, .. } => value.to_string(),
         ContentPart::Thinking { text, .. } => format!("[thinking: {text}]"),
+        ContentPart::Refusal { text, .. } => text.clone(),
         ContentPart::Image {
             media_type, data, ..
         }

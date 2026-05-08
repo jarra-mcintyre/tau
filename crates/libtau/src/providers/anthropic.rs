@@ -6,8 +6,8 @@ use serde_json::Value;
 
 use crate::{
     context::{
-        ContentPart, ConversationItem, MediaData, ResponsePart, ServerToolUse, TauSession,
-        ToolResult, ToolUse,
+        ContentPart, ConversationItem, MediaData, ResponsePart, ResponseStop, ResponseStopReason,
+        ServerToolUse, TauSession, ToolResult, ToolUse,
     },
     providers::{
         Provider, ProviderApi, ProviderApiConfig, ProviderError, ProviderResponse, TokenUsage,
@@ -29,8 +29,6 @@ pub const API: ProviderApi = ProviderApi {
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
-const WEB_SEARCH_TOOL_TYPE: &str = "web_search_20260209";
-const WEB_SEARCH_TOOL_NAME: &str = "web_search";
 
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
@@ -351,7 +349,7 @@ enum AnthropicTool {
     },
     Server {
         #[serde(rename = "type")]
-        kind: &'static str,
+        type_id: &'static str,
         name: &'static str,
         #[serde(flatten)]
         options: serde_json::Map<String, Value>,
@@ -363,6 +361,8 @@ struct AnthropicResponse {
     #[serde(default)]
     content: Vec<Value>,
     usage: Option<AnthropicUsage>,
+    stop_reason: Option<String>,
+    stop_sequence: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -425,6 +425,7 @@ fn build_request(
                     .map(tool_result_content)
                     .collect::<Result<Vec<_>, _>>()?,
             ),
+            ConversationItem::ResponseStop { .. } => {}
         }
     }
 
@@ -461,16 +462,14 @@ fn anthropic_tools(
 
     if let Some(web_search) = web_search.filter(|config| config.enabled) {
         tools.push(AnthropicTool::Server {
-            kind: WEB_SEARCH_TOOL_TYPE,
-            name: WEB_SEARCH_TOOL_NAME,
+            type_id: "web_search_20260209",
+            name: "web_search",
             options: web_search.options(),
         });
     }
 
     tools
 }
-
-
 
 fn push_message(
     messages: &mut Vec<AnthropicMessage>,
@@ -507,14 +506,23 @@ fn parse_response(response: AnthropicResponse) -> Result<ProviderResponse, Provi
     let mut content = Vec::new();
     let mut tool_calls = Vec::new();
 
+    let is_refusal = response.stop_reason.as_deref() == Some("refusal");
+    let stop = anthropic_stop(
+        response.stop_reason.as_deref(),
+        response.stop_sequence.clone(),
+    );
+
     for part in response.content {
         match part.get("type").and_then(Value::as_str) {
             Some("text") => {
                 let text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
                     ProviderError::Response("Anthropic text block missing text".to_string())
                 })?;
-                let content_part =
-                    ContentPart::text_with_metadata(text, content_block_metadata(part.clone()));
+                let content_part = if is_refusal {
+                    ContentPart::refusal_with_metadata(text, content_block_metadata(part.clone()))
+                } else {
+                    ContentPart::text_with_metadata(text, content_block_metadata(part.clone()))
+                };
                 parts.push(ResponsePart::Content {
                     content: content_part.clone(),
                 });
@@ -598,11 +606,37 @@ fn parse_response(response: AnthropicResponse) -> Result<ProviderResponse, Provi
         }
     }
 
+    if let Some(stop) = stop {
+        parts.push(ResponsePart::Stop { stop });
+    }
+
     Ok(ProviderResponse {
         parts,
         content,
         tool_calls,
         usage,
+    })
+}
+
+fn anthropic_stop(reason: Option<&str>, sequence: Option<String>) -> Option<ResponseStop> {
+    let reason = match reason? {
+        "end_turn" => ResponseStopReason::EndTurn,
+        "max_tokens" => ResponseStopReason::MaxTokens,
+        "stop_sequence" => ResponseStopReason::StopSequence { sequence },
+        "tool_use" => ResponseStopReason::ToolUse,
+        "pause_turn" => ResponseStopReason::PauseTurn,
+        "refusal" => ResponseStopReason::Refusal,
+        other => ResponseStopReason::Other {
+            value: other.to_string(),
+        },
+    };
+
+    Some(ResponseStop {
+        reason,
+        metadata: Some(serde_json::json!({
+            "provider": PROVIDER_NAME,
+            "kind": "anthropic.stop",
+        })),
     })
 }
 
@@ -660,11 +694,15 @@ fn input_content_parts(parts: &[ContentPart]) -> Result<Vec<AnthropicContent>, P
             ContentPart::Thinking { text, .. } => Ok(AnthropicContent::Text {
                 text: format!("[thinking: {text}]"),
             }),
+            ContentPart::Refusal { text, .. } => Ok(AnthropicContent::Text { text: text.clone() }),
         })
         .collect()
 }
 
 fn output_content_parts(parts: &[ContentPart]) -> Vec<AnthropicContent> {
+    fn is_type(value: &Value, type_id: &str) -> bool {
+        value.get("type").and_then(Value::as_str) == Some(type_id)
+    }
     parts
         .iter()
         .map(|part| match part {
@@ -675,9 +713,8 @@ fn output_content_parts(parts: &[ContentPart]) -> Vec<AnthropicContent> {
                 thinking: text.clone(),
                 signature: signature.clone(),
             },
-            ContentPart::Json { value, metadata }
-                if is_anthropic_redacted_thinking(value, metadata) =>
-            {
+            ContentPart::Refusal { text, .. } => AnthropicContent::Text { text: text.clone() },
+            ContentPart::Json { value, metadata: _ } if is_type(value, "redacted_thinking") => {
                 AnthropicContent::RedactedThinking {
                     data: value
                         .get("data")
@@ -686,9 +723,7 @@ fn output_content_parts(parts: &[ContentPart]) -> Vec<AnthropicContent> {
                         .to_string(),
                 }
             }
-            ContentPart::Json { value, metadata }
-                if is_anthropic_server_tool_use(value, metadata) =>
-            {
+            ContentPart::Json { value, metadata: _ } if is_type(value, "server_tool_use") => {
                 AnthropicContent::ServerToolUse {
                     id: value
                         .get("id")
@@ -703,8 +738,8 @@ fn output_content_parts(parts: &[ContentPart]) -> Vec<AnthropicContent> {
                     input: value.get("input").cloned().unwrap_or(Value::Null),
                 }
             }
-            ContentPart::Json { value, metadata }
-                if is_anthropic_web_search_tool_result(value, metadata) =>
+            ContentPart::Json { value, metadata: _ }
+                if is_type(value, "web_search_tool_result") =>
             {
                 AnthropicContent::WebSearchToolResult {
                     tool_use_id: value
@@ -720,27 +755,6 @@ fn output_content_parts(parts: &[ContentPart]) -> Vec<AnthropicContent> {
             },
         })
         .collect()
-}
-
-fn is_anthropic_redacted_thinking(value: &Value, metadata: &Option<Value>) -> bool {
-    is_anthropic_content_block(value, metadata, "redacted_thinking")
-}
-
-fn is_anthropic_server_tool_use(value: &Value, metadata: &Option<Value>) -> bool {
-    is_anthropic_content_block(value, metadata, "server_tool_use")
-}
-
-fn is_anthropic_web_search_tool_result(value: &Value, metadata: &Option<Value>) -> bool {
-    is_anthropic_content_block(value, metadata, "web_search_tool_result")
-}
-
-fn is_anthropic_content_block(value: &Value, metadata: &Option<Value>, block_type: &str) -> bool {
-    value.get("type").and_then(Value::as_str) == Some(block_type)
-        && metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get("provider"))
-            .and_then(Value::as_str)
-            == Some(PROVIDER_NAME)
 }
 
 fn tool_result_content(result: &ToolResult) -> Result<AnthropicContent, ProviderError> {
@@ -834,7 +848,6 @@ mod tests {
         assert_eq!(value["system"][0]["type"], "text");
         assert_eq!(value["tools"][0]["name"], "echo");
         assert_eq!(value["tools"][0]["strict"], true);
-        assert_eq!(value["tools"][1]["type"], WEB_SEARCH_TOOL_TYPE);
         assert_eq!(value["tools"][1]["name"], "web_search");
         assert_eq!(value["tools"][1]["max_uses"], 3);
         assert_eq!(value["tools"][1]["allowed_domains"], json!(["example.com"]));
@@ -925,6 +938,8 @@ mod tests {
                 input_tokens: Some(50),
                 output_tokens: Some(12),
             }),
+            stop_reason: Some("tool_use".to_string()),
+            stop_sequence: None,
             content: vec![
                 json!({"type": "text", "text": "I'll check.", "citations": [{"type":"web_search_result_location","url":"https://example.com","title":"Example"}]}),
                 json!({"type": "thinking", "thinking": "I should inspect the files.", "signature": "sig_1"}),

@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    context::{ContentPart, ConversationItem, ResponsePart, TauSession, ToolResult, ToolUse},
+    context::{
+        ContentPart, ConversationItem, ResponsePart, ResponseStop, ResponseStopReason, TauSession,
+        ToolResult, ToolUse,
+    },
     providers::{
         Provider, ProviderApi, ProviderApiConfig, ProviderError, ProviderResponse, TokenUsage,
         common::{
@@ -195,6 +198,13 @@ struct OpenAiResponse {
     #[serde(default)]
     output: Vec<Value>,
     usage: Option<OpenAiUsage>,
+    status: Option<String>,
+    incomplete_details: Option<OpenAiIncompleteDetails>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAiIncompleteDetails {
+    reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -264,6 +274,7 @@ fn build_request(session: &TauSession) -> Result<OpenAiRequest, ProviderError> {
                     ));
                 }
             }
+            ConversationItem::ResponseStop { .. } => {}
         }
     }
 
@@ -321,9 +332,13 @@ fn parse_response(response: OpenAiResponse) -> Result<ProviderResponse, Provider
     let mut content = Vec::new();
     let mut tool_calls = Vec::new();
 
+    let mut saw_refusal = false;
+
     for item in response.output {
         match item.get("type").and_then(Value::as_str) {
-            Some("message") => parse_message_output_item(item, &mut parts, &mut content)?,
+            Some("message") => {
+                saw_refusal |= parse_message_output_item(item, &mut parts, &mut content)?;
+            }
             Some("function_call") => {
                 let function_call: OpenAiFunctionCallOutput = serde_json::from_value(item.clone())?;
                 let input = serde_json::from_str(&function_call.arguments).map_err(|error| {
@@ -360,6 +375,15 @@ fn parse_response(response: OpenAiResponse) -> Result<ProviderResponse, Provider
         }
     }
 
+    if let Some(stop) = openai_stop(
+        response.status.as_deref(),
+        response.incomplete_details.as_ref(),
+        saw_refusal,
+        !tool_calls.is_empty(),
+    ) {
+        parts.push(ResponsePart::Stop { stop });
+    }
+
     Ok(ProviderResponse {
         parts,
         content,
@@ -368,17 +392,63 @@ fn parse_response(response: OpenAiResponse) -> Result<ProviderResponse, Provider
     })
 }
 
+fn openai_stop(
+    status: Option<&str>,
+    incomplete_details: Option<&OpenAiIncompleteDetails>,
+    saw_refusal: bool,
+    has_tool_calls: bool,
+) -> Option<ResponseStop> {
+    let reason = if saw_refusal {
+        ResponseStopReason::Refusal
+    } else if has_tool_calls {
+        ResponseStopReason::ToolUse
+    } else {
+        match status? {
+            "completed" => ResponseStopReason::EndTurn,
+            "incomplete" => {
+                match incomplete_details.and_then(|details| details.reason.as_deref()) {
+                    Some("max_output_tokens") => ResponseStopReason::MaxTokens,
+                    Some("content_filter") => ResponseStopReason::Refusal,
+                    Some(other) => ResponseStopReason::Other {
+                        value: other.to_string(),
+                    },
+                    None => ResponseStopReason::Other {
+                        value: "incomplete".to_string(),
+                    },
+                }
+            }
+            other => ResponseStopReason::Other {
+                value: other.to_string(),
+            },
+        }
+    };
+
+    Some(ResponseStop {
+        reason,
+        metadata: Some(serde_json::json!({
+            "provider": PROVIDER_NAME,
+            "kind": "openai.stop",
+            "status": status,
+            "incomplete_details": incomplete_details.map(|details| serde_json::json!({
+                "reason": details.reason,
+            })),
+        })),
+    })
+}
+
 fn parse_message_output_item(
     item: Value,
     parts_out: &mut Vec<ResponsePart>,
     content: &mut Vec<ContentPart>,
-) -> Result<(), ProviderError> {
+) -> Result<bool, ProviderError> {
     let parts = item
         .get("content")
         .and_then(Value::as_array)
         .ok_or_else(|| {
             ProviderError::Response("OpenAI message output missing content array".to_string())
         })?;
+
+    let mut saw_refusal = false;
 
     for part in parts {
         let metadata = raw_metadata("openai.message_content", part.clone());
@@ -397,7 +467,8 @@ fn parse_message_output_item(
                 let refusal = part.get("refusal").and_then(Value::as_str).ok_or_else(|| {
                     ProviderError::Response("OpenAI refusal missing refusal text".to_string())
                 })?;
-                let content_part = ContentPart::text_with_metadata(refusal, metadata);
+                saw_refusal = true;
+                let content_part = ContentPart::refusal_with_metadata(refusal, metadata);
                 parts_out.push(ResponsePart::Content {
                     content: content_part.clone(),
                 });
@@ -413,7 +484,7 @@ fn parse_message_output_item(
         }
     }
 
-    Ok(())
+    Ok(saw_refusal)
 }
 
 fn openai_reasoning_content(item: Value) -> ContentPart {
@@ -465,6 +536,9 @@ fn input_content_parts(parts: &[ContentPart]) -> Result<Vec<OpenAiContent>, Prov
             ContentPart::Thinking { text, .. } => Ok(OpenAiContent::InputText {
                 text: format!("[thinking: {text}]"),
             }),
+            ContentPart::Refusal { text, .. } => {
+                Ok(OpenAiContent::InputText { text: text.clone() })
+            }
         })
         .collect()
 }
@@ -477,6 +551,7 @@ fn output_content_parts(parts: &[ContentPart]) -> Vec<OpenAiContent> {
             ContentPart::Thinking { text, .. } => OpenAiContent::OutputText {
                 text: format!("[thinking: {text}]"),
             },
+            ContentPart::Refusal { text, .. } => OpenAiContent::OutputText { text: text.clone() },
             part => OpenAiContent::OutputText {
                 text: assistant_content_as_text(part),
             },
@@ -598,6 +673,8 @@ mod tests {
                 output_tokens: Some(20),
                 total_tokens: Some(120),
             }),
+            status: Some("completed".to_string()),
+            incomplete_details: None,
             output: vec![
                 json!({
                     "type": "message",
