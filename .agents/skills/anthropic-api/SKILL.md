@@ -54,7 +54,15 @@ Automatic caching example (as per Anthropic docs):
 }
 ```
 
+# Stop reasons
 
+Every response to a successful message will have a `stop_reason` field. This is an enum that will be set to:
+- `end_turn` - the model naturally ended its turn (possibly sending an empty message)
+- `max_tokens` - the maximum token limit was encountered
+- `stop_sequence` - a custom stop sequence (specified with the `stop_sequence` parameter) was encountered
+- `tool_use` - a tool use was requested
+- `pause_turn` - server sampling loop reached its iteration limit. Response may contain a `server_tool_use` block without a corresponding `server_tool_result`. send back the response as is to signal to the model to keep processing.
+- `refusal` - model refused to generate response
    
 
 # More information
