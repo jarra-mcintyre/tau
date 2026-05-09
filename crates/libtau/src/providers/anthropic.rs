@@ -11,9 +11,7 @@ use crate::{
     },
     providers::{
         Provider, ProviderApi, ProviderApiConfig, ProviderError, ProviderResponse, TokenUsage,
-        common::{
-            assistant_content_as_text, binary_content_as_text, json_as_text, tool_result_json,
-        },
+        common::{binary_content_as_text, json_as_text, tool_result_json},
     },
 };
 
@@ -118,7 +116,7 @@ impl Provider for AnthropicProvider {
     }
 
     async fn respond(&self, session: &mut TauSession) -> Result<ProviderResponse, ProviderError> {
-        let request = build_request(
+        let (request, conversation) = build_request(
             session,
             self.max_tokens,
             self.cache_ttl,
@@ -155,7 +153,10 @@ impl Provider for AnthropicProvider {
         }
 
         let response: AnthropicResponse = serde_json::from_str(&body)?;
-        parse_response(response)
+        let native_content = response.content.clone();
+        let parsed = parse_response(response)?;
+        record_anthropic_response(session, conversation, native_content)?;
+        Ok(parsed)
     }
 }
 
@@ -351,6 +352,12 @@ enum AnthropicTool {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+struct AnthropicConversationData {
+    system: Vec<AnthropicContent>,
+    messages: Vec<AnthropicMessage>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct AnthropicResponse {
     #[serde(default)]
@@ -374,66 +381,103 @@ struct AnthropicToolUseOutput {
 }
 
 fn build_request(
-    session: &TauSession,
+    session: &mut TauSession,
     max_tokens: u32,
     cache_ttl: Option<AnthropicCacheTtl>,
     web_search: Option<&AnthropicWebSearchConfig>,
-) -> Result<AnthropicRequest, ProviderError> {
+) -> Result<(AnthropicRequest, AnthropicConversationData), ProviderError> {
     let model = session
         .model()
         .ok_or(ProviderError::MissingModel)?
         .to_string();
 
-    let mut system = Vec::new();
-    let mut messages = Vec::new();
+    let mut conversation = session
+        .provider_conversation_data::<AnthropicConversationData>()
+        .unwrap_or_default();
+    append_anthropic_input_items(&mut conversation, pending_input_items(session))?;
 
-    for item in &session.conversation().items {
+    let tools = anthropic_tools(session, web_search);
+
+    Ok((
+        AnthropicRequest {
+            model,
+            max_tokens,
+            cache_control: cache_ttl.map(AnthropicCacheControl::new),
+            system: conversation.system.clone(),
+            messages: conversation.messages.clone(),
+            tools,
+        },
+        conversation,
+    ))
+}
+
+fn append_anthropic_input_items(
+    data: &mut AnthropicConversationData,
+    items: &[ConversationItem],
+) -> Result<(), ProviderError> {
+    for item in items {
         match item {
-            ConversationItem::System { content } => system.extend(input_content_parts(content)?),
+            ConversationItem::System { content } => {
+                data.system.extend(input_content_parts(content)?)
+            }
             ConversationItem::User { content } => push_message(
-                &mut messages,
+                &mut data.messages,
                 AnthropicRole::User,
                 input_content_parts(content)?,
             ),
-            ConversationItem::Agent { content } => push_message(
-                &mut messages,
-                AnthropicRole::Assistant,
-                output_content_parts(content),
-            ),
-            ConversationItem::ToolUse { calls } => push_message(
-                &mut messages,
-                AnthropicRole::Assistant,
-                calls
-                    .iter()
-                    .map(|call| AnthropicContent::ToolUse {
-                        id: call.id.clone(),
-                        name: call.name.clone(),
-                        input: call.input.clone(),
-                    })
-                    .collect(),
-            ),
             ConversationItem::ToolResult { results } => push_message(
-                &mut messages,
+                &mut data.messages,
                 AnthropicRole::User,
                 results
                     .iter()
                     .map(tool_result_content)
                     .collect::<Result<Vec<_>, _>>()?,
             ),
-            ConversationItem::ResponseStop { .. } => {}
+            ConversationItem::Agent { .. }
+            | ConversationItem::ToolUse { .. }
+            | ConversationItem::ResponseStop { .. } => {}
         }
     }
 
-    let tools = anthropic_tools(session, web_search);
+    Ok(())
+}
 
-    Ok(AnthropicRequest {
-        model,
-        max_tokens,
-        cache_control: cache_ttl.map(AnthropicCacheControl::new),
-        system,
-        messages,
-        tools,
-    })
+fn record_anthropic_response(
+    session: &mut TauSession,
+    mut conversation: AnthropicConversationData,
+    native_content: Vec<Value>,
+) -> Result<(), ProviderError> {
+    if native_content.is_empty() {
+        session.set_provider_conversation_data(&conversation)?;
+        return Ok(());
+    }
+
+    let content = native_content
+        .into_iter()
+        .map(serde_json::from_value)
+        .collect::<Result<Vec<AnthropicContent>, _>>()?;
+    push_message(
+        &mut conversation.messages,
+        AnthropicRole::Assistant,
+        content,
+    );
+    session.set_provider_conversation_data(&conversation)
+}
+
+fn pending_input_items(session: &TauSession) -> &[ConversationItem] {
+    let items = &session.conversation().items;
+    let start = items
+        .iter()
+        .rposition(|item| {
+            matches!(
+                item,
+                ConversationItem::Agent { .. }
+                    | ConversationItem::ToolUse { .. }
+                    | ConversationItem::ResponseStop { .. }
+            )
+        })
+        .map_or(0, |index| index + 1);
+    &items[start..]
 }
 
 fn anthropic_tools(
@@ -510,9 +554,15 @@ fn parse_response(response: AnthropicResponse) -> Result<ProviderResponse, Provi
                     ProviderError::Response("Anthropic text block missing text".to_string())
                 })?;
                 let content_part = if is_refusal {
-                    ContentPart::refusal_with_metadata(text, content_block_metadata(part.clone()))
+                    ContentPart::Refusal {
+                        text: text.to_string(),
+                        metadata: content_block_metadata(&part),
+                    }
                 } else {
-                    ContentPart::text_with_metadata(text, content_block_metadata(part.clone()))
+                    ContentPart::Text {
+                        text: text.to_string(),
+                        metadata: content_block_metadata(&part),
+                    }
                 };
                 parts.push(ResponsePart::Content {
                     content: content_part.clone(),
@@ -541,11 +591,10 @@ fn parse_response(response: AnthropicResponse) -> Result<ProviderResponse, Provi
                         .unwrap_or("web_search")
                         .to_string(),
                     input: part.get("input").cloned().unwrap_or(Value::Null),
-                    metadata: Some(content_block_metadata(part.clone())),
+                    metadata: Some(provider_metadata("anthropic.server_tool_use")),
                 };
                 parts.push(ResponsePart::ServerToolUse { call });
-                let content_part =
-                    ContentPart::json_with_metadata(part.clone(), content_block_metadata(part));
+                let content_part = ContentPart::json(part.clone());
                 parts.push(ResponsePart::Content {
                     content: content_part.clone(),
                 });
@@ -564,31 +613,25 @@ fn parse_response(response: AnthropicResponse) -> Result<ProviderResponse, Provi
                     .get("signature")
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
-                let content_part = ContentPart::thinking_with_metadata(
-                    text,
+                let content_part = ContentPart::Thinking {
+                    text: text.to_string(),
                     signature,
-                    raw_metadata("anthropic.content_block", part.clone()),
-                );
+                    metadata: None,
+                };
                 parts.push(ResponsePart::Content {
                     content: content_part.clone(),
                 });
                 content.push(content_part);
             }
             Some("redacted_thinking") => {
-                let content_part = ContentPart::json_with_metadata(
-                    part.clone(),
-                    raw_metadata("anthropic.content_block", part),
-                );
+                let content_part = ContentPart::json(part.clone());
                 parts.push(ResponsePart::Content {
                     content: content_part.clone(),
                 });
                 content.push(content_part);
             }
             _ => {
-                let content_part = ContentPart::json_with_metadata(
-                    part.clone(),
-                    raw_metadata("anthropic.content_block", part),
-                );
+                let content_part = ContentPart::json(part.clone());
                 parts.push(ResponsePart::Content {
                     content: content_part.clone(),
                 });
@@ -631,25 +674,20 @@ fn anthropic_stop(reason: Option<&str>, sequence: Option<String>) -> Option<Resp
     })
 }
 
-fn content_block_metadata(raw: Value) -> Value {
-    let mut metadata = serde_json::json!({
-        "provider": PROVIDER_NAME,
-        "kind": "anthropic.content_block",
-        "raw": raw,
-    });
-
-    if let Some(citations) = metadata["raw"].get("citations").cloned() {
-        metadata["citations"] = citations;
-    }
-
-    metadata
+fn content_block_metadata(block: &Value) -> Option<Value> {
+    block.get("citations").cloned().map(|citations| {
+        serde_json::json!({
+            "provider": PROVIDER_NAME,
+            "kind": "citations",
+            "citations": citations,
+        })
+    })
 }
 
-fn raw_metadata(kind: &str, raw: Value) -> Value {
+fn provider_metadata(kind: &str) -> Value {
     serde_json::json!({
         "provider": PROVIDER_NAME,
         "kind": kind,
-        "raw": raw,
     })
 }
 
@@ -686,64 +724,6 @@ fn input_content_parts(parts: &[ContentPart]) -> Result<Vec<AnthropicContent>, P
                 text: format!("[thinking: {text}]"),
             }),
             ContentPart::Refusal { text, .. } => Ok(AnthropicContent::Text { text: text.clone() }),
-        })
-        .collect()
-}
-
-fn output_content_parts(parts: &[ContentPart]) -> Vec<AnthropicContent> {
-    fn is_type(value: &Value, type_id: &str) -> bool {
-        value.get("type").and_then(Value::as_str) == Some(type_id)
-    }
-    parts
-        .iter()
-        .map(|part| match part {
-            ContentPart::Text { text, .. } => AnthropicContent::Text { text: text.clone() },
-            ContentPart::Thinking {
-                text, signature, ..
-            } => AnthropicContent::Thinking {
-                thinking: text.clone(),
-                signature: signature.clone(),
-            },
-            ContentPart::Refusal { text, .. } => AnthropicContent::Text { text: text.clone() },
-            ContentPart::Json { value, metadata: _ } if is_type(value, "redacted_thinking") => {
-                AnthropicContent::RedactedThinking {
-                    data: value
-                        .get("data")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                }
-            }
-            ContentPart::Json { value, metadata: _ } if is_type(value, "server_tool_use") => {
-                AnthropicContent::ServerToolUse {
-                    id: value
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    name: value
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("web_search")
-                        .to_string(),
-                    input: value.get("input").cloned().unwrap_or(Value::Null),
-                }
-            }
-            ContentPart::Json { value, metadata: _ }
-                if is_type(value, "web_search_tool_result") =>
-            {
-                AnthropicContent::WebSearchToolResult {
-                    tool_use_id: value
-                        .get("tool_use_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    content: value.get("content").cloned().unwrap_or(Value::Null),
-                }
-            }
-            part => AnthropicContent::Text {
-                text: assistant_content_as_text(part),
-            },
         })
         .collect()
 }
@@ -817,6 +797,38 @@ mod tests {
                 error: None,
             }],
         });
+        session
+            .set_provider_conversation_data(&AnthropicConversationData {
+                system: vec![AnthropicContent::Text {
+                    text: "be helpful".to_string(),
+                }],
+                messages: vec![
+                    AnthropicMessage {
+                        role: AnthropicRole::User,
+                        content: vec![AnthropicContent::Text {
+                            text: "hello".to_string(),
+                        }],
+                    },
+                    AnthropicMessage {
+                        role: AnthropicRole::Assistant,
+                        content: vec![
+                            AnthropicContent::Text {
+                                text: "I'll call a tool.".to_string(),
+                            },
+                            AnthropicContent::Thinking {
+                                thinking: "Need to echo.".to_string(),
+                                signature: Some("sig_1".to_string()),
+                            },
+                            AnthropicContent::ToolUse {
+                                id: "toolu_1".to_string(),
+                                name: "echo".to_string(),
+                                input: json!({"text":"hello"}),
+                            },
+                        ],
+                    },
+                ],
+            })
+            .unwrap();
         let web_search = AnthropicWebSearchConfig {
             enabled: Some(true),
             max_uses: Some(3),
@@ -824,13 +836,13 @@ mod tests {
             blocked_domains: Some(vec!["bad.example".to_string()]),
         };
         let request = build_request(
-            &session,
+            &mut session,
             DEFAULT_MAX_TOKENS,
             Some(AnthropicCacheTtl::FiveMinutes),
             Some(&web_search),
         )
         .unwrap();
-        let value = serde_json::to_value(request).unwrap();
+        let value = serde_json::to_value(request.0).unwrap();
 
         assert_eq!(value["model"], "claude-sonnet-4-5");
         assert_eq!(value["max_tokens"], DEFAULT_MAX_TOKENS);
@@ -856,15 +868,15 @@ mod tests {
     #[test]
     fn configures_one_hour_automatic_cache_ttl() {
         let context = crate::context::TauContext::new();
-        let session = context.session(AnthropicProvider::new("test-key"), "claude-sonnet-4-5");
+        let mut session = context.session(AnthropicProvider::new("test-key"), "claude-sonnet-4-5");
         let request = build_request(
-            &session,
+            &mut session,
             DEFAULT_MAX_TOKENS,
             Some(AnthropicCacheTtl::OneHour),
             None,
         )
         .unwrap();
-        let value = serde_json::to_value(request).unwrap();
+        let value = serde_json::to_value(request.0).unwrap();
 
         assert_eq!(
             value["cache_control"],
@@ -903,7 +915,7 @@ mod tests {
     #[test]
     fn disables_web_search_when_configured_off() {
         let context = crate::context::TauContext::new();
-        let session = context.session(AnthropicProvider::new("test-key"), "claude-sonnet-4-5");
+        let mut session = context.session(AnthropicProvider::new("test-key"), "claude-sonnet-4-5");
         let web_search = AnthropicWebSearchConfig {
             enabled: Some(false),
             max_uses: Some(1),
@@ -911,13 +923,13 @@ mod tests {
             blocked_domains: None,
         };
         let request = build_request(
-            &session,
+            &mut session,
             DEFAULT_MAX_TOKENS,
             Some(AnthropicCacheTtl::FiveMinutes),
             Some(&web_search),
         )
         .unwrap();
-        let value = serde_json::to_value(request).unwrap();
+        let value = serde_json::to_value(request.0).unwrap();
 
         assert!(value.get("tools").is_none());
     }
@@ -956,10 +968,7 @@ mod tests {
         match &parsed.content[0] {
             ContentPart::Text { text, metadata } => {
                 assert_eq!(text, "I'll check.");
-                assert_eq!(
-                    metadata.as_ref().unwrap()["kind"],
-                    "anthropic.content_block"
-                );
+                assert_eq!(metadata.as_ref().unwrap()["kind"], "citations");
                 assert_eq!(
                     metadata.as_ref().unwrap()["citations"][0]["url"],
                     "https://example.com"
@@ -975,20 +984,14 @@ mod tests {
             } => {
                 assert_eq!(text, "I should inspect the files.");
                 assert_eq!(signature.as_deref(), Some("sig_1"));
-                assert_eq!(
-                    metadata.as_ref().unwrap()["kind"],
-                    "anthropic.content_block"
-                );
+                assert!(metadata.is_none());
             }
             other => panic!("expected thinking content, got {other:?}"),
         }
         match &parsed.content[2] {
             ContentPart::Json { value, metadata } => {
                 assert_eq!(value["type"], "server_tool_use");
-                assert_eq!(
-                    metadata.as_ref().unwrap()["kind"],
-                    "anthropic.content_block"
-                );
+                assert!(metadata.is_none());
             }
             other => panic!("expected json content, got {other:?}"),
         }

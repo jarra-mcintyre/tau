@@ -28,6 +28,14 @@ pub struct TauSession {
 pub struct Conversation {
     pub model: Option<String>,
     pub items: Vec<ConversationItem>,
+    /// Provider-specific conversation state for the session's current provider.
+    ///
+    /// Generic Tau content is stored in `items`; providers use this field to
+    /// persist their native replay format (for example Anthropic content blocks
+    /// with cache-control-sensitive structure, or OpenAI response ids). Switching
+    /// provider invalidates this state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_data: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -309,6 +317,7 @@ impl TauSession {
     pub fn set_provider_arc(&mut self, provider: Arc<dyn Provider>) {
         self.provider = provider;
         self.provider_state.clear();
+        self.conversation.provider_data = None;
         self.last_token_usage = None;
     }
 
@@ -339,6 +348,28 @@ impl TauSession {
 
     pub fn conversation_mut(&mut self) -> &mut Conversation {
         &mut self.conversation
+    }
+
+    pub fn provider_conversation_data<T>(&self) -> Option<T>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        self.conversation
+            .provider_data
+            .clone()
+            .and_then(|value| serde_json::from_value(value).ok())
+    }
+
+    pub fn set_provider_conversation_data<T>(&mut self, data: &T) -> Result<(), ProviderError>
+    where
+        T: Serialize,
+    {
+        self.conversation.provider_data = Some(serde_json::to_value(data)?);
+        Ok(())
+    }
+
+    pub fn clear_provider_conversation_data(&mut self) {
+        self.conversation.provider_data = None;
     }
 
     pub fn push_item(&mut self, item: ConversationItem) {

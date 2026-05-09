@@ -41,6 +41,12 @@ pub struct OpenAiState {
     pub previous_response_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+struct OpenAiConversationData {
+    previous_response_id: Option<String>,
+    output: Vec<Value>,
+}
+
 fn build_provider(config: ProviderApiConfig) -> Result<Arc<dyn Provider>, ProviderError> {
     Ok(match config.base_url {
         Some(base_url) => Arc::new(OpenAiProvider::with_base_url(config.api_key, base_url)),
@@ -76,7 +82,7 @@ impl Provider for OpenAiProvider {
     }
 
     async fn respond(&self, session: &mut TauSession) -> Result<ProviderResponse, ProviderError> {
-        let request = build_request(session)?;
+        let (request, conversation) = build_request(session)?;
         let url = format!("{}/responses", self.base_url);
         let request_body = serde_json::to_string_pretty(&request)?;
         tracing::debug!(
@@ -107,14 +113,12 @@ impl Provider for OpenAiProvider {
         }
 
         let response: OpenAiResponse = serde_json::from_str(&body)?;
-        session.set_provider_state(
-            PROVIDER_NAME,
-            OpenAiState {
-                previous_response_id: Some(response.id.clone()),
-            },
-        );
+        let native_output = response.output.clone();
+        let response_id = response.id.clone();
+        let parsed = parse_response(response)?;
+        record_openai_response(session, conversation, response_id, native_output)?;
 
-        parse_response(response)
+        Ok(parsed)
     }
 }
 
@@ -221,72 +225,114 @@ struct OpenAiFunctionCallOutput {
     arguments: String,
 }
 
-fn build_request(session: &TauSession) -> Result<OpenAiRequest, ProviderError> {
+fn build_request(
+    session: &mut TauSession,
+) -> Result<(OpenAiRequest, OpenAiConversationData), ProviderError> {
     let model = session
         .model()
         .ok_or(ProviderError::MissingModel)?
         .to_string();
 
-    let previous_response_id = session
-        .provider_state::<OpenAiState>(PROVIDER_NAME)
-        .and_then(|state| state.previous_response_id.clone());
-    let items = incremental_input_items(session, previous_response_id.as_deref());
+    let conversation = session
+        .provider_conversation_data::<OpenAiConversationData>()
+        .or_else(|| {
+            session
+                .provider_state::<OpenAiState>(PROVIDER_NAME)
+                .map(|state| OpenAiConversationData {
+                    previous_response_id: state.previous_response_id.clone(),
+                    output: Vec::new(),
+                })
+        })
+        .unwrap_or_default();
+    let previous_response_id = conversation.previous_response_id.clone();
 
+    let input_items = if previous_response_id.is_some() {
+        pending_input_items(session)
+    } else {
+        &session.conversation().items
+    };
     let mut input = Vec::new();
-    for item in items {
-        match item {
-            ConversationItem::System { content } => {
-                input.push(OpenAiInputItem::Message(OpenAiMessage {
-                    role: OpenAiRole::System,
-                    content: input_content_parts(content)?,
-                }))
-            }
-            ConversationItem::User { content } => {
-                input.push(OpenAiInputItem::Message(OpenAiMessage {
-                    role: OpenAiRole::User,
-                    content: input_content_parts(content)?,
-                }))
-            }
-            ConversationItem::Agent { content } => {
-                input.push(OpenAiInputItem::Message(OpenAiMessage {
-                    role: OpenAiRole::Assistant,
-                    content: output_content_parts(content),
-                }))
-            }
-            ConversationItem::ToolUse { calls } => {
-                for call in calls {
-                    input.push(OpenAiInputItem::FunctionCall(OpenAiFunctionCallItem {
-                        kind: "function_call",
-                        call_id: call.id.clone(),
-                        name: call.name.clone(),
-                        arguments: serde_json::to_string(&call.input)?,
-                    }));
-                }
-            }
-            ConversationItem::ToolResult { results } => {
-                for result in results {
-                    input.push(OpenAiInputItem::FunctionCallOutput(
-                        OpenAiFunctionCallOutputItem {
-                            kind: "function_call_output",
-                            call_id: result.call_id.clone(),
-                            output: tool_result_output(result)?,
-                        },
-                    ));
-                }
-            }
-            ConversationItem::ResponseStop { .. } => {}
-        }
+    for item in input_items {
+        input.extend(openai_input_items_for_conversation_item(item)?);
     }
 
     let tools = openai_tools(session);
 
-    Ok(OpenAiRequest {
-        model,
-        input,
-        tools,
-        parallel_tool_calls: true,
-        previous_response_id,
-    })
+    Ok((
+        OpenAiRequest {
+            model,
+            input,
+            tools,
+            parallel_tool_calls: true,
+            previous_response_id,
+        },
+        conversation,
+    ))
+}
+
+fn openai_input_items_for_conversation_item(
+    item: &ConversationItem,
+) -> Result<Vec<OpenAiInputItem>, ProviderError> {
+    let mut input = Vec::new();
+    match item {
+        ConversationItem::System { content } => {
+            input.push(OpenAiInputItem::Message(OpenAiMessage {
+                role: OpenAiRole::System,
+                content: input_content_parts(content)?,
+            }))
+        }
+        ConversationItem::User { content } => input.push(OpenAiInputItem::Message(OpenAiMessage {
+            role: OpenAiRole::User,
+            content: input_content_parts(content)?,
+        })),
+        ConversationItem::Agent { content } => {
+            input.push(OpenAiInputItem::Message(OpenAiMessage {
+                role: OpenAiRole::Assistant,
+                content: output_content_parts(content),
+            }))
+        }
+        ConversationItem::ToolUse { calls } => {
+            for call in calls {
+                input.push(OpenAiInputItem::FunctionCall(OpenAiFunctionCallItem {
+                    kind: "function_call",
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: serde_json::to_string(&call.input)?,
+                }));
+            }
+        }
+        ConversationItem::ToolResult { results } => {
+            for result in results {
+                input.push(OpenAiInputItem::FunctionCallOutput(
+                    OpenAiFunctionCallOutputItem {
+                        kind: "function_call_output",
+                        call_id: result.call_id.clone(),
+                        output: tool_result_output(result)?,
+                    },
+                ));
+            }
+        }
+        ConversationItem::ResponseStop { .. } => {}
+    }
+    Ok(input)
+}
+
+fn record_openai_response(
+    session: &mut TauSession,
+    mut conversation: OpenAiConversationData,
+    response_id: String,
+    native_output: Vec<Value>,
+) -> Result<(), ProviderError> {
+    session.set_provider_state(
+        PROVIDER_NAME,
+        OpenAiState {
+            previous_response_id: Some(response_id.clone()),
+        },
+    );
+
+    conversation.previous_response_id = Some(response_id);
+    conversation.output.extend(native_output);
+    session.set_provider_conversation_data(&conversation)
 }
 
 fn openai_tools(session: &TauSession) -> Vec<OpenAiTool> {
@@ -306,19 +352,19 @@ fn openai_tools(session: &TauSession) -> Vec<OpenAiTool> {
     tools
 }
 
-fn incremental_input_items<'a>(
-    session: &'a TauSession,
-    previous_response_id: Option<&str>,
-) -> &'a [ConversationItem] {
-    if previous_response_id.is_none() {
-        return &session.conversation().items;
-    }
-
+fn pending_input_items(session: &TauSession) -> &[ConversationItem] {
     let items = &session.conversation().items;
     let start = items
         .iter()
-        .rposition(|item| matches!(item, ConversationItem::ToolUse { .. }))
-        .unwrap_or(items.len());
+        .rposition(|item| {
+            matches!(
+                item,
+                ConversationItem::Agent { .. }
+                    | ConversationItem::ToolUse { .. }
+                    | ConversationItem::ResponseStop { .. }
+            )
+        })
+        .map_or(0, |index| index + 1);
     &items[start..]
 }
 
@@ -363,10 +409,7 @@ fn parse_response(response: OpenAiResponse) -> Result<ProviderResponse, Provider
                 content.push(content_part);
             }
             _ => {
-                let content_part = ContentPart::json_with_metadata(
-                    item.clone(),
-                    raw_metadata("openai.output_item", item),
-                );
+                let content_part = ContentPart::json(item.clone());
                 parts.push(ResponsePart::Content {
                     content: content_part.clone(),
                 });
@@ -451,13 +494,15 @@ fn parse_message_output_item(
     let mut saw_refusal = false;
 
     for part in parts {
-        let metadata = raw_metadata("openai.message_content", part.clone());
         match part.get("type").and_then(Value::as_str) {
             Some("output_text") => {
                 let text = part.get("text").and_then(Value::as_str).ok_or_else(|| {
                     ProviderError::Response("OpenAI output_text missing text".to_string())
                 })?;
-                let content_part = ContentPart::text_with_metadata(text, metadata);
+                let content_part = ContentPart::Text {
+                    text: text.to_string(),
+                    metadata: openai_content_metadata(part),
+                };
                 parts_out.push(ResponsePart::Content {
                     content: content_part.clone(),
                 });
@@ -468,14 +513,17 @@ fn parse_message_output_item(
                     ProviderError::Response("OpenAI refusal missing refusal text".to_string())
                 })?;
                 saw_refusal = true;
-                let content_part = ContentPart::refusal_with_metadata(refusal, metadata);
+                let content_part = ContentPart::Refusal {
+                    text: refusal.to_string(),
+                    metadata: None,
+                };
                 parts_out.push(ResponsePart::Content {
                     content: content_part.clone(),
                 });
                 content.push(content_part);
             }
             _ => {
-                let content_part = ContentPart::json_with_metadata(part.clone(), metadata);
+                let content_part = ContentPart::json(part.clone());
                 parts_out.push(ResponsePart::Content {
                     content: content_part.clone(),
                 });
@@ -504,14 +552,16 @@ fn openai_reasoning_content(item: Value) -> ContentPart {
         })
         .unwrap_or_default();
 
-    ContentPart::thinking_with_metadata(text, None, raw_metadata("openai.reasoning", item))
+    ContentPart::thinking(text)
 }
 
-fn raw_metadata(kind: &str, raw: Value) -> Value {
-    serde_json::json!({
-        "provider": PROVIDER_NAME,
-        "kind": kind,
-        "raw": raw,
+fn openai_content_metadata(part: &Value) -> Option<Value> {
+    part.get("annotations").cloned().map(|annotations| {
+        serde_json::json!({
+            "provider": PROVIDER_NAME,
+            "kind": "annotations",
+            "annotations": annotations,
+        })
     })
 }
 
@@ -605,8 +655,8 @@ mod tests {
                 error: None,
             }],
         });
-        let request = build_request(&session).unwrap();
-        let value = serde_json::to_value(request).unwrap();
+        let request = build_request(&mut session).unwrap();
+        let value = serde_json::to_value(request.0).unwrap();
 
         assert_eq!(value["model"], "gpt-4.1-mini");
         assert_eq!(value["parallel_tool_calls"], true);
@@ -648,20 +698,19 @@ mod tests {
                 error: None,
             }],
         });
-        session.set_provider_state(
-            PROVIDER_NAME,
-            OpenAiState {
+        session
+            .set_provider_conversation_data(&OpenAiConversationData {
                 previous_response_id: Some("resp_previous".to_string()),
-            },
-        );
+                output: Vec::new(),
+            })
+            .unwrap();
 
-        let request = build_request(&session).unwrap();
-        let value = serde_json::to_value(request).unwrap();
+        let request = build_request(&mut session).unwrap();
+        let value = serde_json::to_value(request.0).unwrap();
 
         assert_eq!(value["previous_response_id"], "resp_previous");
-        assert_eq!(value["input"].as_array().unwrap().len(), 2);
-        assert_eq!(value["input"][0]["type"], "function_call");
-        assert_eq!(value["input"][1]["type"], "function_call_output");
+        assert_eq!(value["input"].as_array().unwrap().len(), 1);
+        assert_eq!(value["input"][0]["type"], "function_call_output");
     }
 
     #[test]
@@ -722,22 +771,22 @@ mod tests {
             ContentPart::Text { text, metadata } => {
                 assert_eq!(text, "I'll check.");
                 let metadata = metadata.as_ref().unwrap();
-                assert_eq!(metadata["kind"], "openai.message_content");
-                assert_eq!(metadata["raw"]["annotations"][0]["type"], "url_citation");
+                assert_eq!(metadata["kind"], "annotations");
+                assert_eq!(metadata["annotations"][0]["type"], "url_citation");
             }
             other => panic!("expected text content, got {other:?}"),
         }
         match &parsed.content[1] {
             ContentPart::Thinking { text, metadata, .. } => {
                 assert_eq!(text, "I should inspect the files.");
-                assert_eq!(metadata.as_ref().unwrap()["kind"], "openai.reasoning");
+                assert!(metadata.is_none());
             }
             other => panic!("expected thinking content, got {other:?}"),
         }
         match &parsed.content[2] {
             ContentPart::Json { value, metadata } => {
                 assert_eq!(value["type"], "web_search_call");
-                assert_eq!(metadata.as_ref().unwrap()["kind"], "openai.output_item");
+                assert!(metadata.is_none());
             }
             other => panic!("expected json content, got {other:?}"),
         }
