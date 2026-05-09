@@ -29,7 +29,8 @@ pub const API: ProviderApi = ProviderApi {
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
 const DEFAULT_MAX_TOKENS: u64 = 64_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum AnthropicAdaptiveThinkingEffort {
     Low,
     Medium,
@@ -294,11 +295,31 @@ struct AnthropicRequest {
     max_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<AnthropicCacheControl>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<AnthropicThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<AnthropicOutputConfig>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     system: Vec<AnthropicContent>,
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<AnthropicTool>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicThinking {
+    Adaptive,
+    Enabled {
+        budget_tokens: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display: Option<&'static str>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct AnthropicOutputConfig {
+    effort: AnthropicAdaptiveThinkingEffort,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -523,18 +544,48 @@ fn build_request(
     append_anthropic_input_items(&mut conversation, pending_input_items(session))?;
 
     let tools = anthropic_tools(session, web_search);
+    let (thinking, output_config) = anthropic_thinking_config(&model);
 
     Ok((
         AnthropicRequest {
             model: model.id.clone(),
             max_tokens: anthropic_max_tokens(&model),
             cache_control: cache_ttl.map(AnthropicCacheControl::new),
+            thinking,
+            output_config,
             system: conversation.system.clone(),
             messages: conversation.messages.clone(),
             tools,
         },
         conversation,
     ))
+}
+
+fn anthropic_thinking_config(
+    model: &ModelMetadata,
+) -> (Option<AnthropicThinking>, Option<AnthropicOutputConfig>) {
+    let Some(details) = model
+        .provider_details
+        .as_deref()
+        .and_then(|details| details.as_any().downcast_ref::<AnthropicModelDetails>())
+    else {
+        return (None, None);
+    };
+
+    match details.thinking {
+        AnthropicThinkingConfig::Adaptive { effort } => (
+            Some(AnthropicThinking::Adaptive),
+            effort.map(|effort| AnthropicOutputConfig { effort }),
+        ),
+        AnthropicThinkingConfig::Enabled { budget_tokens } => (
+            Some(AnthropicThinking::Enabled {
+                budget_tokens,
+                display: Some("summarized"),
+            }),
+            None,
+        ),
+        AnthropicThinkingConfig::Disabled => (None, None),
+    }
 }
 
 fn anthropic_max_tokens(model: &ModelMetadata) -> u64 {
@@ -1007,6 +1058,63 @@ mod tests {
         assert_eq!(value["messages"][1]["content"][1]["signature"], "sig_1");
         assert_eq!(value["messages"][1]["content"][2]["type"], "tool_use");
         assert_eq!(value["messages"][2]["content"][0]["type"], "tool_result");
+    }
+
+    #[test]
+    fn sends_adaptive_thinking_and_effort_for_default_anthropic_models() {
+        let context = crate::context::TauContext::new();
+        let model = default_models()
+            .into_iter()
+            .find(|model| model.name == "sonnet-4-6-xhigh")
+            .unwrap();
+        let mut session = context.session(AnthropicProvider::new("test-key"), model);
+
+        let request = build_request(&mut session, None, None).unwrap();
+        let value = serde_json::to_value(request.0).unwrap();
+
+        assert_eq!(value["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(value["output_config"], json!({"effort": "xhigh"}));
+    }
+
+    #[test]
+    fn sends_enabled_thinking_budget_for_legacy_thinking_models() {
+        let context = crate::context::TauContext::new();
+        let model = default_models()
+            .into_iter()
+            .find(|model| model.name == "haiku-4-5-medium")
+            .unwrap();
+        let mut session = context.session(AnthropicProvider::new("test-key"), model);
+
+        let request = build_request(&mut session, None, None).unwrap();
+        let value = serde_json::to_value(request.0).unwrap();
+
+        assert_eq!(
+            value["thinking"],
+            json!({"type": "enabled", "budget_tokens": 4000, "display": "summarized"})
+        );
+        assert!(value.get("output_config").is_none());
+    }
+
+    #[test]
+    fn omits_thinking_for_disabled_or_unknown_model_metadata() {
+        let context = crate::context::TauContext::new();
+        let model = default_models()
+            .into_iter()
+            .find(|model| model.name == "haiku-4-5-no-thinking")
+            .unwrap();
+        let mut session = context.session(AnthropicProvider::new("test-key"), model);
+        let request = build_request(&mut session, None, None).unwrap();
+        let value = serde_json::to_value(request.0).unwrap();
+
+        assert!(value.get("thinking").is_none());
+        assert!(value.get("output_config").is_none());
+
+        let mut custom_session = context.session(AnthropicProvider::new("test-key"), test_model());
+        let custom_request = build_request(&mut custom_session, None, None).unwrap();
+        let custom_value = serde_json::to_value(custom_request.0).unwrap();
+
+        assert!(custom_value.get("thinking").is_none());
+        assert!(custom_value.get("output_config").is_none());
     }
 
     #[test]
