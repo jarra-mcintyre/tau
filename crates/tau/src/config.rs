@@ -2,7 +2,10 @@ use std::{fmt, fs, path::PathBuf, str::FromStr, sync::Arc};
 
 use libtau::{
     context::{TauContext, TauSession},
-    providers::{Provider, ProviderApi, ProviderApiConfig, find_provider_api, openai},
+    providers::{
+        ModelMetadata, Provider, ProviderApi, ProviderApiConfig, anthropic, find_provider_api,
+        openai,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -40,14 +43,21 @@ struct ProviderConfig {
     models: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ConfiguredProvider {
     name: String,
     provider_api: &'static ProviderApi,
     api_key: Option<String>,
     base_url: Option<String>,
     options: Value,
-    models: Vec<String>,
+    models: Vec<ConfiguredModel>,
+}
+
+#[derive(Debug)]
+struct ConfiguredModel {
+    name: String,
+    id: String,
+    metadata: Option<ModelMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,7 +66,7 @@ pub(crate) struct ModelSelection {
     model: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct CliConfig {
     current_model: ModelSelection,
     providers_config: ProvidersConfig,
@@ -88,6 +98,12 @@ impl CliConfig {
         &self.current_model
     }
 
+    pub(crate) fn current_model_metadata(
+        &self,
+    ) -> Result<ModelMetadata, Box<dyn std::error::Error>> {
+        self.resolve_model_metadata(&self.current_model)
+    }
+
     pub(crate) fn config_path(&self) -> Option<&PathBuf> {
         self.config_path.as_ref()
     }
@@ -97,7 +113,8 @@ impl CliConfig {
         context: &TauContext,
     ) -> Result<TauSession, Box<dyn std::error::Error>> {
         let provider = self.build_provider_for_selection(&self.current_model)?;
-        Ok(context.session_with_provider_arc(provider, self.current_model.model.clone()))
+        let model = self.resolve_model_metadata(&self.current_model)?;
+        Ok(context.session_with_provider_arc(provider, model))
     }
 
     pub(crate) fn restore_current_model(
@@ -118,7 +135,8 @@ impl CliConfig {
         validate_model_selection(&self.providers, &selection, self.config_path.as_ref())?;
         let provider = self.build_provider_for_selection(&selection)?;
         self.save_current_model(&selection)?;
-        session.set_provider_and_model(provider, selection.model.clone());
+        let model = self.resolve_model_metadata(&selection)?;
+        session.set_provider_and_model(provider, model);
         self.current_model = selection;
         Ok(())
     }
@@ -129,13 +147,14 @@ impl CliConfig {
             for model in &provider.models {
                 let selection = ModelSelection {
                     provider_name: provider.name.clone(),
-                    model: model.clone(),
+                    model: model.name.clone(),
                 };
+                let summary = model_metadata_summary(model);
                 if selection == self.current_model {
                     printed_current = true;
-                    println!("* {selection}");
+                    println!("* {selection}{summary}");
                 } else {
-                    println!("  {selection}");
+                    println!("  {selection}{summary}");
                 }
             }
         }
@@ -147,6 +166,38 @@ impl CliConfig {
 
     pub(crate) fn print_current_model(&self) {
         println!("model: {}", self.current_model);
+    }
+
+    fn resolve_model_metadata(
+        &self,
+        selection: &ModelSelection,
+    ) -> Result<ModelMetadata, Box<dyn std::error::Error>> {
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| provider.name == selection.provider_name)
+            .ok_or_else(|| format!("provider '{}' is not configured", selection.provider_name))?;
+        let model = provider
+            .models
+            .iter()
+            .find(|model| model.name == selection.model || model.id == selection.model)
+            .ok_or_else(|| {
+                format!(
+                    "model '{}' is not listed for provider '{}' in {}",
+                    selection.model,
+                    selection.provider_name,
+                    config_path_label(self.config_path.as_ref())
+                )
+            })?;
+
+        Ok(model.metadata.clone().unwrap_or_else(|| ModelMetadata {
+            name: model.name.clone(),
+            id: model.id.clone(),
+            context_length: 0,
+            max_tokens: 0,
+            provider_details: None,
+            costs: None,
+        }))
     }
 
     fn build_provider_for_selection(
@@ -199,12 +250,6 @@ impl CliConfig {
         )?;
         self.config_path = Some(path);
         Ok(())
-    }
-}
-
-impl ModelSelection {
-    pub(crate) fn model(&self) -> &str {
-        &self.model
     }
 }
 
@@ -268,7 +313,7 @@ fn configured_providers(
             api_key: provider_config.api_key.clone(),
             base_url: provider_config.base_url.clone(),
             options: provider_config.options.clone(),
-            models: provider_config.models.clone(),
+            models: configured_models_for_provider(provider_api, provider_config),
         });
     }
 
@@ -280,11 +325,67 @@ fn configured_providers(
             api_key: None,
             base_url: None,
             options: Value::Null,
-            models: vec![DEFAULT_MODEL.to_string()],
+            models: default_models_for_provider(
+                find_provider_api(DEFAULT_API).expect("default provider API is registered"),
+            ),
         });
     }
 
     Ok(providers)
+}
+
+fn configured_models_for_provider(
+    provider_api: &'static ProviderApi,
+    provider_config: &ProviderConfig,
+) -> Vec<ConfiguredModel> {
+    if !provider_config.models.is_empty() {
+        return provider_config
+            .models
+            .iter()
+            .map(|model| ConfiguredModel {
+                name: model.clone(),
+                id: model.clone(),
+                metadata: None,
+            })
+            .collect();
+    } else if provider_config.base_url.is_none() {
+        default_models_for_provider(provider_api)
+    } else {
+        Vec::new()
+    }
+}
+
+fn default_models_for_provider(provider_api: &'static ProviderApi) -> Vec<ConfiguredModel> {
+    (provider_api.default_models)()
+        .into_iter()
+        .map(|metadata| ConfiguredModel {
+            name: metadata.name.to_string(),
+            id: metadata.id.to_string(),
+            metadata: Some(metadata),
+        })
+        .collect()
+}
+
+fn model_metadata_summary(model: &ConfiguredModel) -> String {
+    let Some(metadata) = model.metadata.as_ref() else {
+        return String::new();
+    };
+
+    let costs = metadata
+        .costs
+        .as_ref()
+        .map(|costs| format!(", costs: {costs:?}"))
+        .unwrap_or_default();
+    let details = metadata
+        .provider_details
+        .as_ref()
+        .map(|details| format!(", details: {details:?}"))
+        .unwrap_or_default();
+
+    format!(
+        " (id: {}, context: {}{}{costs})",
+        metadata.id, metadata.context_length, details
+    )
 }
 
 fn first_configured_model_ref(providers: &[ConfiguredProvider]) -> Option<String> {
@@ -292,7 +393,7 @@ fn first_configured_model_ref(providers: &[ConfiguredProvider]) -> Option<String
         provider
             .models
             .first()
-            .map(|model| format!("{}/{model}", provider.name))
+            .map(|model| format!("{}/{}", provider.name, model.name))
     })
 }
 
@@ -312,7 +413,12 @@ fn validate_model_selection(
             )
         })?;
 
-    if !provider.models.is_empty() && !provider.models.contains(&selection.model) {
+    if !provider.models.is_empty()
+        && !provider
+            .models
+            .iter()
+            .any(|model| model.name == selection.model || model.id == selection.model)
+    {
         return Err(format!(
             "model '{}' is not listed for provider '{}' in {}",
             selection.model,
@@ -349,7 +455,11 @@ fn load_providers_config() -> Result<(ProvidersConfig, Option<PathBuf>), Box<dyn
 }
 
 fn default_provider_api_name(provider_name: &str) -> Option<&'static str> {
-    (provider_name == DEFAULT_PROVIDER).then_some(DEFAULT_API)
+    match provider_name {
+        openai::PROVIDER_NAME => Some(openai::API_NAME),
+        anthropic::PROVIDER_NAME => Some(anthropic::API_NAME),
+        _ => None,
+    }
 }
 
 fn providers_config_path() -> Option<PathBuf> {
@@ -369,7 +479,14 @@ mod tests {
             api_key: None,
             base_url: None,
             options: Value::Null,
-            models: models.iter().map(|model| model.to_string()).collect(),
+            models: models
+                .iter()
+                .map(|model| ConfiguredModel {
+                    name: model.to_string(),
+                    id: model.to_string(),
+                    metadata: None,
+                })
+                .collect(),
         }
     }
 

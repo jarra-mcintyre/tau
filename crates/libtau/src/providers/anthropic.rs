@@ -10,7 +10,8 @@ use crate::{
         ServerToolUse, TauSession, ToolResult, ToolUse,
     },
     providers::{
-        Provider, ProviderApi, ProviderApiConfig, ProviderError, ProviderResponse, TokenUsage,
+        ModelCosts, ModelMetadata, Provider, ProviderApi, ProviderApiConfig, ProviderError,
+        ProviderModelDetails, ProviderResponse, TokenUsage,
         common::{binary_content_as_text, json_as_text, tool_result_json},
     },
 };
@@ -23,17 +24,155 @@ pub const API: ProviderApi = ProviderApi {
     api_key_env: API_KEY_ENV,
     display_name: "Anthropic",
     build: build_provider,
+    default_models,
 };
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
+const DEFAULT_MAX_TOKENS: u64 = 64_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnthropicAdaptiveThinkingEffort {
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnthropicThinkingConfig {
+    /// Anthropic adaptive thinking: `thinking: { type: "adaptive" }`.
+    /// The optional effort is sent separately as `output_config.effort`.
+    Adaptive {
+        effort: Option<AnthropicAdaptiveThinkingEffort>,
+    },
+    /// Anthropic extended thinking: `thinking: { type: "enabled", budget_tokens: N }`.
+    Enabled {
+        budget_tokens: u32,
+    },
+    // FIXME: Handle this
+    Disabled,
+}
+
+#[derive(Debug)]
+pub struct AnthropicModelDetails {
+    pub thinking: AnthropicThinkingConfig,
+}
+
+impl ProviderModelDetails for AnthropicModelDetails {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[derive(Debug)]
+pub struct AnthropicModelCosts {
+    pub input_token: f64,
+    pub output_token: f64,
+    pub cache_hit_token: Option<f64>,
+    pub cache_write_5m_token: Option<f64>,
+    pub cache_write_1h_token: Option<f64>,
+    pub web_search: Option<f64>,
+}
+
+impl ModelCosts for AnthropicModelCosts {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+fn anthropic_model_details(thinking: AnthropicThinkingConfig) -> Arc<dyn ProviderModelDetails> {
+    Arc::new(AnthropicModelDetails { thinking })
+}
+
+const THINKING_MAX: AnthropicThinkingConfig = AnthropicThinkingConfig::Adaptive {
+    effort: Some(AnthropicAdaptiveThinkingEffort::Max),
+};
+const THINKING_XHIGH: AnthropicThinkingConfig = AnthropicThinkingConfig::Adaptive {
+    effort: Some(AnthropicAdaptiveThinkingEffort::XHigh),
+};
+const THINKING_HIGH: AnthropicThinkingConfig = AnthropicThinkingConfig::Adaptive {
+    effort: Some(AnthropicAdaptiveThinkingEffort::High),
+};
+
+fn anthropic_model_metadata(
+    name: impl Into<String>,
+    id: impl Into<String>,
+    context_length: u64,
+    max_tokens: u64,
+    thinking: AnthropicThinkingConfig,
+) -> ModelMetadata {
+    ModelMetadata {
+        name: name.into(),
+        id: id.into(),
+        context_length,
+        max_tokens,
+        provider_details: Some(anthropic_model_details(thinking)),
+        costs: None,
+    }
+}
+
+fn default_models() -> Vec<ModelMetadata> {
+    vec![
+        anthropic_model_metadata(
+            "opus4-7-max",
+            "claude-opus-4-7",
+            1_000_000,
+            128_000,
+            THINKING_MAX,
+        ),
+        anthropic_model_metadata(
+            "opus4-7-xhigh",
+            "claude-opus-4-7",
+            1_000_000,
+            128_000,
+            THINKING_XHIGH,
+        ),
+        anthropic_model_metadata(
+            "opus-4-7-high",
+            "claude-opus-4-7",
+            1_000_000,
+            128_000,
+            THINKING_HIGH,
+        ),
+        anthropic_model_metadata(
+            "opus-4-6-max",
+            "claude-opus-4-6",
+            200_000,
+            128_000,
+            THINKING_MAX,
+        ),
+        anthropic_model_metadata(
+            "sonnet-4-6-xhigh",
+            "claude-sonnet-4-6",
+            1_000_000,
+            64_000,
+            THINKING_XHIGH,
+        ),
+        anthropic_model_metadata(
+            "haiku-4-5-no-thinking",
+            "claude-haiku-4-5-20251001",
+            200_000,
+            64_000,
+            AnthropicThinkingConfig::Disabled,
+        ),
+        anthropic_model_metadata(
+            "haiku-4-5-medium",
+            "claude-haiku-4-5-20251001",
+            200_000,
+            64_000,
+            AnthropicThinkingConfig::Enabled {
+                budget_tokens: 4000,
+            },
+        ),
+    ]
+}
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
-    max_tokens: u32,
     cache_ttl: Option<AnthropicCacheTtl>,
     web_search: Option<AnthropicWebSearchConfig>,
 }
@@ -69,7 +208,6 @@ impl AnthropicProvider {
             client: reqwest::Client::new(),
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
-            max_tokens: DEFAULT_MAX_TOKENS,
             cache_ttl: Some(AnthropicCacheTtl::FiveMinutes),
             web_search: Some(AnthropicWebSearchConfig::enabled()),
         }
@@ -87,15 +225,9 @@ impl AnthropicProvider {
             client: reqwest::Client::new(),
             api_key: api_key.into(),
             base_url: normalize_base_url(base_url),
-            max_tokens: DEFAULT_MAX_TOKENS,
             cache_ttl: Some(AnthropicCacheTtl::FiveMinutes),
             web_search: None,
         }
-    }
-
-    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
-        self.max_tokens = max_tokens;
-        self
     }
 
     pub fn with_cache_ttl(mut self, cache_ttl: Option<AnthropicCacheTtl>) -> Self {
@@ -116,12 +248,8 @@ impl Provider for AnthropicProvider {
     }
 
     async fn respond(&self, session: &mut TauSession) -> Result<ProviderResponse, ProviderError> {
-        let (request, conversation) = build_request(
-            session,
-            self.max_tokens,
-            self.cache_ttl,
-            self.web_search.as_ref(),
-        )?;
+        let (request, conversation) =
+            build_request(session, self.cache_ttl, self.web_search.as_ref())?;
         let url = format!("{}/messages", self.base_url);
         let request_body = serde_json::to_string_pretty(&request)?;
         tracing::debug!(
@@ -163,7 +291,7 @@ impl Provider for AnthropicProvider {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 struct AnthropicRequest {
     model: String,
-    max_tokens: u32,
+    max_tokens: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<AnthropicCacheControl>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -382,15 +510,13 @@ struct AnthropicToolUseOutput {
 
 fn build_request(
     session: &mut TauSession,
-    max_tokens: u32,
     cache_ttl: Option<AnthropicCacheTtl>,
     web_search: Option<&AnthropicWebSearchConfig>,
 ) -> Result<(AnthropicRequest, AnthropicConversationData), ProviderError> {
     let model = session
-        .model()
+        .model_metadata()
         .ok_or(ProviderError::MissingModel)?
-        .to_string();
-
+        .clone();
     let mut conversation = session
         .provider_conversation_data::<AnthropicConversationData>()
         .unwrap_or_default();
@@ -400,8 +526,8 @@ fn build_request(
 
     Ok((
         AnthropicRequest {
-            model,
-            max_tokens,
+            model: model.id.clone(),
+            max_tokens: anthropic_max_tokens(&model),
             cache_control: cache_ttl.map(AnthropicCacheControl::new),
             system: conversation.system.clone(),
             messages: conversation.messages.clone(),
@@ -409,6 +535,14 @@ fn build_request(
         },
         conversation,
     ))
+}
+
+fn anthropic_max_tokens(model: &ModelMetadata) -> u64 {
+    if model.max_tokens == 0 {
+        DEFAULT_MAX_TOKENS
+    } else {
+        model.max_tokens
+    }
 }
 
 fn append_anthropic_input_items(
@@ -746,6 +880,17 @@ mod tests {
         Ok(ToolOutput::json(input))
     }
 
+    fn test_model() -> ModelMetadata {
+        ModelMetadata {
+            name: "claude-sonnet-4-5".to_string(),
+            id: "claude-sonnet-4-5".to_string(),
+            context_length: 200_000,
+            max_tokens: 64_000,
+            provider_details: None,
+            costs: None,
+        }
+    }
+
     #[test]
     fn derives_v1_base_path_for_host_only_urls() {
         assert_eq!(
@@ -769,7 +914,7 @@ mod tests {
                 callback,
             })
             .unwrap();
-        let mut session = context.session(AnthropicProvider::new("test-key"), "claude-sonnet-4-5");
+        let mut session = context.session(AnthropicProvider::new("test-key"), test_model());
         session.push_system_text("be helpful");
         session.push_user_text("hello");
         session.push_item(ConversationItem::Agent {
@@ -837,7 +982,6 @@ mod tests {
         };
         let request = build_request(
             &mut session,
-            DEFAULT_MAX_TOKENS,
             Some(AnthropicCacheTtl::FiveMinutes),
             Some(&web_search),
         )
@@ -845,7 +989,7 @@ mod tests {
         let value = serde_json::to_value(request.0).unwrap();
 
         assert_eq!(value["model"], "claude-sonnet-4-5");
-        assert_eq!(value["max_tokens"], DEFAULT_MAX_TOKENS);
+        assert_eq!(value["max_tokens"], 64_000);
         assert_eq!(value["cache_control"]["type"], "ephemeral");
         assert!(value["cache_control"].get("ttl").is_none());
         assert_eq!(value["system"][0]["type"], "text");
@@ -866,16 +1010,22 @@ mod tests {
     }
 
     #[test]
+    fn configured_model_without_metadata_uses_anthropic_max_tokens_default() {
+        let context = crate::context::TauContext::new();
+        let mut session = context.session(AnthropicProvider::new("test-key"), "llama.cpp-model");
+
+        let request = build_request(&mut session, None, None).unwrap();
+        let value = serde_json::to_value(request.0).unwrap();
+
+        assert_eq!(value["model"], "llama.cpp-model");
+        assert_eq!(value["max_tokens"], DEFAULT_MAX_TOKENS);
+    }
+
+    #[test]
     fn configures_one_hour_automatic_cache_ttl() {
         let context = crate::context::TauContext::new();
-        let mut session = context.session(AnthropicProvider::new("test-key"), "claude-sonnet-4-5");
-        let request = build_request(
-            &mut session,
-            DEFAULT_MAX_TOKENS,
-            Some(AnthropicCacheTtl::OneHour),
-            None,
-        )
-        .unwrap();
+        let mut session = context.session(AnthropicProvider::new("test-key"), test_model());
+        let request = build_request(&mut session, Some(AnthropicCacheTtl::OneHour), None).unwrap();
         let value = serde_json::to_value(request.0).unwrap();
 
         assert_eq!(
@@ -915,7 +1065,7 @@ mod tests {
     #[test]
     fn disables_web_search_when_configured_off() {
         let context = crate::context::TauContext::new();
-        let mut session = context.session(AnthropicProvider::new("test-key"), "claude-sonnet-4-5");
+        let mut session = context.session(AnthropicProvider::new("test-key"), test_model());
         let web_search = AnthropicWebSearchConfig {
             enabled: Some(false),
             max_uses: Some(1),
@@ -924,7 +1074,6 @@ mod tests {
         };
         let request = build_request(
             &mut session,
-            DEFAULT_MAX_TOKENS,
             Some(AnthropicCacheTtl::FiveMinutes),
             Some(&web_search),
         )

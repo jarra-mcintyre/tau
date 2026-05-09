@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    providers::{Provider, ProviderError, ProviderResponse, TokenUsage},
+    providers::{ModelMetadata, Provider, ProviderError, ProviderResponse, TokenUsage},
     tools::{ToolCallError, ToolDefinition, ToolOutput, ToolRegistrationError},
 };
 
@@ -19,6 +19,7 @@ pub struct TauContext {
 pub struct TauSession {
     context: Arc<TauContext>,
     conversation: Conversation,
+    model: Option<ModelMetadata>,
     provider: Arc<dyn Provider>,
     provider_state: BTreeMap<String, ProviderState>,
     last_token_usage: Option<TokenUsage>,
@@ -183,6 +184,7 @@ impl fmt::Debug for TauSession {
             .debug_struct("TauSession")
             .field("context", &self.context)
             .field("conversation", &self.conversation)
+            .field("model", &self.model)
             .field("provider", &self.provider.name())
             .field(
                 "provider_state_keys",
@@ -200,7 +202,7 @@ impl TauContext {
     pub fn session(
         &self,
         provider: impl Provider + 'static,
-        model: impl Into<String>,
+        model: impl Into<ModelMetadata>,
     ) -> TauSession {
         TauSession::new(self.clone(), provider, model)
     }
@@ -208,7 +210,7 @@ impl TauContext {
     pub fn session_with_provider_arc(
         &self,
         provider: Arc<dyn Provider>,
-        model: impl Into<String>,
+        model: impl Into<ModelMetadata>,
     ) -> TauSession {
         TauSession::new_with_provider_arc(self.clone(), provider, model)
     }
@@ -285,7 +287,7 @@ impl TauSession {
     pub fn new(
         context: TauContext,
         provider: impl Provider + 'static,
-        model: impl Into<String>,
+        model: impl Into<ModelMetadata>,
     ) -> Self {
         Self::new_with_provider_arc(context, Arc::new(provider), model)
     }
@@ -293,13 +295,15 @@ impl TauSession {
     pub fn new_with_provider_arc(
         context: TauContext,
         provider: Arc<dyn Provider>,
-        model: impl Into<String>,
+        model: impl Into<ModelMetadata>,
     ) -> Self {
+        let model = model.into();
         let mut conversation = Conversation::default();
-        conversation.model = Some(model.into());
+        conversation.model = Some(model.id.clone());
         Self {
             context: Arc::new(context),
             conversation,
+            model: Some(model),
             provider,
             provider_state: BTreeMap::new(),
             last_token_usage: None,
@@ -324,7 +328,7 @@ impl TauSession {
     pub fn set_provider_and_model(
         &mut self,
         provider: Arc<dyn Provider>,
-        model: impl Into<String>,
+        model: impl Into<ModelMetadata>,
     ) {
         self.set_provider_arc(provider);
         self.set_model(model);
@@ -334,12 +338,18 @@ impl TauSession {
         self.last_token_usage.as_ref()
     }
 
-    pub fn set_model(&mut self, model: impl Into<String>) {
-        self.conversation.model = Some(model.into());
+    pub fn set_model(&mut self, model: impl Into<ModelMetadata>) {
+        let model = model.into();
+        self.conversation.model = Some(model.id.clone());
+        self.model = Some(model);
     }
 
     pub fn model(&self) -> Option<&str> {
-        self.conversation.model.as_deref()
+        self.model.as_ref().map(|model| model.id.as_str())
+    }
+
+    pub fn model_metadata(&self) -> Option<&ModelMetadata> {
+        self.model.as_ref()
     }
 
     pub fn conversation(&self) -> &Conversation {

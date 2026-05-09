@@ -32,6 +32,95 @@ curl https://api.anthropic.com/v1/messages \
 }'
 ```
 
+## Response format
+
+The following gives a complete example of an API response (as per (Anthropic API Create Message)[https://platform.claude.com/docs/en/api/beta/messages/create]). Note the response ID is a unique response assigned to the message for QC and support purposes and should be recorded. 
+
+```json
+{
+  "id": "msg_013Zva2CMHLNnXjNJJKqJ2EF",
+  "container": {
+    "id": "id",
+    "expires_at": "2019-12-27T18:11:19.117Z",
+    "skills": [
+      {
+        "skill_id": "pdf",
+        "type": "anthropic",
+        "version": "latest"
+      }
+    ]
+  },
+  "content": [
+    {
+      "citations": [
+        {
+          "cited_text": "cited_text",
+          "document_index": 0,
+          "document_title": "document_title",
+          "end_char_index": 0,
+          "file_id": "file_id",
+          "start_char_index": 0,
+          "type": "char_location"
+        }
+      ],
+      "text": "Hi! My name is Claude.",
+      "type": "text"
+    }
+  ],
+  "context_management": {
+    "applied_edits": [
+      {
+        "cleared_input_tokens": 0,
+        "cleared_tool_uses": 0,
+        "type": "clear_tool_uses_20250919"
+      }
+    ]
+  },
+  "model": "claude-opus-4-6",
+  "role": "assistant",
+  "stop_details": {
+    "category": "cyber",
+    "explanation": "explanation",
+    "type": "refusal"
+  },
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "type": "message",
+  "usage": {
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 0,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "cache_creation_input_tokens": 2051,
+    "cache_read_input_tokens": 2051,
+    "inference_geo": "inference_geo",
+    "input_tokens": 2095,
+    "iterations": [
+      {
+        "cache_creation": {
+          "ephemeral_1h_input_tokens": 0,
+          "ephemeral_5m_input_tokens": 0
+        },
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "type": "message"
+      }
+    ],
+    "output_tokens": 503,
+    "server_tool_use": {
+      "web_fetch_requests": 2,
+      "web_search_requests": 0
+    },
+    "service_tier": "standard",
+    "speed": "standard"
+  }
+}
+```
+
+## Caching
+
 If a cache control header is added then the system caches prompts
 - For automatic caching add a top-level single `cache_control` block to the request. The cache breakpoint is moved forward automatically
 - For fine-grained cache add `cache_control` block to each message where caching should be run up-to
@@ -54,7 +143,7 @@ Automatic caching example (as per Anthropic docs):
 }
 ```
 
-# Stop reasons
+## Stop reasons
 
 Every response to a successful message will have a `stop_reason` field. This is an enum that will be set to:
 - `end_turn` - the model naturally ended its turn (possibly sending an empty message)
@@ -63,7 +152,6 @@ Every response to a successful message will have a `stop_reason` field. This is 
 - `tool_use` - a tool use was requested
 - `pause_turn` - server sampling loop reached its iteration limit. Response may contain a `server_tool_use` block without a corresponding `server_tool_result`. send back the response as is to signal to the model to keep processing.
 - `refusal` - model refused to generate response
-   
 
 # More information
 

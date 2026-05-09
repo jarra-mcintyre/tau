@@ -35,7 +35,7 @@ pub(crate) fn load_or_create_session(
 
         let mut session = config.session_for_current_model(context)?;
         *session.conversation_mut() = persisted.conversation;
-        session.set_model(config.current_model().model().to_string());
+        session.set_model(config.current_model_metadata()?);
 
         return Ok((
             session,

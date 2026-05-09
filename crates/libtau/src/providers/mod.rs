@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{any::Any, fmt, sync::Arc};
 
 use async_trait::async_trait;
 
@@ -67,12 +67,63 @@ pub struct ProviderApiConfig {
     pub options: serde_json::Value,
 }
 
+pub trait ModelCosts: fmt::Debug + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+}
+
+pub trait ProviderModelDetails: fmt::Debug + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelMetadata {
+    /// User-facing model name used in Tau model selections.
+    pub name: String,
+    /// Provider API model identifier sent in requests.
+    pub id: String,
+    /// maximum context length of the model
+    pub context_length: u64,
+    /// maximum number of tokens to generate in a single response
+    pub max_tokens: u64,
+    /// Provider-specific model capabilities/configuration, such as thinking effort.
+    pub provider_details: Option<Arc<dyn ProviderModelDetails>>,
+    /// Provider-specific prices. USD per one million units unless noted otherwise.
+    pub costs: Option<Arc<dyn ModelCosts>>,
+}
+
+impl ModelMetadata {
+    pub fn custom(model: impl Into<String>) -> Self {
+        let model = model.into();
+        Self {
+            name: model.clone(),
+            id: model,
+            context_length: 0,
+            max_tokens: 0,
+            provider_details: None,
+            costs: None,
+        }
+    }
+}
+
+impl From<String> for ModelMetadata {
+    fn from(model: String) -> Self {
+        Self::custom(model)
+    }
+}
+
+impl From<&str> for ModelMetadata {
+    fn from(model: &str) -> Self {
+        Self::custom(model)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ProviderApi {
     pub name: &'static str,
     pub api_key_env: &'static str,
     pub display_name: &'static str,
     pub build: fn(ProviderApiConfig) -> Result<Arc<dyn Provider>, ProviderError>,
+    pub default_models: fn() -> Vec<ModelMetadata>,
 }
 
 impl ProviderApi {

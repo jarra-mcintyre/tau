@@ -10,7 +10,8 @@ use crate::{
         ToolResult, ToolUse,
     },
     providers::{
-        Provider, ProviderApi, ProviderApiConfig, ProviderError, ProviderResponse, TokenUsage,
+        ModelCosts, ModelMetadata, Provider, ProviderApi, ProviderApiConfig, ProviderError,
+        ProviderModelDetails, ProviderResponse, TokenUsage,
         common::{
             assistant_content_as_text, binary_content_as_text, json_as_text, media_to_url,
             tool_result_json,
@@ -26,8 +27,88 @@ pub const API: ProviderApi = ProviderApi {
     api_key_env: API_KEY_ENV,
     display_name: "OpenAI",
     build: build_provider,
+    default_models,
 };
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+
+#[derive(Debug, Clone, Copy)]
+pub enum OpenAiThinkingEffort {
+    Low,
+    Medium,
+    High,
+    XHigh,
+}
+
+#[derive(Debug)]
+pub struct OpenAiModelDetails {
+    pub thinking_effort: Option<OpenAiThinkingEffort>,
+}
+
+impl ProviderModelDetails for OpenAiModelDetails {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[derive(Debug)]
+pub struct OpenAiModelCosts {
+    pub input_token: f64,
+    pub output_token: f64,
+    pub cached_input_token: Option<f64>,
+}
+
+impl ModelCosts for OpenAiModelCosts {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+fn openai_model_costs(
+    input_token: f64,
+    output_token: f64,
+    cached_input_token: Option<f64>,
+) -> Arc<dyn ModelCosts> {
+    Arc::new(OpenAiModelCosts {
+        input_token,
+        output_token,
+        cached_input_token,
+    })
+}
+
+fn openai_model_details(
+    thinking_effort: Option<OpenAiThinkingEffort>,
+) -> Arc<dyn ProviderModelDetails> {
+    Arc::new(OpenAiModelDetails { thinking_effort })
+}
+
+fn default_models() -> Vec<ModelMetadata> {
+    vec![
+        ModelMetadata {
+            name: "gpt-5.5".to_string(),
+            id: "gpt-4.1-mini".to_string(),
+            context_length: 1_047_576,
+            max_tokens: 0,
+            provider_details: Some(openai_model_details(None)),
+            costs: Some(openai_model_costs(5.0, 30.0, Some(0.50))),
+        },
+        ModelMetadata {
+            name: "gpt-5.4".to_string(),
+            id: "gpt-5.4".to_string(),
+            context_length: 1_047_576,
+            max_tokens: 0,
+            provider_details: Some(openai_model_details(None)),
+            costs: Some(openai_model_costs(2.50, 15.0, Some(0.25))),
+        },
+        ModelMetadata {
+            name: "gpt-5.4-mini".to_string(),
+            id: "gpt-5.4-mini".to_string(),
+            context_length: 400_000,
+            max_tokens: 0,
+            provider_details: Some(openai_model_details(Some(OpenAiThinkingEffort::Medium))),
+            costs: Some(openai_model_costs(0.75, 4.50, Some(0.075))),
+        },
+    ]
+}
 
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
