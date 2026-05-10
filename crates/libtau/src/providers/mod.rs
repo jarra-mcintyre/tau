@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::{any::Any, fmt, sync::Arc};
 
 use async_trait::async_trait;
@@ -71,8 +72,19 @@ pub trait ModelCosts: fmt::Debug + Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
-pub trait ProviderModelDetails: fmt::Debug + Send + Sync {
+pub trait ProviderModelConfig: fmt::Debug + Send + Sync {
     fn as_any(&self) -> &dyn Any;
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingEffort {
+    Disabled,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
 }
 
 #[derive(Debug, Clone)]
@@ -83,10 +95,10 @@ pub struct ModelMetadata {
     pub id: String,
     /// maximum context length of the model
     pub context_length: u64,
-    /// maximum number of tokens to generate in a single response
+    /// maximum number of tokens to generate in a single response (0 to leave unspecified)
     pub max_tokens: u64,
-    /// Provider-specific model capabilities/configuration, such as thinking effort.
-    pub provider_details: Option<Arc<dyn ProviderModelDetails>>,
+    /// Provider-specific model configuration.
+    pub provider_config: Option<Arc<dyn ProviderModelConfig>>,
     /// Provider-specific prices. USD per one million units unless noted otherwise.
     pub costs: Option<Arc<dyn ModelCosts>>,
 }
@@ -99,7 +111,7 @@ impl ModelMetadata {
             id: model,
             context_length: 0,
             max_tokens: 0,
-            provider_details: None,
+            provider_config: None,
             costs: None,
         }
     }

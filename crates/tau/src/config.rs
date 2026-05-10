@@ -3,8 +3,8 @@ use std::{fmt, fs, path::PathBuf, str::FromStr, sync::Arc};
 use libtau::{
     context::{TauContext, TauSession},
     providers::{
-        ModelMetadata, Provider, ProviderApi, ProviderApiConfig, anthropic, find_provider_api,
-        openai,
+        ModelMetadata, Provider, ProviderApi, ProviderApiConfig, ProviderModelConfig, anthropic,
+        find_provider_api, openai,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -40,7 +40,24 @@ struct ProviderConfig {
     #[serde(default)]
     options: Value,
     #[serde(default)]
-    models: Vec<String>,
+    models: Vec<ModelConfigEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+enum ModelConfigEntry {
+    Name(String),
+    Detailed {
+        name: String,
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        context_length: u64,
+        #[serde(default)]
+        max_tokens: u64,
+        #[serde(default)]
+        provider_config: Value,
+    },
 }
 
 #[derive(Debug)]
@@ -195,7 +212,7 @@ impl CliConfig {
             id: model.id.clone(),
             context_length: 0,
             max_tokens: 0,
-            provider_details: None,
+            provider_config: None,
             costs: None,
         }))
     }
@@ -313,7 +330,7 @@ fn configured_providers(
             api_key: provider_config.api_key.clone(),
             base_url: provider_config.base_url.clone(),
             options: provider_config.options.clone(),
-            models: configured_models_for_provider(provider_api, provider_config),
+            models: configured_models_for_provider(provider_api, provider_config)?,
         });
     }
 
@@ -337,21 +354,71 @@ fn configured_providers(
 fn configured_models_for_provider(
     provider_api: &'static ProviderApi,
     provider_config: &ProviderConfig,
-) -> Vec<ConfiguredModel> {
+) -> Result<Vec<ConfiguredModel>, Box<dyn std::error::Error>> {
     if !provider_config.models.is_empty() {
-        return provider_config
+        provider_config
             .models
             .iter()
-            .map(|model| ConfiguredModel {
-                name: model.clone(),
-                id: model.clone(),
-                metadata: None,
-            })
-            .collect();
+            .map(|model| configured_model(provider_api, model))
+            .collect()
     } else if provider_config.base_url.is_none() {
-        default_models_for_provider(provider_api)
+        Ok(default_models_for_provider(provider_api))
     } else {
-        Vec::new()
+        Ok(Vec::new())
+    }
+}
+
+fn configured_model(
+    provider_api: &'static ProviderApi,
+    model: &ModelConfigEntry,
+) -> Result<ConfiguredModel, Box<dyn std::error::Error>> {
+    match model {
+        ModelConfigEntry::Name(name) => Ok(ConfiguredModel {
+            name: name.clone(),
+            id: name.clone(),
+            metadata: None,
+        }),
+        ModelConfigEntry::Detailed {
+            name,
+            id,
+            context_length,
+            max_tokens,
+            provider_config,
+        } => {
+            let id = id.clone().unwrap_or_else(|| name.clone());
+            Ok(ConfiguredModel {
+                name: name.clone(),
+                id: id.clone(),
+                metadata: Some(ModelMetadata {
+                    name: name.clone(),
+                    id,
+                    context_length: *context_length,
+                    max_tokens: *max_tokens,
+                    provider_config: parse_provider_model_config(provider_api, provider_config)?,
+                    costs: None,
+                }),
+            })
+        }
+    }
+}
+
+fn parse_provider_model_config(
+    provider_api: &'static ProviderApi,
+    value: &Value,
+) -> Result<Option<Arc<dyn ProviderModelConfig>>, Box<dyn std::error::Error>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+
+    match provider_api.name {
+        anthropic::API_NAME => Ok(Some(Arc::new(serde_json::from_value::<
+            anthropic::AnthropicModelConfig,
+        >(value.clone())?))),
+        _ => Err(format!(
+            "provider_config is not supported for provider API {}",
+            provider_api.name
+        )
+        .into()),
     }
 }
 
@@ -376,15 +443,15 @@ fn model_metadata_summary(model: &ConfiguredModel) -> String {
         .as_ref()
         .map(|costs| format!(", costs: {costs:?}"))
         .unwrap_or_default();
-    let details = metadata
-        .provider_details
+    let provider_config = metadata
+        .provider_config
         .as_ref()
-        .map(|details| format!(", details: {details:?}"))
+        .map(|config| format!(", provider_config: {config:?}"))
         .unwrap_or_default();
 
     format!(
-        " (id: {}, context: {}{}{costs})",
-        metadata.id, metadata.context_length, details
+        " (id: {}, context: {}{provider_config}{costs})",
+        metadata.id, metadata.context_length
     )
 }
 

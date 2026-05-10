@@ -6,7 +6,7 @@ This summarises information from Anthropic documentation:
 
 Enable thinking by setting the `thinking` parameter:
 - For Opus 4.7 and later only adaptive thinking can be used: `thinking: {type: "adaptive"}`
-- For earlier models a maximum number of thinking tokens can be set: `thinking: {type: "enabled", budget_tokens: N}`
+- For earlier models a maximum number of thinking tokens can be set: `thinking: {type: "enabled", budget_tokens: N}` (or `"disabled"` to disable)
 - For Opus 4.6 and Sonnet 4.6 adaptive thinking is recommended but not required
 
 ```json

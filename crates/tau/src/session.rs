@@ -1,6 +1,6 @@
 use std::{fs, path::PathBuf};
 
-use libtau::context::{Conversation, TauContext, TauSession};
+use libtau::context::{Conversation, TauContext, TauSession, TauSessionConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{CliConfig, ModelSelection};
@@ -12,6 +12,8 @@ const SESSIONS_DIR: &str = ".tau/sessions";
 struct PersistedSession {
     id: String,
     current_model: String,
+    #[serde(default)]
+    config: TauSessionConfig,
     conversation: Conversation,
 }
 
@@ -34,6 +36,7 @@ pub(crate) fn load_or_create_session(
         config.restore_current_model(current_model)?;
 
         let mut session = config.session_for_current_model(context)?;
+        session.set_config(persisted.config);
         *session.conversation_mut() = persisted.conversation;
         session.set_model(config.current_model_metadata()?);
 
@@ -66,6 +69,7 @@ pub(crate) fn save_session(
     let persisted = PersistedSession {
         id: persistence.id.clone(),
         current_model: current_model.to_string(),
+        config: session.config().clone(),
         conversation: session.conversation().clone(),
     };
     fs::write(

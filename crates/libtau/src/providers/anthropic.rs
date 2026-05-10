@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,7 @@ use crate::{
     },
     providers::{
         ModelCosts, ModelMetadata, Provider, ProviderApi, ProviderApiConfig, ProviderError,
-        ProviderModelDetails, ProviderResponse, TokenUsage,
+        ProviderModelConfig, ProviderResponse, ThinkingEffort, TokenUsage,
         common::{binary_content_as_text, json_as_text, tool_result_json},
     },
 };
@@ -29,42 +29,6 @@ pub const API: ProviderApi = ProviderApi {
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
 const DEFAULT_MAX_TOKENS: u64 = 64_000;
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum AnthropicAdaptiveThinkingEffort {
-    Low,
-    Medium,
-    High,
-    XHigh,
-    Max,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AnthropicThinkingConfig {
-    /// Anthropic adaptive thinking: `thinking: { type: "adaptive" }`.
-    /// The optional effort is sent separately as `output_config.effort`.
-    Adaptive {
-        effort: Option<AnthropicAdaptiveThinkingEffort>,
-    },
-    /// Anthropic extended thinking: `thinking: { type: "enabled", budget_tokens: N }`.
-    Enabled {
-        budget_tokens: u32,
-    },
-    // FIXME: Handle this
-    Disabled,
-}
-
-#[derive(Debug)]
-pub struct AnthropicModelDetails {
-    pub thinking: AnthropicThinkingConfig,
-}
-
-impl ProviderModelDetails for AnthropicModelDetails {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
 #[derive(Debug)]
 pub struct AnthropicModelCosts {
     pub input_token: f64,
@@ -81,89 +45,48 @@ impl ModelCosts for AnthropicModelCosts {
     }
 }
 
-fn anthropic_model_details(thinking: AnthropicThinkingConfig) -> Arc<dyn ProviderModelDetails> {
-    Arc::new(AnthropicModelDetails { thinking })
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnthropicModelConfig {
+    pub legacy_thinking_budget: bool,
 }
 
-const THINKING_MAX: AnthropicThinkingConfig = AnthropicThinkingConfig::Adaptive {
-    effort: Some(AnthropicAdaptiveThinkingEffort::Max),
-};
-const THINKING_XHIGH: AnthropicThinkingConfig = AnthropicThinkingConfig::Adaptive {
-    effort: Some(AnthropicAdaptiveThinkingEffort::XHigh),
-};
-const THINKING_HIGH: AnthropicThinkingConfig = AnthropicThinkingConfig::Adaptive {
-    effort: Some(AnthropicAdaptiveThinkingEffort::High),
-};
+impl ProviderModelConfig for AnthropicModelConfig {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
 
 fn anthropic_model_metadata(
     name: impl Into<String>,
     id: impl Into<String>,
     context_length: u64,
     max_tokens: u64,
-    thinking: AnthropicThinkingConfig,
+    legacy_thinking_budget: bool,
 ) -> ModelMetadata {
     ModelMetadata {
         name: name.into(),
         id: id.into(),
         context_length,
         max_tokens,
-        provider_details: Some(anthropic_model_details(thinking)),
+        provider_config: Some(Arc::new(AnthropicModelConfig {
+            legacy_thinking_budget,
+        })),
         costs: None,
     }
 }
 
 fn default_models() -> Vec<ModelMetadata> {
     vec![
+        anthropic_model_metadata("opus4-7", "claude-opus-4-7", 1_000_000, 128_000, false),
+        anthropic_model_metadata("opus-4-6", "claude-opus-4-6", 200_000, 128_000, false),
+        anthropic_model_metadata("sonnet-4-6", "claude-sonnet-4-6", 1_000_000, 64_000, false),
         anthropic_model_metadata(
-            "opus4-7-max",
-            "claude-opus-4-7",
-            1_000_000,
-            128_000,
-            THINKING_MAX,
-        ),
-        anthropic_model_metadata(
-            "opus4-7-xhigh",
-            "claude-opus-4-7",
-            1_000_000,
-            128_000,
-            THINKING_XHIGH,
-        ),
-        anthropic_model_metadata(
-            "opus-4-7-high",
-            "claude-opus-4-7",
-            1_000_000,
-            128_000,
-            THINKING_HIGH,
-        ),
-        anthropic_model_metadata(
-            "opus-4-6-max",
-            "claude-opus-4-6",
-            200_000,
-            128_000,
-            THINKING_MAX,
-        ),
-        anthropic_model_metadata(
-            "sonnet-4-6-xhigh",
-            "claude-sonnet-4-6",
-            1_000_000,
-            64_000,
-            THINKING_XHIGH,
-        ),
-        anthropic_model_metadata(
-            "haiku-4-5-no-thinking",
+            "haiku-4-5",
             "claude-haiku-4-5-20251001",
             200_000,
             64_000,
-            AnthropicThinkingConfig::Disabled,
-        ),
-        anthropic_model_metadata(
-            "haiku-4-5-medium",
-            "claude-haiku-4-5-20251001",
-            200_000,
-            64_000,
-            AnthropicThinkingConfig::Enabled {
-                budget_tokens: 4000,
-            },
+            true,
         ),
     ]
 }
@@ -296,30 +219,14 @@ struct AnthropicRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<AnthropicCacheControl>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    thinking: Option<AnthropicThinking>,
+    thinking: Option<BTreeMap<String, Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    output_config: Option<AnthropicOutputConfig>,
+    output_config: Option<BTreeMap<String, Value>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     system: Vec<AnthropicContent>,
     messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<AnthropicTool>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum AnthropicThinking {
-    Adaptive,
-    Enabled {
-        budget_tokens: u32,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        display: Option<&'static str>,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct AnthropicOutputConfig {
-    effort: AnthropicAdaptiveThinkingEffort,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -544,7 +451,14 @@ fn build_request(
     append_anthropic_input_items(&mut conversation, pending_input_items(session))?;
 
     let tools = anthropic_tools(session, web_search);
-    let (thinking, output_config) = anthropic_thinking_config(&model);
+    let legacy_thinking_budget = model
+        .provider_config
+        .as_ref()
+        .and_then(|config| config.as_any().downcast_ref::<AnthropicModelConfig>())
+        .map(|config| config.legacy_thinking_budget)
+        .unwrap_or(false);
+    let (thinking, output_config) =
+        anthropic_thinking_config(session.thinking_effort(), legacy_thinking_budget);
 
     Ok((
         AnthropicRequest {
@@ -562,29 +476,72 @@ fn build_request(
 }
 
 fn anthropic_thinking_config(
-    model: &ModelMetadata,
-) -> (Option<AnthropicThinking>, Option<AnthropicOutputConfig>) {
-    let Some(details) = model
-        .provider_details
-        .as_deref()
-        .and_then(|details| details.as_any().downcast_ref::<AnthropicModelDetails>())
-    else {
+    effort: Option<ThinkingEffort>,
+    legacy_budget: bool,
+) -> (
+    Option<BTreeMap<String, Value>>,
+    Option<BTreeMap<String, Value>>,
+) {
+    let Some(effort) = effort else {
         return (None, None);
     };
 
-    match details.thinking {
-        AnthropicThinkingConfig::Adaptive { effort } => (
-            Some(AnthropicThinking::Adaptive),
-            effort.map(|effort| AnthropicOutputConfig { effort }),
-        ),
-        AnthropicThinkingConfig::Enabled { budget_tokens } => (
-            Some(AnthropicThinking::Enabled {
-                budget_tokens,
-                display: Some("summarized"),
-            }),
+    fn map(items: impl IntoIterator<Item = (&'static str, Value)>) -> BTreeMap<String, Value> {
+        items
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect()
+    }
+
+    if effort == ThinkingEffort::Disabled {
+        return (
+            Some(map([("type", Value::String("disabled".to_string()))])),
             None,
-        ),
-        AnthropicThinkingConfig::Disabled => (None, None),
+        );
+    }
+
+    if legacy_budget {
+        return (
+            Some(map([
+                ("type", Value::String("enabled".to_string())),
+                ("budget_tokens", Value::from(legacy_thinking_budget(effort))),
+                ("display", Value::String("summarized".to_string())),
+            ])),
+            None,
+        );
+    }
+
+    (
+        Some(map([
+            ("type", Value::String("adaptive".to_string())),
+            ("display", Value::String("summarized".to_string())),
+        ])),
+        Some(map([(
+            "effort",
+            Value::String(anthropic_effort(effort).to_string()),
+        )])),
+    )
+}
+
+fn anthropic_effort(effort: ThinkingEffort) -> &'static str {
+    match effort {
+        ThinkingEffort::Max => "max",
+        ThinkingEffort::XHigh => "xhigh",
+        ThinkingEffort::High => "high",
+        ThinkingEffort::Medium => "medium",
+        ThinkingEffort::Low => "low",
+        ThinkingEffort::Disabled => "disabled",
+    }
+}
+
+fn legacy_thinking_budget(effort: ThinkingEffort) -> u64 {
+    match effort {
+        ThinkingEffort::Low => 1_024,
+        ThinkingEffort::Medium => 4_000,
+        ThinkingEffort::High => 8_000,
+        ThinkingEffort::XHigh => 16_000,
+        ThinkingEffort::Max => 32_000,
+        ThinkingEffort::Disabled => 0,
     }
 }
 
@@ -937,7 +894,7 @@ mod tests {
             id: "claude-sonnet-4-5".to_string(),
             context_length: 200_000,
             max_tokens: 64_000,
-            provider_details: None,
+            provider_config: None,
             costs: None,
         }
     }
@@ -1065,14 +1022,18 @@ mod tests {
         let context = crate::context::TauContext::new();
         let model = default_models()
             .into_iter()
-            .find(|model| model.name == "sonnet-4-6-xhigh")
+            .find(|model| model.name == "sonnet-4-6")
             .unwrap();
         let mut session = context.session(AnthropicProvider::new("test-key"), model);
+        session.set_thinking_effort(Some(ThinkingEffort::XHigh));
 
         let request = build_request(&mut session, None, None).unwrap();
         let value = serde_json::to_value(request.0).unwrap();
 
-        assert_eq!(value["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(
+            value["thinking"],
+            json!({"type": "adaptive", "display": "summarized"})
+        );
         assert_eq!(value["output_config"], json!({"effort": "xhigh"}));
     }
 
@@ -1081,9 +1042,10 @@ mod tests {
         let context = crate::context::TauContext::new();
         let model = default_models()
             .into_iter()
-            .find(|model| model.name == "haiku-4-5-medium")
+            .find(|model| model.name == "haiku-4-5")
             .unwrap();
         let mut session = context.session(AnthropicProvider::new("test-key"), model);
+        session.set_thinking_effort(Some(ThinkingEffort::Medium));
 
         let request = build_request(&mut session, None, None).unwrap();
         let value = serde_json::to_value(request.0).unwrap();
@@ -1100,7 +1062,7 @@ mod tests {
         let context = crate::context::TauContext::new();
         let model = default_models()
             .into_iter()
-            .find(|model| model.name == "haiku-4-5-no-thinking")
+            .find(|model| model.name == "haiku-4-5")
             .unwrap();
         let mut session = context.session(AnthropicProvider::new("test-key"), model);
         let request = build_request(&mut session, None, None).unwrap();

@@ -6,7 +6,7 @@ use std::{
 use clap::Parser;
 use libtau::{
     context::{ContentPart, ResponsePart, TauSession, ToolResult, ToolUse},
-    providers::TokenUsage,
+    providers::{ThinkingEffort, TokenUsage},
     tools,
 };
 use tracing_appender::non_blocking::WorkerGuard;
@@ -81,6 +81,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("Tau interactive shell");
     println!("session: {}", persistence.id);
     cli_config.print_current_model();
+    print_thinking_effort(session.thinking_effort());
     if let Some(path) = cli_config.config_path() {
         println!("config: {}", path.display());
     } else {
@@ -88,6 +89,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("type /models to list configured models");
     println!("type /model provider/model to switch models");
+    println!("type /thinking default|disabled|low|medium|high|xhigh|max to set thinking effort");
     println!("resume later with: tau --resume {}", persistence.id);
     println!("type /exit or press Ctrl-D to quit\n");
 
@@ -124,6 +126,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             continue;
         }
+        if let Some(effort) = line.strip_prefix("/thinking ") {
+            match parse_thinking_effort(effort.trim()) {
+                Ok(effort) => {
+                    session.set_thinking_effort(effort);
+                    save_session(&persistence, cli_config.current_model(), &session)?;
+                    print_thinking_effort(session.thinking_effort());
+                }
+                Err(error) => eprintln!("error: {error}"),
+            }
+            continue;
+        }
 
         match run_turn(&mut session, line).await {
             Ok(()) => save_session(&persistence, cli_config.current_model(), &session)?,
@@ -135,6 +148,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn parse_thinking_effort(value: &str) -> Result<Option<ThinkingEffort>, String> {
+    match value {
+        "default" | "model" | "none" => Ok(None),
+        "disabled" | "off" => Ok(Some(ThinkingEffort::Disabled)),
+        "low" => Ok(Some(ThinkingEffort::Low)),
+        "medium" => Ok(Some(ThinkingEffort::Medium)),
+        "high" => Ok(Some(ThinkingEffort::High)),
+        "xhigh" | "extra-high" => Ok(Some(ThinkingEffort::XHigh)),
+        "max" => Ok(Some(ThinkingEffort::Max)),
+        other => Err(format!("unknown thinking effort '{other}'")),
+    }
+}
+
+fn print_thinking_effort(effort: Option<ThinkingEffort>) {
+    match effort {
+        Some(effort) => println!("thinking: {effort:?}"),
+        None => println!("thinking: default"),
+    }
 }
 
 async fn run_turn(

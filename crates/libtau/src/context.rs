@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    providers::{ModelMetadata, Provider, ProviderError, ProviderResponse, TokenUsage},
+    providers::{
+        ModelMetadata, Provider, ProviderError, ProviderResponse, ThinkingEffort, TokenUsage,
+    },
     tools::{ToolCallError, ToolDefinition, ToolOutput, ToolRegistrationError},
 };
 
@@ -21,8 +23,15 @@ pub struct TauSession {
     conversation: Conversation,
     model: Option<ModelMetadata>,
     provider: Arc<dyn Provider>,
+    config: TauSessionConfig,
     provider_state: BTreeMap<String, ProviderState>,
     last_token_usage: Option<TokenUsage>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TauSessionConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_effort: Option<ThinkingEffort>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -186,6 +195,7 @@ impl fmt::Debug for TauSession {
             .field("conversation", &self.conversation)
             .field("model", &self.model)
             .field("provider", &self.provider.name())
+            .field("config", &self.config)
             .field(
                 "provider_state_keys",
                 &self.provider_state.keys().collect::<Vec<_>>(),
@@ -305,6 +315,7 @@ impl TauSession {
             conversation,
             model: Some(model),
             provider,
+            config: TauSessionConfig::default(),
             provider_state: BTreeMap::new(),
             last_token_usage: None,
         }
@@ -316,6 +327,26 @@ impl TauSession {
 
     pub fn provider(&self) -> &dyn Provider {
         self.provider.as_ref()
+    }
+
+    pub fn config(&self) -> &TauSessionConfig {
+        &self.config
+    }
+
+    pub fn config_mut(&mut self) -> &mut TauSessionConfig {
+        &mut self.config
+    }
+
+    pub fn thinking_effort(&self) -> Option<ThinkingEffort> {
+        self.config.thinking_effort
+    }
+
+    pub fn set_thinking_effort(&mut self, thinking_effort: Option<ThinkingEffort>) {
+        self.config.thinking_effort = thinking_effort;
+    }
+
+    pub fn set_config(&mut self, config: TauSessionConfig) {
+        self.config = config;
     }
 
     pub fn set_provider_arc(&mut self, provider: Arc<dyn Provider>) {
