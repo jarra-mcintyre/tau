@@ -6,15 +6,15 @@ use serde_json::Value;
 
 use crate::{
     api::{
-        ModelApi, ModelApiFactory, ProviderError, ApiResponse, TokenUsage,
+        ModelApi, ModelApiFactory, ProviderError, TokenUsage,
         common::{
             assistant_content_as_text, binary_content_as_text, json_as_text, media_to_url,
             tool_result_json,
         },
     },
     context::{
-        ContentPart, ConversationItem, ResponsePart, ResponseStop, ResponseStopReason, TauSession,
-        ToolResult, ToolUse,
+        ContentPart, ConversationItem, ResponsePart, ResponseStop, ResponseStopReason, TauResponse,
+        TauSession, ToolResult, ToolUse,
     },
     providers::{ProviderConfig, ThinkingEffort},
 };
@@ -79,7 +79,7 @@ impl ModelApi for OpenAiResponsesApi {
         crate::providers::openai::PROVIDER_NAME
     }
 
-    async fn respond(&self, session: &mut TauSession) -> Result<ApiResponse, ProviderError> {
+    async fn respond(&self, session: &mut TauSession) -> Result<TauResponse, ProviderError> {
         let (request, conversation) = build_request(session)?;
         let url = format!("{}/responses", self.base_url);
         let request_body = serde_json::to_string_pretty(&request)?;
@@ -387,22 +387,20 @@ fn pending_input_items(session: &TauSession) -> &[ConversationItem] {
     &items[start..]
 }
 
-fn parse_response(response: OpenAiResponse) -> Result<ApiResponse, ProviderError> {
+fn parse_response(response: OpenAiResponse) -> Result<TauResponse, ProviderError> {
     let usage = response.usage.map(|usage| TokenUsage {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         total_tokens: usage.total_tokens,
     });
     let mut parts = Vec::new();
-    let mut content = Vec::new();
-    let mut tool_calls = Vec::new();
-
     let mut saw_refusal = false;
+    let mut has_tool_calls = false;
 
     for item in response.output {
         match item.get("type").and_then(Value::as_str) {
             Some("message") => {
-                saw_refusal |= parse_message_output_item(item, &mut parts, &mut content)?;
+                saw_refusal |= parse_message_output_item(item, &mut parts)?;
             }
             Some("function_call") => {
                 let function_call: OpenAiFunctionCallOutput = serde_json::from_value(item.clone())?;
@@ -418,21 +416,19 @@ fn parse_response(response: OpenAiResponse) -> Result<ApiResponse, ProviderError
                     input,
                 };
                 parts.push(ResponsePart::ToolUse { call: call.clone() });
-                tool_calls.push(call);
+                has_tool_calls = true;
             }
             Some("reasoning") => {
                 let content_part = openai_reasoning_content(item.clone());
                 parts.push(ResponsePart::Content {
                     content: content_part.clone(),
                 });
-                content.push(content_part);
             }
             _ => {
                 let content_part = ContentPart::json(item.clone());
                 parts.push(ResponsePart::Content {
                     content: content_part.clone(),
                 });
-                content.push(content_part);
             }
         }
     }
@@ -441,17 +437,12 @@ fn parse_response(response: OpenAiResponse) -> Result<ApiResponse, ProviderError
         response.status.as_deref(),
         response.incomplete_details.as_ref(),
         saw_refusal,
-        !tool_calls.is_empty(),
+        has_tool_calls,
     ) {
         parts.push(ResponsePart::Stop { stop });
     }
 
-    Ok(ApiResponse {
-        parts,
-        content,
-        tool_calls,
-        usage,
-    })
+    Ok(TauResponse { parts, usage })
 }
 
 fn openai_stop(
@@ -501,7 +492,6 @@ fn openai_stop(
 fn parse_message_output_item(
     item: Value,
     parts_out: &mut Vec<ResponsePart>,
-    content: &mut Vec<ContentPart>,
 ) -> Result<bool, ProviderError> {
     let parts = item
         .get("content")
@@ -523,9 +513,8 @@ fn parse_message_output_item(
                     metadata: openai_content_metadata(part),
                 };
                 parts_out.push(ResponsePart::Content {
-                    content: content_part.clone(),
+                    content: content_part,
                 });
-                content.push(content_part);
             }
             Some("refusal") => {
                 let refusal = part.get("refusal").and_then(Value::as_str).ok_or_else(|| {
@@ -537,16 +526,14 @@ fn parse_message_output_item(
                     metadata: None,
                 };
                 parts_out.push(ResponsePart::Content {
-                    content: content_part.clone(),
+                    content: content_part,
                 });
-                content.push(content_part);
             }
             _ => {
                 let content_part = ContentPart::json(part.clone());
                 parts_out.push(ResponsePart::Content {
-                    content: content_part.clone(),
+                    content: content_part,
                 });
-                content.push(content_part);
             }
         }
     }
@@ -647,7 +634,7 @@ mod tests {
 
     #[test]
     fn builds_responses_api_request_from_complete_history() {
-        let mut context = crate::context::TauContext::new();
+        let mut context = crate::context::TauContext::default();
         context
             .register_tool(ToolDefinition {
                 name: "echo".to_string(),
@@ -689,7 +676,7 @@ mod tests {
 
     #[test]
     fn uses_previous_response_id_for_incremental_requests() {
-        let mut context = crate::context::TauContext::new();
+        let mut context = crate::context::TauContext::default();
         context
             .register_tool(ToolDefinition {
                 name: "echo".to_string(),
@@ -785,8 +772,9 @@ mod tests {
 
         let parsed = parse_response(response).unwrap();
 
-        assert_eq!(parsed.content.len(), 3);
-        match &parsed.content[0] {
+        let content = parsed.content();
+        assert_eq!(content.len(), 3);
+        match &content[0] {
             ContentPart::Text { text, metadata } => {
                 assert_eq!(text, "I'll check.");
                 let metadata = metadata.as_ref().unwrap();
@@ -795,23 +783,24 @@ mod tests {
             }
             other => panic!("expected text content, got {other:?}"),
         }
-        match &parsed.content[1] {
+        match &content[1] {
             ContentPart::Thinking { text, metadata, .. } => {
                 assert_eq!(text, "I should inspect the files.");
                 assert!(metadata.is_none());
             }
             other => panic!("expected thinking content, got {other:?}"),
         }
-        match &parsed.content[2] {
+        match &content[2] {
             ContentPart::Json { value, metadata } => {
                 assert_eq!(value["type"], "web_search_call");
                 assert!(metadata.is_none());
             }
             other => panic!("expected json content, got {other:?}"),
         }
-        assert_eq!(parsed.tool_calls.len(), 2);
-        assert_eq!(parsed.tool_calls[0].id, "call_a");
-        assert_eq!(parsed.tool_calls[1].input, json!({"path":"README.md"}));
+        let tool_calls = parsed.tool_calls();
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0].id, "call_a");
+        assert_eq!(tool_calls[1].input, json!({"path":"README.md"}));
         assert_eq!(parsed.usage.unwrap().total_tokens, Some(120));
     }
 }

@@ -129,6 +129,5 @@ pub fn find_predefined_provider(name: &str) -> Option<&'static ProviderMetadata>
 
 // Backwards-compatible re-exports for callers that still import API items from `providers`.
 pub use crate::api::{
-    ModelApi, ModelApiFactory, ProviderError, ApiResponse, TokenUsage, available_model_apis,
-    find_model_api,
+    ModelApi, ModelApiFactory, ProviderError, TokenUsage, available_model_apis, find_model_api,
 };

@@ -6,12 +6,12 @@ use serde_json::Value;
 
 use crate::{
     api::{
-        ModelApi, ModelApiFactory, ProviderError, ApiResponse, TokenUsage,
+        ModelApi, ModelApiFactory, ProviderError, TokenUsage,
         common::{binary_content_as_text, json_as_text, tool_result_json},
     },
     context::{
         ContentPart, ConversationItem, MediaData, ResponsePart, ResponseStop, ResponseStopReason,
-        ServerToolUse, TauSession, ToolResult, ToolUse,
+        ServerToolUse, TauResponse, TauSession, ToolResult, ToolUse,
     },
     providers::{ModelMetadata, ProviderConfig, ThinkingEffort, anthropic::AnthropicModelConfig},
 };
@@ -104,7 +104,7 @@ impl ModelApi for AnthropicProvider {
         crate::providers::anthropic::PROVIDER_NAME
     }
 
-    async fn respond(&self, session: &mut TauSession) -> Result<ApiResponse, ProviderError> {
+    async fn respond(&self, session: &mut TauSession) -> Result<TauResponse, ProviderError> {
         let (request, conversation) =
             build_request(session, self.cache_ttl, self.web_search.as_ref())?;
         let url = format!("{}/messages", self.base_url);
@@ -600,7 +600,7 @@ fn push_message(
     messages.push(AnthropicMessage { role, content });
 }
 
-fn parse_response(response: AnthropicResponse) -> Result<ApiResponse, ProviderError> {
+fn parse_response(response: AnthropicResponse) -> Result<TauResponse, ProviderError> {
     let usage = response.usage.map(|usage| {
         let total_tokens = match (usage.input_tokens, usage.output_tokens) {
             (Some(input), Some(output)) => Some(input + output),
@@ -613,8 +613,6 @@ fn parse_response(response: AnthropicResponse) -> Result<ApiResponse, ProviderEr
         }
     });
     let mut parts = Vec::new();
-    let mut content = Vec::new();
-    let mut tool_calls = Vec::new();
 
     let is_refusal = response.stop_reason.as_deref() == Some("refusal");
     let stop = anthropic_stop(
@@ -640,9 +638,8 @@ fn parse_response(response: AnthropicResponse) -> Result<ApiResponse, ProviderEr
                     }
                 };
                 parts.push(ResponsePart::Content {
-                    content: content_part.clone(),
+                    content: content_part,
                 });
-                content.push(content_part);
             }
             Some("tool_use") => {
                 let tool_use: AnthropicToolUseOutput = serde_json::from_value(part)?;
@@ -651,8 +648,7 @@ fn parse_response(response: AnthropicResponse) -> Result<ApiResponse, ProviderEr
                     name: tool_use.name,
                     input: tool_use.input,
                 };
-                parts.push(ResponsePart::ToolUse { call: call.clone() });
-                tool_calls.push(call);
+                parts.push(ResponsePart::ToolUse { call: call });
             }
             Some("server_tool_use") => {
                 let call = ServerToolUse {
@@ -671,9 +667,8 @@ fn parse_response(response: AnthropicResponse) -> Result<ApiResponse, ProviderEr
                 parts.push(ResponsePart::ServerToolUse { call });
                 let content_part = ContentPart::json(part.clone());
                 parts.push(ResponsePart::Content {
-                    content: content_part.clone(),
+                    content: content_part,
                 });
-                content.push(content_part);
             }
             Some("thinking") => {
                 let text = part
@@ -694,23 +689,20 @@ fn parse_response(response: AnthropicResponse) -> Result<ApiResponse, ProviderEr
                     metadata: None,
                 };
                 parts.push(ResponsePart::Content {
-                    content: content_part.clone(),
+                    content: content_part,
                 });
-                content.push(content_part);
             }
             Some("redacted_thinking") => {
                 let content_part = ContentPart::json(part.clone());
                 parts.push(ResponsePart::Content {
-                    content: content_part.clone(),
+                    content: content_part,
                 });
-                content.push(content_part);
             }
             _ => {
                 let content_part = ContentPart::json(part.clone());
                 parts.push(ResponsePart::Content {
-                    content: content_part.clone(),
+                    content: content_part,
                 });
-                content.push(content_part);
             }
         }
     }
@@ -719,12 +711,7 @@ fn parse_response(response: AnthropicResponse) -> Result<ApiResponse, ProviderEr
         parts.push(ResponsePart::Stop { stop });
     }
 
-    Ok(ApiResponse {
-        parts,
-        content,
-        tool_calls,
-        usage,
-    })
+    Ok(TauResponse { parts, usage })
 }
 
 fn anthropic_stop(reason: Option<&str>, sequence: Option<String>) -> Option<ResponseStop> {
@@ -847,7 +834,7 @@ mod tests {
 
     #[test]
     fn builds_messages_api_request_from_complete_history() {
-        let mut context = crate::context::TauContext::new();
+        let mut context = crate::context::TauContext::default();
         context
             .register_tool(ToolDefinition {
                 name: "echo".to_string(),
@@ -953,7 +940,7 @@ mod tests {
 
     #[test]
     fn sends_adaptive_thinking_and_effort_for_default_anthropic_models() {
-        let context = crate::context::TauContext::new();
+        let context = crate::context::TauContext::default();
         let model = crate::providers::anthropic::default_models()
             .into_iter()
             .find(|model| model.name == "sonnet-4-6")
@@ -973,7 +960,7 @@ mod tests {
 
     #[test]
     fn sends_enabled_thinking_budget_for_legacy_thinking_models() {
-        let context = crate::context::TauContext::new();
+        let context = crate::context::TauContext::default();
         let model = crate::providers::anthropic::default_models()
             .into_iter()
             .find(|model| model.name == "haiku-4-5")
@@ -993,7 +980,7 @@ mod tests {
 
     #[test]
     fn omits_thinking_for_disabled_or_unknown_model_metadata() {
-        let context = crate::context::TauContext::new();
+        let context = crate::context::TauContext::default();
         let model = crate::providers::anthropic::default_models()
             .into_iter()
             .find(|model| model.name == "haiku-4-5")
@@ -1015,7 +1002,7 @@ mod tests {
 
     #[test]
     fn configured_model_without_metadata_uses_anthropic_max_tokens_default() {
-        let context = crate::context::TauContext::new();
+        let context = crate::context::TauContext::default();
         let mut session = context.session(AnthropicProvider::new("test-key"), "llama.cpp-model");
 
         let request = build_request(&mut session, None, None).unwrap();
@@ -1027,7 +1014,7 @@ mod tests {
 
     #[test]
     fn configures_one_hour_automatic_cache_ttl() {
-        let context = crate::context::TauContext::new();
+        let context = crate::context::TauContext::default();
         let mut session = context.session(AnthropicProvider::new("test-key"), test_model());
         let request = build_request(&mut session, Some(AnthropicCacheTtl::OneHour), None).unwrap();
         let value = serde_json::to_value(request.0).unwrap();
@@ -1068,7 +1055,7 @@ mod tests {
 
     #[test]
     fn disables_web_search_when_configured_off() {
-        let context = crate::context::TauContext::new();
+        let context = crate::context::TauContext::default();
         let mut session = context.session(AnthropicProvider::new("test-key"), test_model());
         let web_search = AnthropicWebSearchConfig {
             enabled: Some(false),
@@ -1117,8 +1104,9 @@ mod tests {
 
         let parsed = parse_response(response).unwrap();
 
-        assert_eq!(parsed.content.len(), 3);
-        match &parsed.content[0] {
+        let content = parsed.content();
+        assert_eq!(content.len(), 3);
+        match &content[0] {
             ContentPart::Text { text, metadata } => {
                 assert_eq!(text, "I'll check.");
                 assert_eq!(metadata.as_ref().unwrap()["kind"], "citations");
@@ -1129,7 +1117,7 @@ mod tests {
             }
             other => panic!("expected text content, got {other:?}"),
         }
-        match &parsed.content[1] {
+        match &content[1] {
             ContentPart::Thinking {
                 text,
                 signature,
@@ -1141,7 +1129,7 @@ mod tests {
             }
             other => panic!("expected thinking content, got {other:?}"),
         }
-        match &parsed.content[2] {
+        match &content[2] {
             ContentPart::Json { value, metadata } => {
                 assert_eq!(value["type"], "server_tool_use");
                 assert!(metadata.is_none());
@@ -1153,9 +1141,10 @@ mod tests {
             ResponsePart::ServerToolUse { call }
                 if call.id.as_deref() == Some("srv_1") && call.name == "web_search"
         ));
-        assert_eq!(parsed.tool_calls.len(), 2);
-        assert_eq!(parsed.tool_calls[0].id, "toolu_a");
-        assert_eq!(parsed.tool_calls[1].input, json!({"path":"README.md"}));
+        let tool_calls = parsed.tool_calls();
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0].id, "toolu_a");
+        assert_eq!(tool_calls[1].input, json!({"path":"README.md"}));
         assert_eq!(parsed.usage.unwrap().total_tokens, Some(62));
     }
 }

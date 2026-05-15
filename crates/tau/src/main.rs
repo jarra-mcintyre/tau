@@ -71,7 +71,7 @@ fn init_file_logging() -> Result<WorkerGuard, Box<dyn std::error::Error>> {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let mut cli_config = CliConfig::load()?;
-    let mut context = libtau::context::TauContext::new();
+    let mut context = libtau::context::TauContext::default();
     tools::register_builtin_tools(&mut context)?;
 
     let (mut session, persistence) =

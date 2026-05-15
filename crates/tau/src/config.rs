@@ -1,14 +1,11 @@
 use std::{fmt, fs, path::PathBuf, str::FromStr, sync::Arc};
 
 use libtau::{
-    api::{
-        ModelApi, ModelApiFactory, find_model_api
-    },
+    api::{ModelApi, ModelApiFactory, find_model_api},
     context::{TauContext, TauSession},
     providers::{
         ModelMetadata, ProviderConfig as RuntimeProviderConfig, ProviderMetadata,
-        ProviderModelConfig, ThinkingEffort, anthropic, openai,
-        find_predefined_provider
+        ProviderModelConfig, ThinkingEffort, anthropic, find_predefined_provider, openai,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -358,8 +355,8 @@ fn configured_provider(
             config_path_label(config_path)
         )
     })?;
-    let api = find_model_api(&api_name)
-        .ok_or_else(|| format!("unsupported provider API: {api_name}"))?;
+    let api =
+        find_model_api(&api_name).ok_or_else(|| format!("unsupported provider API: {api_name}"))?;
 
     if provider_config.models.is_empty() {
         return Err(format!(

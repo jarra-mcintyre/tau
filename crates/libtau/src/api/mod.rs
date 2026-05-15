@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
-    context::{ContentPart, ResponsePart, TauSession, ToolUse},
+    context::{ResponsePart, TauResponse, TauSession},
     providers::ProviderConfig,
 };
 
@@ -11,27 +13,20 @@ pub mod anthropic_messages;
 pub mod common;
 pub mod openai_responses;
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ApiResponse {
-    /// Ordered response blocks as returned by the provider.
-    pub parts: Vec<ResponsePart>,
-    /// Convenience view of all agent content blocks in `parts`.
-    pub content: Vec<ContentPart>,
-    /// Convenience view of all client-executable tool calls in `parts`.
-    pub tool_calls: Vec<ToolUse>,
-    pub usage: Option<TokenUsage>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
 }
 
-impl ApiResponse {
+impl TauResponse {
     pub fn is_tool_call_only(&self) -> bool {
-        self.content.is_empty() && !self.tool_calls.is_empty()
+        !self.parts.is_empty()
+            && self
+                .parts
+                .iter()
+                .all(|part| matches!(part, ResponsePart::ToolUse { .. }))
     }
 }
 
@@ -60,7 +55,7 @@ pub enum ProviderError {
 pub trait ModelApi: Send + Sync {
     fn name(&self) -> &'static str;
 
-    async fn respond(&self, session: &mut TauSession) -> Result<ApiResponse, ProviderError>;
+    async fn respond(&self, session: &mut TauSession) -> Result<TauResponse, ProviderError>;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -80,7 +75,5 @@ pub fn available_model_apis() -> &'static [ModelApiFactory] {
 }
 
 pub fn find_model_api(name: &str) -> Option<&'static ModelApiFactory> {
-    available_model_apis()
-        .iter()
-        .find(|api| api.name == name)
+    available_model_apis().iter().find(|api| api.name == name)
 }

@@ -1,12 +1,10 @@
-use std::{any::Any, collections::BTreeMap, fmt, sync::Arc};
+use std::{any::Any, collections::BTreeMap, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    providers::{
-        ModelMetadata, ModelApi, ProviderError, ApiResponse, ThinkingEffort, TokenUsage,
-    },
+    providers::{ModelApi, ModelMetadata, ProviderError, ThinkingEffort, TokenUsage},
     tools::{ToolCallError, ToolDefinition, ToolOutput, ToolRegistrationError},
 };
 
@@ -167,6 +165,8 @@ pub struct ServerToolUse {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TauResponse {
     pub parts: Vec<ResponsePart>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -178,37 +178,7 @@ pub enum TauEvent {
     ToolResult(Vec<ToolResult>),
 }
 
-impl fmt::Debug for TauContext {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("TauContext")
-            .field("tools", &self.tools)
-            .finish()
-    }
-}
-
-impl fmt::Debug for TauSession {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("TauSession")
-            .field("context", &self.context)
-            .field("conversation", &self.conversation)
-            .field("model", &self.model)
-            .field("provider", &self.provider.name())
-            .field("config", &self.config)
-            .field(
-                "provider_state_keys",
-                &self.provider_state.keys().collect::<Vec<_>>(),
-            )
-            .finish()
-    }
-}
-
 impl TauContext {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn session(
         &self,
         provider: impl ModelApi + 'static,
@@ -537,10 +507,10 @@ impl TauSession {
         self.last_token_usage = response.usage.clone();
         self.record_provider_response(&response);
 
-        Ok(response.into())
+        Ok(response)
     }
 
-    fn record_provider_response(&mut self, response: &ApiResponse) {
+    fn record_provider_response(&mut self, response: &TauResponse) {
         let mut content = Vec::new();
         let mut tool_calls = Vec::new();
         let mut stops = Vec::new();
@@ -552,11 +522,6 @@ impl TauSession {
                 ResponsePart::ServerToolUse { .. } => {}
                 ResponsePart::Stop { stop } => stops.push(stop.clone()),
             }
-        }
-
-        if response.parts.is_empty() {
-            content = response.content.clone();
-            tool_calls = response.tool_calls.clone();
         }
 
         if !content.is_empty() {
@@ -652,31 +617,6 @@ impl TauResponse {
     }
 }
 
-impl From<ApiResponse> for TauResponse {
-    fn from(response: ApiResponse) -> Self {
-        if !response.parts.is_empty() {
-            return Self {
-                parts: response.parts,
-            };
-        }
-
-        let mut parts = Vec::new();
-        parts.extend(
-            response
-                .content
-                .into_iter()
-                .map(|content| ResponsePart::Content { content }),
-        );
-        parts.extend(
-            response
-                .tool_calls
-                .into_iter()
-                .map(|call| ResponsePart::ToolUse { call }),
-        );
-        Self { parts }
-    }
-}
-
 impl ContentPart {
     pub fn text(text: impl Into<String>) -> Self {
         Self::Text {
@@ -748,19 +688,14 @@ mod tests {
             "stub"
         }
 
-        async fn respond(
-            &self,
-            _session: &mut TauSession,
-        ) -> Result<ApiResponse, ProviderError> {
+        async fn respond(&self, _session: &mut TauSession) -> Result<TauResponse, ProviderError> {
             let call = ToolUse {
                 id: "call_1".to_string(),
                 name: "read_file".to_string(),
                 input: serde_json::json!({"path":"README.md"}),
             };
-            Ok(ApiResponse {
+            Ok(TauResponse {
                 parts: vec![ResponsePart::ToolUse { call: call.clone() }],
-                content: vec![],
-                tool_calls: vec![call],
                 usage: Some(TokenUsage {
                     input_tokens: Some(10),
                     output_tokens: Some(5),
@@ -772,7 +707,7 @@ mod tests {
 
     #[test]
     fn registers_builtin_tools() {
-        let mut context = TauContext::new();
+        let mut context = TauContext::default();
         tools::register_builtin_tools(&mut context).unwrap();
 
         let names: Vec<_> = context
@@ -793,7 +728,7 @@ mod tests {
             Ok(ToolOutput::json(input))
         }
 
-        let mut context = TauContext::new();
+        let mut context = TauContext::default();
         let definition = ToolDefinition {
             name: "duplicate".to_string(),
             description: "first".to_string(),
@@ -816,7 +751,7 @@ mod tests {
             .build()
             .unwrap()
             .block_on(async {
-                let mut session = TauContext::new().session(StubProvider, "gpt-test");
+                let mut session = TauContext::default().session(StubProvider, "gpt-test");
                 session.set_system_message("be helpful");
 
                 let mut events = Vec::new();
@@ -834,7 +769,12 @@ mod tests {
                                 name: "read_file".to_string(),
                                 input: serde_json::json!({"path":"README.md"}),
                             }
-                        }]
+                        }],
+                        usage: Some(TokenUsage {
+                            input_tokens: Some(10),
+                            output_tokens: Some(5),
+                            total_tokens: Some(15),
+                        }),
                     }
                 );
                 assert_eq!(
@@ -860,7 +800,7 @@ mod tests {
             Ok(ToolOutput::json(input))
         }
 
-        let mut context = TauContext::new();
+        let mut context = TauContext::default();
         context
             .register_tool(ToolDefinition {
                 name: "echo".to_string(),
