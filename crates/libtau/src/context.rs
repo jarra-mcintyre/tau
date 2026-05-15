@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::{
     providers::{
-        ModelMetadata, Provider, ProviderError, ProviderResponse, ThinkingEffort, TokenUsage,
+        ModelMetadata, ModelApi, ProviderError, ApiResponse, ThinkingEffort, TokenUsage,
     },
     tools::{ToolCallError, ToolDefinition, ToolOutput, ToolRegistrationError},
 };
@@ -22,7 +22,7 @@ pub struct TauSession {
     context: Arc<TauContext>,
     conversation: Conversation,
     model: Option<ModelMetadata>,
-    provider: Arc<dyn Provider>,
+    provider: Arc<dyn ModelApi>,
     config: TauSessionConfig,
     provider_state: BTreeMap<String, ProviderState>,
     last_token_usage: Option<TokenUsage>,
@@ -211,7 +211,7 @@ impl TauContext {
 
     pub fn session(
         &self,
-        provider: impl Provider + 'static,
+        provider: impl ModelApi + 'static,
         model: impl Into<ModelMetadata>,
     ) -> TauSession {
         TauSession::new(self.clone(), provider, model)
@@ -219,7 +219,7 @@ impl TauContext {
 
     pub fn session_with_provider_arc(
         &self,
-        provider: Arc<dyn Provider>,
+        provider: Arc<dyn ModelApi>,
         model: impl Into<ModelMetadata>,
     ) -> TauSession {
         TauSession::new_with_provider_arc(self.clone(), provider, model)
@@ -296,7 +296,7 @@ impl TauContext {
 impl TauSession {
     pub fn new(
         context: TauContext,
-        provider: impl Provider + 'static,
+        provider: impl ModelApi + 'static,
         model: impl Into<ModelMetadata>,
     ) -> Self {
         Self::new_with_provider_arc(context, Arc::new(provider), model)
@@ -304,7 +304,7 @@ impl TauSession {
 
     pub fn new_with_provider_arc(
         context: TauContext,
-        provider: Arc<dyn Provider>,
+        provider: Arc<dyn ModelApi>,
         model: impl Into<ModelMetadata>,
     ) -> Self {
         let model = model.into();
@@ -325,7 +325,7 @@ impl TauSession {
         &self.context
     }
 
-    pub fn provider(&self) -> &dyn Provider {
+    pub fn provider(&self) -> &dyn ModelApi {
         self.provider.as_ref()
     }
 
@@ -349,7 +349,7 @@ impl TauSession {
         self.config = config;
     }
 
-    pub fn set_provider_arc(&mut self, provider: Arc<dyn Provider>) {
+    pub fn set_provider_arc(&mut self, provider: Arc<dyn ModelApi>) {
         self.provider = provider;
         self.provider_state.clear();
         self.conversation.provider_data = None;
@@ -358,7 +358,7 @@ impl TauSession {
 
     pub fn set_provider_and_model(
         &mut self,
-        provider: Arc<dyn Provider>,
+        provider: Arc<dyn ModelApi>,
         model: impl Into<ModelMetadata>,
     ) {
         self.set_provider_arc(provider);
@@ -540,7 +540,7 @@ impl TauSession {
         Ok(response.into())
     }
 
-    fn record_provider_response(&mut self, response: &ProviderResponse) {
+    fn record_provider_response(&mut self, response: &ApiResponse) {
         let mut content = Vec::new();
         let mut tool_calls = Vec::new();
         let mut stops = Vec::new();
@@ -652,8 +652,8 @@ impl TauResponse {
     }
 }
 
-impl From<ProviderResponse> for TauResponse {
-    fn from(response: ProviderResponse) -> Self {
+impl From<ApiResponse> for TauResponse {
+    fn from(response: ApiResponse) -> Self {
         if !response.parts.is_empty() {
             return Self {
                 parts: response.parts,
@@ -737,13 +737,13 @@ impl ContentPart {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{providers::Provider, tools};
+    use crate::{providers::ModelApi, tools};
 
     #[derive(Debug)]
     struct StubProvider;
 
     #[async_trait::async_trait]
-    impl Provider for StubProvider {
+    impl ModelApi for StubProvider {
         fn name(&self) -> &'static str {
             "stub"
         }
@@ -751,13 +751,13 @@ mod tests {
         async fn respond(
             &self,
             _session: &mut TauSession,
-        ) -> Result<ProviderResponse, ProviderError> {
+        ) -> Result<ApiResponse, ProviderError> {
             let call = ToolUse {
                 id: "call_1".to_string(),
                 name: "read_file".to_string(),
                 input: serde_json::json!({"path":"README.md"}),
             };
-            Ok(ProviderResponse {
+            Ok(ApiResponse {
                 parts: vec![ResponsePart::ToolUse { call: call.clone() }],
                 content: vec![],
                 tool_calls: vec![call],

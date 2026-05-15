@@ -12,8 +12,9 @@ Use normal Cargo commands for building, formatting, testing and running. Use `fi
 ## Architecture
 
 - "Context" tracks global configuration such as tool and provider definitions
-- "Sessions" track a conversation with a model and include user message, agent message, tools use etc. Each session is tied to a provider.
-- "Providers": implement support for a specific provider API. Currently we support Anthropic Messages and OpenAI Requests.
+- "Sessions": track a conversation with a model and include user message, agent message, tools use etc. Each session is tied to a provider.
+- "API": implements support for common model provider APIs (currently Anthropic Messages and OpenAI Requests)
+- "Providers": services that provide a model. Each provider uses a specific API (e.g. Anthropic Messages for Anthropic)
 - "Models": Models (e.g. GPT-5.5, Opus 4.7) are provided by a Provider.
 
 Providers track the complete conversation history in a provider specific format and optionally any resume IDs etc (e.g. OpenAI `previous_response_id`). Sessions track the conversation history in a model agnostic format suitable for display to users etc

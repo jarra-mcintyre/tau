@@ -1,8 +1,8 @@
 use serde_json::{Value, json};
 
 use crate::{
+    api::ProviderError,
     context::{ContentPart, MediaData, ToolResult},
-    providers::ProviderError,
 };
 
 pub fn json_as_text(value: &Value) -> Result<String, ProviderError> {

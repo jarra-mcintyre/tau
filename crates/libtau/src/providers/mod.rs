@@ -1,72 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::{any::Any, fmt, sync::Arc};
 
-use async_trait::async_trait;
-
-use crate::context::{ContentPart, ResponsePart, TauSession, ToolUse};
+use crate::api;
 
 pub mod anthropic;
-pub mod common;
 pub mod openai;
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProviderResponse {
-    /// Ordered response blocks as returned by the provider.
-    pub parts: Vec<ResponsePart>,
-    /// Convenience view of all agent content blocks in `parts`.
-    pub content: Vec<ContentPart>,
-    /// Convenience view of all client-executable tool calls in `parts`.
-    pub tool_calls: Vec<ToolUse>,
-    pub usage: Option<TokenUsage>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TokenUsage {
-    pub input_tokens: Option<u64>,
-    pub output_tokens: Option<u64>,
-    pub total_tokens: Option<u64>,
-}
-
-impl ProviderResponse {
-    pub fn is_tool_call_only(&self) -> bool {
-        self.content.is_empty() && !self.tool_calls.is_empty()
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ProviderError {
-    #[error("context does not have a provider")]
-    MissingProvider,
-    #[error("context does not have a model")]
-    MissingModel,
-    #[error("provider configuration error: {0}")]
-    Configuration(String),
-    #[error("http request failed: {0}")]
-    Http(#[from] reqwest::Error),
-    #[error("provider returned an error ({status}): {body}")]
-    Api {
-        status: reqwest::StatusCode,
-        body: String,
-    },
-    #[error("failed to serialize provider request: {0}")]
-    Serialization(#[from] serde_json::Error),
-    #[error("provider response was not understood: {0}")]
-    Response(String),
-}
-
-#[async_trait]
-pub trait Provider: Send + Sync {
-    fn name(&self) -> &'static str;
-
-    async fn respond(&self, session: &mut TauSession) -> Result<ProviderResponse, ProviderError>;
-}
-
-#[derive(Debug, Clone)]
-pub struct ProviderApiConfig {
-    pub api_key: String,
-    pub base_url: Option<String>,
-    pub options: serde_json::Value,
-}
 
 pub trait ModelCosts: fmt::Debug + Send + Sync {
     fn as_any(&self) -> &dyn Any;
@@ -97,6 +35,8 @@ pub struct ModelMetadata {
     pub context_length: u64,
     /// maximum number of tokens to generate in a single response (0 to leave unspecified)
     pub max_tokens: u64,
+    /// Default thinking effort for this model, if configured.
+    pub thinking_effort: Option<ThinkingEffort>,
     /// Provider-specific model configuration.
     pub provider_config: Option<Arc<dyn ProviderModelConfig>>,
     /// Provider-specific prices. USD per one million units unless noted otherwise.
@@ -111,6 +51,7 @@ impl ModelMetadata {
             id: model,
             context_length: 0,
             max_tokens: 0,
+            thinking_effort: None,
             provider_config: None,
             costs: None,
         }
@@ -130,29 +71,64 @@ impl From<&str> for ModelMetadata {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct ProviderApi {
+pub struct ProviderMetadata {
+    /// User-facing provider name used in Tau model selections.
     pub name: &'static str,
+    /// API integration used to communicate with this provider.
+    pub api: &'static api::ModelApiFactory,
+    /// Environment variable used for this provider's API key.
     pub api_key_env: &'static str,
+    /// Human readable provider name used in errors.
     pub display_name: &'static str,
-    pub build: fn(ProviderApiConfig) -> Result<Arc<dyn Provider>, ProviderError>,
-    pub default_models: fn() -> Vec<ModelMetadata>,
+    /// Default API base URL for this provider.
+    pub base_url: &'static str,
+    /// Predefined model list for this provider.
+    pub models: fn() -> Vec<ModelMetadata>,
 }
 
-impl ProviderApi {
-    pub fn build_provider(
-        &self,
-        config: ProviderApiConfig,
-    ) -> Result<Arc<dyn Provider>, ProviderError> {
-        (self.build)(config)
+#[derive(Debug, Clone)]
+pub struct ProviderConfig {
+    pub api_key: String,
+    pub base_url: String,
+    pub options: serde_json::Value,
+}
+
+impl ProviderMetadata {
+    pub fn default_models(&self) -> Vec<ModelMetadata> {
+        (self.models)()
     }
 }
 
-pub fn available_provider_apis() -> &'static [ProviderApi] {
-    &[openai::API, anthropic::API]
+pub const OPENAI: ProviderMetadata = ProviderMetadata {
+    name: openai::PROVIDER_NAME,
+    api: &api::openai_responses::API,
+    api_key_env: openai::API_KEY_ENV,
+    display_name: "OpenAI",
+    base_url: openai::DEFAULT_BASE_URL,
+    models: openai::default_models,
+};
+
+pub const ANTHROPIC: ProviderMetadata = ProviderMetadata {
+    name: anthropic::PROVIDER_NAME,
+    api: &api::anthropic_messages::API,
+    api_key_env: anthropic::API_KEY_ENV,
+    display_name: "Anthropic",
+    base_url: anthropic::DEFAULT_BASE_URL,
+    models: anthropic::default_models,
+};
+
+pub fn predefined_providers() -> &'static [ProviderMetadata] {
+    &[OPENAI, ANTHROPIC]
 }
 
-pub fn find_provider_api(name: &str) -> Option<&'static ProviderApi> {
-    available_provider_apis()
+pub fn find_predefined_provider(name: &str) -> Option<&'static ProviderMetadata> {
+    predefined_providers()
         .iter()
-        .find(|api| api.name == name)
+        .find(|provider| provider.name == name)
 }
+
+// Backwards-compatible re-exports for callers that still import API items from `providers`.
+pub use crate::api::{
+    ModelApi, ModelApiFactory, ProviderError, ApiResponse, TokenUsage, available_model_apis,
+    find_model_api,
+};
