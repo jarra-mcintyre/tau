@@ -169,15 +169,6 @@ pub struct TauResponse {
     pub usage: Option<TokenUsage>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum TauEvent {
-    UserMessage(Vec<ContentPart>),
-    AgentMessage(Vec<ContentPart>),
-    ToolUseRequested(Vec<ToolUse>),
-    ServerToolUse(Vec<ServerToolUse>),
-    ToolResult(Vec<ToolResult>),
-}
-
 impl TauContext {
     pub fn session(
         &self,
@@ -448,19 +439,10 @@ impl TauSession {
     }
 
     pub fn call_tools_parallel_and_record(&mut self, calls: &[ToolUse]) -> Vec<ToolResult> {
-        self.call_tools_parallel_and_record_with_events(calls, |_| {})
-    }
-
-    pub fn call_tools_parallel_and_record_with_events(
-        &mut self,
-        calls: &[ToolUse],
-        mut on_event: impl FnMut(TauEvent),
-    ) -> Vec<ToolResult> {
         let results = self.call_tools_parallel(calls);
         self.push_item(ConversationItem::ToolResult {
             results: results.clone(),
         });
-        on_event(TauEvent::ToolResult(results.clone()));
         results
     }
 
@@ -468,37 +450,15 @@ impl TauSession {
         &mut self,
         text: impl Into<String>,
     ) -> Result<TauResponse, ProviderError> {
-        self.send_message_with_events(text, |_| {}).await
-    }
-
-    pub async fn send_message_with_events(
-        &mut self,
-        text: impl Into<String>,
-        on_event: impl FnMut(TauEvent),
-    ) -> Result<TauResponse, ProviderError> {
-        self.send_content_with_events(vec![ContentPart::text(text)], on_event)
-            .await
+        self.send_content(vec![ContentPart::text(text)]).await
     }
 
     pub async fn send_content(
         &mut self,
         content: Vec<ContentPart>,
     ) -> Result<TauResponse, ProviderError> {
-        self.send_content_with_events(content, |_| {}).await
-    }
-
-    pub async fn send_content_with_events(
-        &mut self,
-        content: Vec<ContentPart>,
-        mut on_event: impl FnMut(TauEvent),
-    ) -> Result<TauResponse, ProviderError> {
-        self.push_user_content(content.clone());
-        on_event(TauEvent::UserMessage(content));
-
-        let response = self.request_response().await?;
-        emit_tau_response(&response, &mut on_event);
-
-        Ok(response)
+        self.push_user_content(content);
+        self.request_response().await
     }
 
     pub async fn request_response(&mut self) -> Result<TauResponse, ProviderError> {
@@ -534,65 +494,6 @@ impl TauSession {
             self.push_item(ConversationItem::ResponseStop { stop });
         }
     }
-}
-
-fn emit_tau_response(response: &TauResponse, on_event: &mut impl FnMut(TauEvent)) {
-    fn flush_events(
-        content: &mut Vec<ContentPart>,
-        tool_calls: &mut Vec<ToolUse>,
-        server_tool_calls: &mut Vec<ServerToolUse>,
-        on_event: &mut impl FnMut(TauEvent),
-    ) {
-        if !content.is_empty() {
-            on_event(TauEvent::AgentMessage(std::mem::take(content)));
-        }
-        if !tool_calls.is_empty() {
-            on_event(TauEvent::ToolUseRequested(std::mem::take(tool_calls)));
-        }
-        if !server_tool_calls.is_empty() {
-            on_event(TauEvent::ServerToolUse(std::mem::take(server_tool_calls)));
-        }
-    }
-
-    let mut content = Vec::new();
-    let mut tool_calls = Vec::new();
-    let mut server_tool_calls = Vec::new();
-
-    for part in &response.parts {
-        match part {
-            ResponsePart::Content { content: part } => content.push(part.clone()),
-            ResponsePart::ToolUse { call } => {
-                if !content.is_empty() || !server_tool_calls.is_empty() {
-                    flush_events(
-                        &mut content,
-                        &mut tool_calls,
-                        &mut server_tool_calls,
-                        on_event,
-                    );
-                }
-                tool_calls.push(call.clone());
-            }
-            ResponsePart::ServerToolUse { call } => {
-                if !content.is_empty() || !tool_calls.is_empty() {
-                    flush_events(
-                        &mut content,
-                        &mut tool_calls,
-                        &mut server_tool_calls,
-                        on_event,
-                    );
-                }
-                server_tool_calls.push(call.clone());
-            }
-            ResponsePart::Stop { .. } => {}
-        }
-    }
-
-    flush_events(
-        &mut content,
-        &mut tool_calls,
-        &mut server_tool_calls,
-        on_event,
-    );
 }
 
 impl TauResponse {
@@ -746,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn sends_message_through_configured_provider_and_emits_updates() {
+    fn sends_message_through_configured_provider() {
         tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
@@ -754,11 +655,7 @@ mod tests {
                 let mut session = TauContext::default().session(StubProvider, "gpt-test");
                 session.set_system_message("be helpful");
 
-                let mut events = Vec::new();
-                let response = session
-                    .send_message_with_events("read the readme", |event| events.push(event))
-                    .await
-                    .unwrap();
+                let response = session.send_message("read the readme").await.unwrap();
 
                 assert_eq!(
                     response,
@@ -776,17 +673,6 @@ mod tests {
                             total_tokens: Some(15),
                         }),
                     }
-                );
-                assert_eq!(
-                    events,
-                    vec![
-                        TauEvent::UserMessage(vec![ContentPart::text("read the readme")]),
-                        TauEvent::ToolUseRequested(vec![ToolUse {
-                            id: "call_1".to_string(),
-                            name: "read_file".to_string(),
-                            input: serde_json::json!({"path":"README.md"}),
-                        }])
-                    ]
                 );
                 assert_eq!(session.model(), Some("gpt-test"));
                 assert_eq!(session.conversation().items.len(), 3);
