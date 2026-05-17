@@ -15,6 +15,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 mod cli;
 mod config;
 mod session;
+mod state;
 
 use config::CliConfig;
 use session::{load_or_create_session, save_session};
