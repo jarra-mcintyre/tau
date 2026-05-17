@@ -1,12 +1,13 @@
 use std::{
-    io::{self, Write},
+    fs,
+    io::{self, IsTerminal},
     path::PathBuf,
+    process::Command as ProcessCommand,
 };
 
-use clap::Parser;
 use libtau::{
     context::{ContentPart, ResponsePart, TauSession, ToolResult, ToolUse},
-    providers::{ThinkingEffort, TokenUsage},
+    providers::TokenUsage,
     tools,
 };
 use tracing_appender::non_blocking::WorkerGuard;
@@ -17,20 +18,14 @@ mod config;
 mod session;
 mod state;
 
+use cli::{Command, parse_cli_from};
 use config::CliConfig;
-use session::{load_or_create_session, save_session};
+use session::{SessionPersistence, load_session_from_path, save_session, session_path_for_id};
+use state::{SessionRecord, StateDb};
 
 const SYSTEM_MESSAGE: &str = r#"You are Tau, a coding agent running in a terminal.
 
 You can inspect and modify files using tools. When the user asks you to read, write, or edit files, use the available tools."#;
-
-#[derive(Debug, Parser)]
-#[command(version, about = "Tau interactive coding agent")]
-struct Args {
-    /// Resume a previous session by id.
-    #[arg(long, value_name = "SESSION_ID")]
-    resume: Option<String>,
-}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _log_guard = init_file_logging()?;
@@ -71,172 +66,283 @@ fn init_file_logging() -> Result<WorkerGuard, Box<dyn std::error::Error>> {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-    let mut cli_config = CliConfig::load()?;
-    let mut context = libtau::context::TauContext::default();
-    tools::register_builtin_tools(&mut context)?;
+    let invocation = parse_cli_from(std::env::args_os())?;
+    let output = OutputStyle::detect();
 
-    let (mut session, persistence) =
-        load_or_create_session(&context, &mut cli_config, SYSTEM_MESSAGE, args.resume)?;
+    match invocation.command {
+        Command::Message { contents } => {
+            let message = match contents {
+                Some(contents) => contents,
+                None => edit_message()?,
+            };
+            if message.trim().is_empty() {
+                return Err("message is empty".into());
+            }
+
+            let mut cli_config = CliConfig::load()?;
+            if let Some(model_ref) = invocation.modifiers.model.as_deref() {
+                cli_config.restore_current_model(model_ref.parse()?)?;
+            }
+
+            let state = StateDb::open(state_path()?)?;
+            let mut context = libtau::context::TauContext::default();
+            tools::register_builtin_tools(&mut context)?;
+
+            let (record, mut session, persistence) = load_or_create_current_session(
+                &state,
+                &context,
+                &mut cli_config,
+                invocation.modifiers.conversation.as_deref(),
+                invocation.modifiers.read_only,
+            )?;
+
+            match run_turn(&mut session, &message, &output).await {
+                Ok(usage) => {
+                    save_session(&persistence, cli_config.current_model(), &session)?;
+                    state.touch_session(&record.id)?;
+                    print_token_usage(usage.as_ref(), &output);
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = save_session(&persistence, cli_config.current_model(), &session);
+                    Err(error)
+                }
+            }
+        }
+        Command::Conversation { alias } => {
+            let mut cli_config = CliConfig::load()?;
+            if let Some(model_ref) = invocation.modifiers.model.as_deref() {
+                cli_config.restore_current_model(model_ref.parse()?)?;
+            }
+
+            let state = StateDb::open(state_path()?)?;
+            let context = libtau::context::TauContext::default();
+            let readonly = invocation.modifiers.read_only && !invocation.modifiers.writes_allowed;
+            let (record, _session, _persistence) = create_new_session(
+                &state,
+                &context,
+                &mut cli_config,
+                alias.as_deref(),
+                readonly,
+            )?;
+
+            println!("conversation: {}", record.alias);
+            println!("session: {}", record.id);
+            println!("model: {}", record.provider);
+            if record.readonly {
+                println!("mode: read-only");
+            }
+            Ok(())
+        }
+        Command::Version => {
+            println!("{}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        other => Err(format!("command not implemented yet: {other:?}").into()),
+    }
+}
+
+fn load_or_create_current_session(
+    state: &StateDb,
+    context: &libtau::context::TauContext,
+    cli_config: &mut CliConfig,
+    alias: Option<&str>,
+    readonly: bool,
+) -> Result<(SessionRecord, TauSession, SessionPersistence), Box<dyn std::error::Error>> {
+    if let Some(alias) = alias {
+        let record = state
+            .get_session_by_alias(alias)?
+            .ok_or_else(|| format!("conversation '{alias}' does not exist"))?;
+        cli_config.restore_current_model(record.provider.parse()?)?;
+        let (session, persistence) =
+            load_session_from_path(context, cli_config, record.contents_path.clone())?;
+        state.set_current_session(&record.id)?;
+        return Ok((record, session, persistence));
+    }
+
+    if let Some(session_id) = state.current_session_id()? {
+        if let Some(record) = state.get_session_by_id(&session_id)? {
+            cli_config.restore_current_model(record.provider.parse()?)?;
+            let (session, persistence) =
+                load_session_from_path(context, cli_config, record.contents_path.clone())?;
+            return Ok((record, session, persistence));
+        }
+        state.clear_current_session()?;
+    }
+
+    create_new_session(state, context, cli_config, None, readonly)
+}
+
+fn create_new_session(
+    state: &StateDb,
+    context: &libtau::context::TauContext,
+    cli_config: &mut CliConfig,
+    alias: Option<&str>,
+    readonly: bool,
+) -> Result<(SessionRecord, TauSession, SessionPersistence), Box<dyn std::error::Error>> {
+    let alias_generated = alias.is_none();
+    let alias = match alias {
+        Some(alias) => alias.to_string(),
+        None => generate_unique_session_alias(state)?,
+    };
+    let placeholder_id = format!("session-{}", uuid::Uuid::new_v4());
+    let contents_path = session_path_for_id(&placeholder_id)?;
+    let record = state.create_session(
+        &alias,
+        &cli_config.current_model().to_string(),
+        readonly,
+        alias_generated,
+        &contents_path,
+    )?;
+    state.set_current_session(&record.id)?;
+
+    let mut session = cli_config.session_for_current_model(context)?;
+    session.set_system_message(SYSTEM_MESSAGE);
+    let persistence = SessionPersistence {
+        id: record.id.clone(),
+        path: record.contents_path.clone(),
+    };
     save_session(&persistence, cli_config.current_model(), &session)?;
 
-    println!("Tau interactive shell");
-    println!("session: {}", persistence.id);
-    cli_config.print_current_model();
-    print_thinking_effort(session.thinking_effort());
-    if let Some(path) = cli_config.config_path() {
-        println!("config: {}", path.display());
-    } else {
-        println!("config: not found, using environment/defaults");
-    }
-    println!("type /models to list configured models");
-    println!("type /model provider/model to switch models");
-    println!("type /thinking default|disabled|low|medium|high|xhigh|max to set thinking effort");
-    println!("resume later with: tau --resume {}", persistence.id);
-    println!("type /exit or press Ctrl-D to quit\n");
-
-    let stdin = io::stdin();
-    loop {
-        print!("tau> ");
-        io::stdout().flush()?;
-
-        let mut line = String::new();
-        let bytes_read = stdin.read_line(&mut line)?;
-        if bytes_read == 0 {
-            println!();
-            break;
-        }
-
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if matches!(line, "/exit" | "/quit") {
-            break;
-        }
-        if line == "/models" {
-            cli_config.print_models();
-            continue;
-        }
-        if let Some(model_ref) = line.strip_prefix("/model ") {
-            match cli_config.switch_model(&mut session, model_ref.trim()) {
-                Ok(()) => {
-                    save_session(&persistence, cli_config.current_model(), &session)?;
-                    cli_config.print_current_model();
-                }
-                Err(error) => eprintln!("error: {error}"),
-            }
-            continue;
-        }
-        if let Some(effort) = line.strip_prefix("/thinking ") {
-            match parse_thinking_effort(effort.trim()) {
-                Ok(effort) => {
-                    session.set_thinking_effort(effort);
-                    save_session(&persistence, cli_config.current_model(), &session)?;
-                    print_thinking_effort(session.thinking_effort());
-                }
-                Err(error) => eprintln!("error: {error}"),
-            }
-            continue;
-        }
-
-        match run_turn(&mut session, line).await {
-            Ok(()) => save_session(&persistence, cli_config.current_model(), &session)?,
-            Err(error) => {
-                let _ = save_session(&persistence, cli_config.current_model(), &session);
-                eprintln!("error: {error}");
-            }
-        }
-    }
-
-    Ok(())
+    Ok((record, session, persistence))
 }
 
-fn parse_thinking_effort(value: &str) -> Result<Option<ThinkingEffort>, String> {
-    match value {
-        "default" | "model" | "none" => Ok(None),
-        "disabled" | "off" => Ok(Some(ThinkingEffort::Disabled)),
-        "low" => Ok(Some(ThinkingEffort::Low)),
-        "medium" => Ok(Some(ThinkingEffort::Medium)),
-        "high" => Ok(Some(ThinkingEffort::High)),
-        "xhigh" | "extra-high" => Ok(Some(ThinkingEffort::XHigh)),
-        "max" => Ok(Some(ThinkingEffort::Max)),
-        other => Err(format!("unknown thinking effort '{other}'")),
+fn generate_unique_session_alias(state: &StateDb) -> Result<String, Box<dyn std::error::Error>> {
+    for _ in 0..100 {
+        let alias = random_alias();
+        if state.get_session_by_alias(&alias)?.is_none() {
+            return Ok(alias);
+        }
     }
+
+    Err("failed to generate a unique conversation alias".into())
 }
 
-fn print_thinking_effort(effort: Option<ThinkingEffort>) {
-    match effort {
-        Some(effort) => println!("thinking: {effort:?}"),
-        None => println!("thinking: default"),
+fn random_alias() -> String {
+    const ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz_";
+    let uuid = uuid::Uuid::new_v4();
+    uuid.as_bytes()
+        .iter()
+        .take(8)
+        .map(|byte| ALPHABET[*byte as usize % ALPHABET.len()] as char)
+        .collect()
+}
+
+fn state_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Err("cannot open Tau state because HOME is not set".into());
+    };
+    Ok(PathBuf::from(home).join(".tau/state.db"))
+}
+
+fn edit_message() -> Result<String, Box<dyn std::error::Error>> {
+    let editor = std::env::var_os("EDITOR").ok_or("EDITOR is not set")?;
+    let path = std::env::temp_dir().join(format!("tau-message-{}.md", uuid::Uuid::new_v4()));
+    fs::write(&path, "")?;
+    let status = ProcessCommand::new(editor).arg(&path).status()?;
+    if !status.success() {
+        return Err("editor exited unsuccessfully".into());
     }
+    let message = fs::read_to_string(&path)?;
+    let _ = fs::remove_file(path);
+    Ok(message)
 }
 
 async fn run_turn(
     context: &mut TauSession,
     user_message: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+    output: &OutputStyle,
+) -> Result<Option<TokenUsage>, Box<dyn std::error::Error>> {
     let mut response = context.send_message(user_message).await?;
-    print_token_usage(context.last_token_usage());
+    let mut total_usage = context.last_token_usage().cloned();
 
     loop {
         let mut tool_calls = Vec::new();
         for part in response.parts {
             match part {
-                ResponsePart::Content { content } => print_content(&[content]),
+                ResponsePart::Content { content } => print_content(&content, output),
                 ResponsePart::ToolUse { call } => tool_calls.push(call),
                 ResponsePart::ServerToolUse { call } => {
-                    println!("[server tool] {}", call.name);
+                    output.println_styled("tool", &format!("[server tool] {}", call.name));
                 }
                 ResponsePart::Stop { .. } => {}
             }
         }
 
         if tool_calls.is_empty() {
-            return Ok(());
+            return Ok(total_usage);
         }
 
-        run_tools(context, &tool_calls);
+        run_tools(context, &tool_calls, output);
         response = context.request_response().await?;
-        print_token_usage(context.last_token_usage());
+        add_usage(&mut total_usage, context.last_token_usage());
     }
 }
 
-fn run_tools(context: &mut TauSession, tool_calls: &[ToolUse]) -> Vec<ToolResult> {
+fn run_tools(
+    context: &mut TauSession,
+    tool_calls: &[ToolUse],
+    output: &OutputStyle,
+) -> Vec<ToolResult> {
     for call in tool_calls {
-        println!("[tool] {}({})", call.name, compact_json(&call.input));
+        output.println_styled(
+            "tool",
+            &format!("[tool] {}({})", call.name, compact_json(&call.input)),
+        );
     }
 
     let results = context.call_tools_parallel_and_record(tool_calls);
 
     for result in &results {
         match &result.error {
-            Some(error) => println!("[tool] {} failed: {error}", result.name),
-            None => println!("[tool] {} completed", result.name),
+            Some(error) => {
+                output.println_styled("tool", &format!("[tool] {} failed: {error}", result.name))
+            }
+            None => output.println_styled("tool", &format!("[tool] {} completed", result.name)),
         }
     }
 
     results
 }
 
-fn print_token_usage(usage: Option<&TokenUsage>) {
+fn add_usage(total: &mut Option<TokenUsage>, usage: Option<&TokenUsage>) {
+    let Some(usage) = usage else {
+        return;
+    };
+    match total {
+        Some(total) => {
+            total.input_tokens = add_optional(total.input_tokens, usage.input_tokens);
+            total.output_tokens = add_optional(total.output_tokens, usage.output_tokens);
+            total.total_tokens = add_optional(total.total_tokens, usage.total_tokens);
+        }
+        None => *total = Some(usage.clone()),
+    }
+}
+
+fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left + right),
+        _ => None,
+    }
+}
+
+fn print_token_usage(usage: Option<&TokenUsage>, output: &OutputStyle) {
     let Some(usage) = usage else {
         return;
     };
 
-    match (usage.input_tokens, usage.output_tokens, usage.total_tokens) {
-        (Some(input), Some(output), Some(total)) => {
-            println!("[tokens] input={input}, output={output}, total={total}");
+    let line = match (usage.input_tokens, usage.output_tokens, usage.total_tokens) {
+        (Some(input), Some(output_tokens), Some(total)) => {
+            format!("[tokens] input={input}, output={output_tokens}, total={total}")
         }
-        (input, output, total) => {
-            println!(
-                "[tokens] input={}, output={}, total={}",
-                format_optional_u64(input),
-                format_optional_u64(output),
-                format_optional_u64(total)
-            );
-        }
-    }
+        (input, output_tokens, total) => format!(
+            "[tokens] input={}, output={}, total={}",
+            format_optional_u64(input),
+            format_optional_u64(output_tokens),
+            format_optional_u64(total)
+        ),
+    };
+    output.println_styled("muted", &line);
 }
 
 fn format_optional_u64(value: Option<u64>) -> String {
@@ -245,23 +351,23 @@ fn format_optional_u64(value: Option<u64>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn print_content(content: &[ContentPart]) {
-    for part in content {
-        match part {
-            ContentPart::Text { text, .. } => println!("{text}"),
-            ContentPart::Json { value, .. } => println!("{}", pretty_json(value)),
-            ContentPart::Thinking { text, .. } => println!("[thinking]\n{text}"),
-            ContentPart::Refusal { text, .. } => println!("[refusal]\n{text}"),
-            ContentPart::Image {
-                media_type, data, ..
-            } => {
-                println!("[image: {media_type}, {data:?}]");
-            }
-            ContentPart::Binary {
-                media_type, data, ..
-            } => {
-                println!("[binary: {media_type}, {data:?}]");
-            }
+fn print_content(content: &ContentPart, output: &OutputStyle) {
+    match content {
+        ContentPart::Text { text, .. } => output.println_styled("agent", text),
+        ContentPart::Json { value, .. } => output.println_styled("agent", &pretty_json(value)),
+        ContentPart::Thinking { text, .. } => {
+            output.println_styled("muted", &format!("[thinking]\n{text}"))
+        }
+        ContentPart::Refusal { text, .. } => println!("[refusal]\n{text}"),
+        ContentPart::Image {
+            media_type, data, ..
+        } => {
+            println!("[image: {media_type}, {data:?}]");
+        }
+        ContentPart::Binary {
+            media_type, data, ..
+        } => {
+            println!("[binary: {media_type}, {data:?}]");
         }
     }
 }
@@ -272,4 +378,35 @@ fn compact_json(value: &serde_json::Value) -> String {
 
 fn pretty_json(value: &serde_json::Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutputStyle {
+    color: bool,
+}
+
+impl OutputStyle {
+    fn detect() -> Self {
+        let color = io::stdout().is_terminal()
+            && std::env::var_os("NO_COLOR").is_none()
+            && std::env::var("TERM")
+                .map(|term| term != "dumb")
+                .unwrap_or(true);
+        Self { color }
+    }
+
+    fn println_styled(&self, style: &str, text: &str) {
+        if !self.color {
+            println!("{text}");
+            return;
+        }
+
+        let code = match style {
+            "muted" => "90",
+            "tool" => "36",
+            "agent" => "97",
+            _ => "0",
+        };
+        println!("\x1b[{code}m{text}\x1b[0m");
+    }
 }

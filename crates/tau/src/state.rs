@@ -9,7 +9,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 pub(crate) type StateResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -29,6 +29,7 @@ pub(crate) struct SessionRecord {
     /// Provider/model reference used for the session, e.g. `openai/gpt-4.1-mini`.
     pub(crate) provider: String,
     pub(crate) readonly: bool,
+    pub(crate) alias_generated: bool,
     pub(crate) contents_path: PathBuf,
 }
 
@@ -61,6 +62,7 @@ impl StateDb {
         alias: &str,
         provider: &str,
         readonly: bool,
+        alias_generated: bool,
         contents_path: impl AsRef<Path>,
     ) -> StateResult<SessionRecord> {
         let now = unix_timestamp_millis()?;
@@ -71,6 +73,7 @@ impl StateDb {
             updated_at: now,
             provider: provider.to_string(),
             readonly,
+            alias_generated,
             contents_path: contents_path.as_ref().to_path_buf(),
         };
         self.insert_session(&record)?;
@@ -79,8 +82,8 @@ impl StateDb {
 
     pub(crate) fn insert_session(&self, record: &SessionRecord) -> StateResult<()> {
         self.connection.execute(
-            "INSERT INTO sessions (id, alias, created_at, updated_at, provider, readonly, contents_path)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO sessions (id, alias, created_at, updated_at, provider, readonly, alias_generated, contents_path)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 record.id,
                 record.alias,
@@ -88,6 +91,7 @@ impl StateDb {
                 record.updated_at,
                 record.provider,
                 if record.readonly { 1 } else { 0 },
+                if record.alias_generated { 1 } else { 0 },
                 record.contents_path.to_string_lossy(),
             ],
         )?;
@@ -97,7 +101,7 @@ impl StateDb {
     pub(crate) fn get_session_by_alias(&self, alias: &str) -> StateResult<Option<SessionRecord>> {
         self.connection
             .query_row(
-                "SELECT id, alias, created_at, updated_at, provider, readonly, contents_path
+                "SELECT id, alias, created_at, updated_at, provider, readonly, alias_generated, contents_path
                  FROM sessions WHERE alias = ?1",
                 params![alias],
                 session_record_from_row,
@@ -109,7 +113,7 @@ impl StateDb {
     pub(crate) fn get_session_by_id(&self, id: &str) -> StateResult<Option<SessionRecord>> {
         self.connection
             .query_row(
-                "SELECT id, alias, created_at, updated_at, provider, readonly, contents_path
+                "SELECT id, alias, created_at, updated_at, provider, readonly, alias_generated, contents_path
                  FROM sessions WHERE id = ?1",
                 params![id],
                 session_record_from_row,
@@ -120,7 +124,7 @@ impl StateDb {
 
     pub(crate) fn list_sessions(&self) -> StateResult<Vec<SessionRecord>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, alias, created_at, updated_at, provider, readonly, contents_path
+            "SELECT id, alias, created_at, updated_at, provider, readonly, alias_generated, contents_path
              FROM sessions ORDER BY updated_at DESC, created_at DESC",
         )?;
         let rows = statement.query_map([], session_record_from_row)?;
@@ -130,7 +134,7 @@ impl StateDb {
     pub(crate) fn rename_session_alias(&self, id: &str, alias: &str) -> StateResult<bool> {
         let updated_at = unix_timestamp_millis()?;
         let changed = self.connection.execute(
-            "UPDATE sessions SET alias = ?1, updated_at = ?2 WHERE id = ?3",
+            "UPDATE sessions SET alias = ?1, alias_generated = 0, updated_at = ?2 WHERE id = ?3",
             params![alias, updated_at, id],
         )?;
         Ok(changed > 0)
@@ -240,6 +244,7 @@ impl StateDb {
                 updated_at INTEGER NOT NULL,
                 provider TEXT NOT NULL,
                 readonly INTEGER NOT NULL,
+                alias_generated INTEGER NOT NULL DEFAULT 0,
                 contents_path TEXT NOT NULL
             ) WITHOUT ROWID;
             CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at DESC);
@@ -272,7 +277,8 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
         updated_at: row.get(3)?,
         provider: row.get(4)?,
         readonly: row.get::<_, i64>(5)? != 0,
-        contents_path: PathBuf::from(row.get::<_, String>(6)?),
+        alias_generated: row.get::<_, i64>(6)? != 0,
+        contents_path: PathBuf::from(row.get::<_, String>(7)?),
     })
 }
 
@@ -316,11 +322,13 @@ mod tests {
                 "Feature work",
                 "openai/gpt-4.1-mini",
                 true,
+                false,
                 "/home/me/.tau/sessions/session-1.json",
             )
             .unwrap();
 
         assert_eq!(record.alias, "Feature work");
+        assert!(!record.alias_generated);
         assert!(record.id.starts_with("session-"));
 
         assert_eq!(
@@ -333,11 +341,11 @@ mod tests {
     #[test]
     fn enforces_unique_aliases() {
         let db = StateDb::open(temp_db_path("unique-aliases")).unwrap();
-        db.create_session("same", "openai/gpt-4.1-mini", false, "one.json")
+        db.create_session("same", "openai/gpt-4.1-mini", false, false, "one.json")
             .unwrap();
 
         assert!(
-            db.create_session("same", "openai/gpt-4.1-mini", false, "two.json")
+            db.create_session("same", "openai/gpt-4.1-mini", false, false, "two.json")
                 .is_err()
         );
     }
@@ -346,10 +354,16 @@ mod tests {
     fn lists_renames_touches_and_deletes_sessions() {
         let db = StateDb::open(temp_db_path("updates")).unwrap();
         let first = db
-            .create_session("first", "openai/gpt-4.1-mini", false, "first.json")
+            .create_session("first", "openai/gpt-4.1-mini", false, false, "first.json")
             .unwrap();
         let second = db
-            .create_session("second", "anthropic/claude-sonnet-4", true, "second.json")
+            .create_session(
+                "second",
+                "anthropic/claude-sonnet-4",
+                true,
+                false,
+                "second.json",
+            )
             .unwrap();
 
         assert_eq!(db.list_sessions().unwrap().len(), 2);
@@ -369,7 +383,7 @@ mod tests {
     fn upserts_one_staged_message_per_session() {
         let db = StateDb::open(temp_db_path("staged-message")).unwrap();
         let session = db
-            .create_session("work", "openai/gpt-4.1-mini", false, "work.json")
+            .create_session("work", "openai/gpt-4.1-mini", false, false, "work.json")
             .unwrap();
 
         let first_parts = json!([
@@ -393,7 +407,7 @@ mod tests {
     fn deleting_session_cascades_to_staged_message_and_current_session() {
         let db = StateDb::open(temp_db_path("cascade")).unwrap();
         let session = db
-            .create_session("work", "openai/gpt-4.1-mini", false, "work.json")
+            .create_session("work", "openai/gpt-4.1-mini", false, false, "work.json")
             .unwrap();
         db.upsert_staged_message(&session.id, &json!([{ "type": "text", "text": "hello" }]))
             .unwrap();
@@ -409,10 +423,10 @@ mod tests {
     fn tracks_current_session() {
         let db = StateDb::open(temp_db_path("current-session")).unwrap();
         let first = db
-            .create_session("first", "openai/gpt-4.1-mini", false, "first.json")
+            .create_session("first", "openai/gpt-4.1-mini", false, false, "first.json")
             .unwrap();
         let second = db
-            .create_session("second", "openai/gpt-4.1-mini", false, "second.json")
+            .create_session("second", "openai/gpt-4.1-mini", false, false, "second.json")
             .unwrap();
 
         assert_eq!(db.current_session_id().unwrap(), None);

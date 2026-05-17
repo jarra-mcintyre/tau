@@ -20,7 +20,7 @@ struct PersistedSession {
 #[derive(Debug, Clone)]
 pub(crate) struct SessionPersistence {
     pub(crate) id: String,
-    path: PathBuf,
+    pub(crate) path: PathBuf,
 }
 
 pub(crate) fn load_or_create_session(
@@ -77,6 +77,33 @@ pub(crate) fn save_session(
         serde_json::to_string_pretty(&persisted)? + "\n",
     )?;
     Ok(())
+}
+
+pub(crate) fn load_session_from_path(
+    context: &TauContext,
+    config: &mut CliConfig,
+    path: PathBuf,
+) -> Result<(TauSession, SessionPersistence), Box<dyn std::error::Error>> {
+    let persisted = read_session(&path)?;
+    let current_model: ModelSelection = persisted.current_model.parse()?;
+    config.restore_current_model(current_model)?;
+
+    let mut session = config.session_for_current_model(context)?;
+    session.set_config(persisted.config);
+    *session.conversation_mut() = persisted.conversation;
+    session.set_model(config.current_model_metadata()?);
+
+    Ok((
+        session,
+        SessionPersistence {
+            id: persisted.id,
+            path,
+        },
+    ))
+}
+
+pub(crate) fn session_path_for_id(session_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    session_path(session_id)
 }
 
 fn read_session(path: &PathBuf) -> Result<PersistedSession, Box<dyn std::error::Error>> {
