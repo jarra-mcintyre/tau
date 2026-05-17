@@ -12,6 +12,7 @@ use libtau::{
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
+mod cli;
 mod config;
 mod session;
 

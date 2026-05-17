@@ -5,7 +5,7 @@ use libtau::{
     context::{TauContext, TauSession},
     providers::{
         ModelMetadata, ProviderConfig as RuntimeProviderConfig, ProviderMetadata,
-        ProviderModelConfig, ThinkingEffort, anthropic, find_predefined_provider, openai,
+        ProviderModelConfig, ThinkingEffort, anthropic, find_predefined_provider,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -620,6 +620,7 @@ fn providers_config_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libtau::providers::openai;
 
     fn provider(name: &str, models: &[&str]) -> ConfiguredProvider {
         ConfiguredProvider {
