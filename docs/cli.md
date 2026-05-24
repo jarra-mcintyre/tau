@@ -7,6 +7,8 @@ Tau works differently to other agentic coding tools. There's no TUI. You just in
 You code with Tau by sending messages on the command line. Messages are added to the current conversation history.
 
 ```bash
+tau # shows the current stage (conversation alias, message offset, token usage .etc.)
+
 # You build messages with message commands. These use the 'm' alias.
 tau m "Also ..."  # Send a message to the model. This sends the message straight away
 tau m # or you can use $EDITOR to write your message
@@ -18,13 +20,14 @@ tau mp # you can also paste text and images from the system clipboard as a messa
 tau mr source/file/path_1.rs source/file/path_2.rs # you can add paths to files as extra references to the current message. Only the path is passed to the model. It can choose to read it or not.
 tau ms # once you've built up all relevant instructions, run `tau ms` to send the current message
 tau me # "echo" the current message
+tau mu -2 # rewind ("undo") the last two messages in the conversation
 tau -y mc # Or use mc to clear the current message
 
 # You manage the current conversation with conversation commands. These use the 'c' alias
 tau c # start a new conversation
-tau c "Feature work phase 2" # start a new conversation, specifying an alias
+tau c -a "Feature work phase 2" # start a new conversation, specifying an alias
 tau ca "My awesome feature" # change the alias for the current conversation
-tau cf "My awesome feature 2" # fork the current conversation
+tau cf -2 -a "My awesome feature 2" # fork the current conversation at the second last message
 tau ch | less # view the history of the current conversation
 tau ch | grep "Launch the missiles" # or search it
 tau -j ch | jq '.' # Output can also be in JSON
@@ -74,6 +77,7 @@ Some commands accept extra modifiers/flags. These should be placed before the co
 - `--yes` (`-y`): "yes" modifier. Skips any confirmation prompts
 - `--conversation <alias>` (`-c <alias>`): conversation modifier. Specifies which conversation a message command should act on.
 - `--model <provider>/<model>` (`-m`): model modifier. Specifies which model to use
+- `--alias <alias>` (`-a`): specify an alias
 - `--read-only` (`-r`): read-only modifier. Disables the editor and shell tools.
 - `--writes-allowed` (`-w`): write modifier. Enables the editor and shell tools.
 - `--json` (`-j`): JSON modifier. Formats output as JSON. This formats Tau output, not the model output.
@@ -92,14 +96,15 @@ For example: `tau -c bug-1234 m "Check the current git diff and see if this is f
 - `message-send` (`ms`): Send the current message to the current conversation.
 - `message-echo` (`me`): "Echo" the current message (prints it on `stdout`).
 - `message-clear` (`mc`): Clear the current message. By default, this will prompt you to confirm the action. Use the `-y` flag to execute automatically.
+- `message-undo (<offset>)` (`mu`): Undo/Rewind the conversation to `<offset>`. 1 is the first message in the conversation. -1 is the last message in the conversation. If `<offset>` is not specified it defaults to -1. Use the `-y` flag to execute automatically
 
 ### Conversation commands
 
-- `conversation (<alias>)` (`c`): Start a new conversation. You can optionally specify an alias. If you don't specify one, an alias will be automatically generated. Accepts the `-r` flag to start a read-only conversation.
+- `conversation` (`c`): Start a new conversation. You can optionally specify an alias. If you don't specify one, an alias will be automatically generated. Accepts the `-r` flag to start a read-only conversation. Accepts the `-a` flag to specify an alias.
 - `conversation-alias <alias>` (`ca`): Set the alias of the current conversation.
 - `conversation-history` (`ch`): Show the history of messages in the current conversation (accepts the `-j` flag).
 - `conversation-compact` (`cc`): Compact the current conversation.
-- `conversation-fork (<alias>)` (`cf`): Fork the conversation. You can optionally specify an alias for the new conversation (accepts the `-r` and `-w` flags to switch the fork to read/write mode).
+- `conversation-fork (<offset>)` (`cf`): Fork the conversation. You can optionally specify an offset from the first or last message to fork at. Accepts the `-r` and `-w` flags to switch the fork to read/write mode. Accepts the `-a` flag to specify the conversation alias.
 - `conversation-switch <alias>` (`cs`): Switch to a different conversation.
 - `conversation-list` (`cl`): List all conversations (accepts the `-j` flag to print in JSON).
 - `conversation-delete <alias>` (`cd`): Delete the specified conversation.
