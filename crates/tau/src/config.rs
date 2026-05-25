@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::{fmt, fs, path::PathBuf, str::FromStr, sync::Arc};
 
 use libtau::{

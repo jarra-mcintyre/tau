@@ -66,7 +66,7 @@ fn init_file_logging() -> Result<WorkerGuard, Box<dyn std::error::Error>> {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let invocation = parse_cli_from(std::env::args_os())?;
+    let invocation = parse_cli_from(std::env::args_os()).unwrap_or_else(|error| error.exit());
     let output = OutputStyle::detect();
 
     match invocation.command {
@@ -253,7 +253,10 @@ async fn run_turn(
     user_message: &str,
     output: &OutputStyle,
 ) -> Result<Option<TokenUsage>, Box<dyn std::error::Error>> {
-    let mut response = context.send_message(user_message).await?;
+    output.println_styled("muted", "[Sending message]");
+    context.push_user_content(vec![ContentPart::text(user_message)]);
+    output.println_styled("muted", "[Message sent. Waiting for model response]");
+    let mut response = context.request_response().await?;
     let mut total_usage = context.last_token_usage().cloned();
 
     loop {
@@ -263,7 +266,7 @@ async fn run_turn(
                 ResponsePart::Content { content } => print_content(&content, output),
                 ResponsePart::ToolUse { call } => tool_calls.push(call),
                 ResponsePart::ServerToolUse { call } => {
-                    output.println_styled("tool", &format!("[server tool] {}", call.name));
+                    output.println_indented_styled("tool", &format!("[server tool] {}", call.name));
                 }
                 ResponsePart::Stop { .. } => {}
             }
@@ -274,6 +277,10 @@ async fn run_turn(
         }
 
         run_tools(context, &tool_calls, output);
+        output.println_styled(
+            "muted",
+            "[Sending tool results. Waiting for model response]",
+        );
         response = context.request_response().await?;
         add_usage(&mut total_usage, context.last_token_usage());
     }
@@ -285,7 +292,7 @@ fn run_tools(
     output: &OutputStyle,
 ) -> Vec<ToolResult> {
     for call in tool_calls {
-        output.println_styled(
+        output.println_indented_styled(
             "tool",
             &format!("[tool] {}({})", call.name, compact_json(&call.input)),
         );
@@ -295,10 +302,13 @@ fn run_tools(
 
     for result in &results {
         match &result.error {
-            Some(error) => {
-                output.println_styled("tool", &format!("[tool] {} failed: {error}", result.name))
+            Some(error) => output.println_indented_styled(
+                "tool",
+                &format!("[tool] {} failed: {error}", result.name),
+            ),
+            None => {
+                output.println_indented_styled("tool", &format!("[tool] {} completed", result.name))
             }
-            None => output.println_styled("tool", &format!("[tool] {} completed", result.name)),
         }
     }
 
@@ -356,18 +366,20 @@ fn print_content(content: &ContentPart, output: &OutputStyle) {
         ContentPart::Text { text, .. } => output.println_styled("agent", text),
         ContentPart::Json { value, .. } => output.println_styled("agent", &pretty_json(value)),
         ContentPart::Thinking { text, .. } => {
-            output.println_styled("muted", &format!("[thinking]\n{text}"))
+            output.println_indented_styled("muted", &format!("[thinking]\n{text}"))
         }
-        ContentPart::Refusal { text, .. } => println!("[refusal]\n{text}"),
+        ContentPart::Refusal { text, .. } => {
+            output.println_indented_styled("muted", &format!("[refusal]\n{text}"))
+        }
         ContentPart::Image {
             media_type, data, ..
         } => {
-            println!("[image: {media_type}, {data:?}]");
+            output.println_indented_styled("muted", &format!("[image: {media_type}, {data:?}]"));
         }
         ContentPart::Binary {
             media_type, data, ..
         } => {
-            println!("[binary: {media_type}, {data:?}]");
+            output.println_indented_styled("muted", &format!("[binary: {media_type}, {data:?}]"));
         }
     }
 }
@@ -378,6 +390,14 @@ fn compact_json(value: &serde_json::Value) -> String {
 
 fn pretty_json(value: &serde_json::Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn indent_display_block(text: &str) -> String {
+    const INDENT: &str = "  ";
+    text.lines()
+        .map(|line| format!("{INDENT}{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -408,5 +428,9 @@ impl OutputStyle {
             _ => "0",
         };
         println!("\x1b[{code}m{text}\x1b[0m");
+    }
+
+    fn println_indented_styled(&self, style: &str, text: &str) {
+        self.println_styled(style, &indent_display_block(text));
     }
 }

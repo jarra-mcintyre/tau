@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::{fs, path::PathBuf};
 
 use libtau::context::{Conversation, TauContext, TauSession, TauSessionConfig};

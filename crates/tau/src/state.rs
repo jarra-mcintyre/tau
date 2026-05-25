@@ -9,7 +9,7 @@ use std::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 pub(crate) type StateResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -42,6 +42,13 @@ pub(crate) struct StagedMessageRecord {
     pub(crate) updated_at: i64,
     /// JSON array/object describing message parts (text, image, path reference, etc.).
     pub(crate) parts: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AuthRecord {
+    pub(crate) provider: String,
+    /// Provider-specific OAuth/authentication state.
+    pub(crate) payload: Value,
 }
 
 impl StateDb {
@@ -219,6 +226,43 @@ impl StateDb {
         Ok(())
     }
 
+    pub(crate) fn upsert_auth(&self, provider: &str, payload: &Value) -> StateResult<()> {
+        let payload_json = serde_json::to_string(payload)?;
+        self.connection.execute(
+            "INSERT INTO auth (provider, payload_json)
+             VALUES (?1, ?2)
+             ON CONFLICT(provider) DO UPDATE SET payload_json = excluded.payload_json",
+            params![provider, payload_json],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn get_auth(&self, provider: &str) -> StateResult<Option<AuthRecord>> {
+        self.connection
+            .query_row(
+                "SELECT provider, payload_json FROM auth WHERE provider = ?1",
+                params![provider],
+                auth_record_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn list_auth(&self) -> StateResult<Vec<AuthRecord>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT provider, payload_json FROM auth ORDER BY provider")?;
+        let rows = statement.query_map([], auth_record_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub(crate) fn delete_auth(&self, provider: &str) -> StateResult<bool> {
+        let changed = self
+            .connection
+            .execute("DELETE FROM auth WHERE provider = ?1", params![provider])?;
+        Ok(changed > 0)
+    }
+
     fn migrate(&self) -> StateResult<()> {
         self.connection.execute_batch(
             "PRAGMA journal_mode = wal;
@@ -259,7 +303,11 @@ impl StateDb {
                 singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
                 session_id TEXT NOT NULL,
                 FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS auth (
+                provider TEXT PRIMARY KEY NOT NULL,
+                payload_json TEXT NOT NULL
+            ) WITHOUT ROWID;",
         )?;
 
         self.connection
@@ -295,6 +343,18 @@ fn staged_message_record_from_row(
         created_at: row.get(1)?,
         updated_at: row.get(2)?,
         parts,
+    })
+}
+
+fn auth_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuthRecord> {
+    let payload_json: String = row.get(1)?;
+    let payload = serde_json::from_str(&payload_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+
+    Ok(AuthRecord {
+        provider: row.get(0)?,
+        payload,
     })
 }
 
@@ -390,12 +450,11 @@ mod tests {
             { "type": "text", "text": "hello" },
             { "type": "path_reference", "path": "src/main.rs" }
         ]);
-        let first = db.upsert_staged_message(&session.id, &first_parts).unwrap();
+        db.upsert_staged_message(&session.id, &first_parts).unwrap();
 
         let second_parts =
             json!([{ "type": "image", "media_type": "image/png", "path": "shot.png" }]);
-        let second = db
-            .upsert_staged_message(&session.id, &second_parts)
+        db.upsert_staged_message(&session.id, &second_parts)
             .unwrap();
 
         assert_eq!(db.list_staged_message_count(), 1);
@@ -436,6 +495,33 @@ mod tests {
         assert_eq!(db.current_session_id().unwrap(), Some(second.id));
         db.clear_current_session().unwrap();
         assert_eq!(db.current_session_id().unwrap(), None);
+    }
+
+    #[test]
+    fn crud_auth_records() {
+        let db = StateDb::open(temp_db_path("auth")).unwrap();
+        let provider = "openai-codex";
+        let first = json!({ "access_token": "one", "expires_at": 123 });
+        let second = json!({ "access_token": "two", "refresh_token": "refresh" });
+
+        assert_eq!(db.get_auth(provider).unwrap(), None);
+
+        db.upsert_auth(provider, &first).unwrap();
+        assert_eq!(
+            db.get_auth(provider).unwrap(),
+            Some(AuthRecord {
+                provider: provider.to_string(),
+                payload: first,
+            })
+        );
+
+        db.upsert_auth(provider, &second).unwrap();
+        assert_eq!(db.list_auth().unwrap().len(), 1);
+        assert_eq!(db.get_auth(provider).unwrap().unwrap().payload, second);
+
+        assert!(db.delete_auth(provider).unwrap());
+        assert!(!db.delete_auth(provider).unwrap());
+        assert_eq!(db.get_auth(provider).unwrap(), None);
     }
 
     trait TestStateDbExt {
