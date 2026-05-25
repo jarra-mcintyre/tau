@@ -19,4 +19,11 @@ Use normal Cargo commands for building, formatting, testing and running. Use `fi
 
 Providers track the complete conversation history in a provider specific format and optionally any resume IDs etc (e.g. OpenAI `previous_response_id`). Sessions track the conversation history in a model agnostic format suitable for display to users etc
 
-Sessions can be switced between different models.
+## Files
+
+- `~/.tau/providers.json` - provider configuration
+- `~/.tau/state.db` - sqlite database tracking current state
+- `~/.tau/sessions/` - folder of sessions (encoded in JSON)
+- `~/.tau/docs/` - documentation folder
+
+Providers are configured in both `~/.tau/providers.json` and `~/.tau/state.db`

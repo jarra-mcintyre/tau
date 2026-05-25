@@ -116,6 +116,7 @@ Provider commands allow you to update the current provider/model configuration.
 - `provider <provider>/<model>`  (`p`): Set the current provider and model.
 - `provider-thinking <level>` (`pt`): Change the model thinking level. Supported levels are `disabled`, `low`, `medium`, `high`, `xhigh`, and `max`.
 - `provider-list`  (`pl`): List configured providers and models (accepts the `-j` flag to print in JSON).
+- `provider-config <provider> `: Configure a provider 
 
 ### Misc. commands
 
