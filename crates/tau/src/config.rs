@@ -11,7 +11,7 @@ use libtau::{
     },
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value};
 
 const CONFIG_PATH: &str = ".tau/providers.json";
 const DEFAULT_PROVIDER: &str = "openai";

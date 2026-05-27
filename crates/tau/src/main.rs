@@ -15,6 +15,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 
 mod cli;
 mod config;
+mod provider_config;
 mod session;
 mod state;
 
@@ -133,6 +134,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("mode: read-only");
             }
             Ok(())
+        }
+        Command::ProviderConfig { provider } => {
+            let state = StateDb::open(state_path()?)?;
+            provider_config::configure_provider(&state, provider).await
+        }
+        Command::ProviderList => {
+            let state = StateDb::open(state_path()?)?;
+            provider_config::list_providers(&state, invocation.modifiers.json)
         }
         Command::Version => {
             println!("{}", env!("CARGO_PKG_VERSION"));

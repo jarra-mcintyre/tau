@@ -2,6 +2,8 @@ use std::{ffi::OsString, path::PathBuf};
 
 use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 
+use crate::provider_config::ConfigurableProvider;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliInvocation {
     pub modifiers: Modifiers,
@@ -69,7 +71,7 @@ pub enum Command {
         level: ThinkingLevel,
     },
     ProviderConfig {
-        provider: String,
+        provider: Option<ConfigurableProvider>,
     },
     ProviderList,
 
@@ -251,7 +253,7 @@ enum RawCommand {
     #[command(name = "provider-config")]
     ProviderConfig {
         #[arg(value_name = "PROVIDER")]
-        provider: String,
+        provider: Option<ConfigurableProvider>,
     },
     #[command(name = "provider-list", alias = "pl")]
     ProviderList,
@@ -638,10 +640,14 @@ mod tests {
             }
         );
         assert_eq!(
-            parse(&["tau", "provider-config", "anthropic"]).command,
+            parse(&["tau", "provider-config", "anthropic-api"]).command,
             Command::ProviderConfig {
-                provider: "anthropic".to_string()
+                provider: Some(ConfigurableProvider::AnthropicApi)
             }
+        );
+        assert_eq!(
+            parse(&["tau", "provider-config"]).command,
+            Command::ProviderConfig { provider: None }
         );
         assert_eq!(parse(&["tau", "pl"]).command, Command::ProviderList);
     }
@@ -740,6 +746,6 @@ mod tests {
         assert!(parse_cli_from(["tau", "-j", "cf"]).is_err());
         assert!(parse_cli_from(["tau", "-r", "q", "What?"]).is_err());
         assert!(parse_cli_from(["tau", "-y", "ch"]).is_err());
-        assert!(parse_cli_from(["tau", "-j", "provider-config", "anthropic"]).is_err());
+        assert!(parse_cli_from(["tau", "-j", "provider-config", "anthropic-api"]).is_err());
     }
 }

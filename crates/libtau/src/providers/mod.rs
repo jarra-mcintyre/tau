@@ -4,6 +4,7 @@ use std::{any::Any, fmt, sync::Arc};
 use crate::api;
 
 pub mod anthropic;
+pub mod codex;
 pub mod openai;
 
 pub trait ModelCosts: fmt::Debug + Send + Sync {
@@ -108,6 +109,15 @@ pub const OPENAI: ProviderMetadata = ProviderMetadata {
     models: openai::default_models,
 };
 
+pub const CODEX: ProviderMetadata = ProviderMetadata {
+    name: codex::PROVIDER_NAME,
+    api: &api::openai_responses::API,
+    api_key_env: codex::API_KEY_ENV,
+    display_name: "OpenAI Codex",
+    base_url: codex::DEFAULT_BASE_URL,
+    models: codex::default_models,
+};
+
 pub const ANTHROPIC: ProviderMetadata = ProviderMetadata {
     name: anthropic::PROVIDER_NAME,
     api: &api::anthropic_messages::API,
@@ -118,7 +128,7 @@ pub const ANTHROPIC: ProviderMetadata = ProviderMetadata {
 };
 
 pub fn predefined_providers() -> &'static [ProviderMetadata] {
-    &[OPENAI, ANTHROPIC]
+    &[OPENAI, CODEX, ANTHROPIC]
 }
 
 pub fn find_predefined_provider(name: &str) -> Option<&'static ProviderMetadata> {
