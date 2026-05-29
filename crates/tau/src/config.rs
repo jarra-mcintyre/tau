@@ -1,88 +1,28 @@
 #![allow(dead_code)]
 
-use std::{fmt, fs, path::PathBuf, str::FromStr, sync::Arc};
+use std::{fmt, fs, path::PathBuf, str::FromStr};
 
 use libtau::{
-    api::{ModelApi, ModelApiFactory, find_model_api},
     context::{TauContext, TauSession},
     providers::{
-        ModelMetadata, ProviderConfig as RuntimeProviderConfig, ProviderMetadata,
-        ProviderModelConfig, ThinkingEffort, anthropic, find_predefined_provider,
+        ApiKeyProviderConfig, ConfiguredModel, ConfiguredProvider, ModelMetadata, ProviderAuth,
+        ProviderConfigEntry, configured_provider_from_entry,
     },
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value};
+use serde_json::{Value, json};
 
 const CONFIG_PATH: &str = ".tau/providers.json";
 const DEFAULT_PROVIDER: &str = "openai";
-const DEFAULT_MODEL: &str = "gpt-4.1-mini";
+const DEFAULT_MODEL: &str = "gpt-5.4-mini";
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
-struct ProvidersConfig {
+pub(crate) struct ProvidersConfig {
     #[serde(default)]
     current_model: Option<String>,
     #[serde(default)]
-    providers: Vec<ProviderConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(deny_unknown_fields)]
-struct ProviderConfig {
-    /// The user-facing provider name, e.g. "personal-openai".
-    #[serde(default)]
-    name: Option<String>,
-    /// The provider API implementation to use, e.g. "openai_responses" or "anthropic_messages".
-    #[serde(default)]
-    api: Option<String>,
-    #[serde(default)]
-    api_key: Option<String>,
-    #[serde(default)]
-    api_key_env: Option<String>,
-    #[serde(default)]
-    base_url: Option<String>,
-    #[serde(default)]
-    options: Value,
-    #[serde(default)]
-    models: Vec<ModelConfigEntry>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
-enum ModelConfigEntry {
-    Name(String),
-    Detailed {
-        name: String,
-        #[serde(default)]
-        id: Option<String>,
-        #[serde(default)]
-        context_length: u64,
-        #[serde(default)]
-        max_tokens: u64,
-        #[serde(default)]
-        thinking_effort: Option<ThinkingEffort>,
-        #[serde(default)]
-        provider_config: Value,
-    },
-}
-
-#[derive(Debug)]
-struct ConfiguredProvider {
-    name: String,
-    api: &'static ModelApiFactory,
-    api_key_env: String,
-    display_name: String,
-    api_key: Option<String>,
-    base_url: Option<String>,
-    options: Value,
-    models: Vec<ConfiguredModel>,
-}
-
-#[derive(Debug)]
-struct ConfiguredModel {
-    name: String,
-    id: String,
-    metadata: Option<ModelMetadata>,
+    providers: Vec<ProviderConfigEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,7 +42,7 @@ pub(crate) struct CliConfig {
 impl CliConfig {
     pub(crate) fn load() -> Result<Self, Box<dyn std::error::Error>> {
         let (providers_config, config_path) = load_providers_config()?;
-        let providers = configured_providers(&providers_config, config_path.as_ref())?;
+        let providers = configured_providers(&providers_config)?;
         let current_model_ref = std::env::var("TAU_MODEL")
             .ok()
             .or(providers_config.current_model.clone())
@@ -238,48 +178,34 @@ impl CliConfig {
     fn build_provider_for_selection(
         &self,
         selection: &ModelSelection,
-    ) -> Result<Arc<dyn ModelApi>, Box<dyn std::error::Error>> {
+    ) -> Result<std::sync::Arc<dyn libtau::api::ModelApi>, Box<dyn std::error::Error>> {
         let provider = self
             .providers
             .iter()
             .find(|provider| provider.name == selection.provider_name)
             .ok_or_else(|| format!("provider '{}' is not configured", selection.provider_name))?;
-
-        let api_key = std::env::var(&provider.api_key_env)
-            .ok()
-            .or(provider.api_key.clone())
-            .ok_or_else(|| {
-                format!(
-                    "missing {} API key; set {} or providers.{}.api_key in ~/.tau/providers.json",
-                    provider.display_name, provider.api_key_env, provider.name
-                )
-            })?;
-
-        Ok(provider.api.build_api(RuntimeProviderConfig {
-            api_key,
-            base_url: provider
-                .base_url
-                .clone()
-                .ok_or_else(|| format!("provider '{}' is missing a base_url", provider.name))?,
-            options: provider.options.clone(),
-        })?)
+        provider.build_api()
     }
 
     fn save_current_model(
         &mut self,
         selection: &ModelSelection,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.providers_config.current_model = Some(selection.to_string());
+        self.save_providers_config()
+    }
+
+    fn save_providers_config(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let path = self
             .config_path
             .clone()
             .or_else(providers_config_path)
-            .ok_or("cannot persist current model because HOME is not set")?;
+            .ok_or("cannot persist provider configuration because HOME is not set")?;
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        self.providers_config.current_model = Some(selection.to_string());
         fs::write(
             &path,
             serde_json::to_string_pretty(&self.providers_config)? + "\n",
@@ -317,208 +243,50 @@ impl fmt::Display for ModelSelection {
     }
 }
 
+pub(crate) fn configure_provider_entry(
+    entry: ProviderConfigEntry,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut config, path) = load_providers_config()?;
+    upsert_provider_entry(&mut config.providers, entry);
+    save_providers_config_to(path, &config)
+}
+
+pub(crate) fn list_providers(json_output: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let (config, config_path) = load_providers_config()?;
+    let configured = config.providers;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "config_path": config_path.or_else(providers_config_path).map(|path| path.display().to_string()),
+                "providers": provider_statuses_json(&configured),
+            }))?
+        );
+        return Ok(());
+    }
+
+    for line in provider_status_lines(&configured) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
 fn configured_providers(
     config: &ProvidersConfig,
-    config_path: Option<&PathBuf>,
 ) -> Result<Vec<ConfiguredProvider>, Box<dyn std::error::Error>> {
-    let mut providers = Vec::new();
-
-    for provider_config in &config.providers {
-        providers.push(configured_provider(provider_config, config_path)?);
-    }
-
-    if providers.is_empty() {
-        let metadata = find_predefined_provider(DEFAULT_PROVIDER)
-            .expect("default provider metadata is registered");
-        providers.push(configured_predefined_provider(metadata, None));
-    }
-
-    Ok(providers)
-}
-
-fn configured_provider(
-    provider_config: &ProviderConfig,
-    config_path: Option<&PathBuf>,
-) -> Result<ConfiguredProvider, Box<dyn std::error::Error>> {
-    let name = provider_config.name.clone().ok_or_else(|| {
-        format!(
-            "provider entry in {} is missing a name",
-            config_path_label(config_path)
-        )
-    })?;
-
-    if let Some(metadata) = find_predefined_provider(&name) {
-        return configured_predefined_provider_with_overrides(metadata, provider_config);
-    }
-
-    let api_name = provider_config.api.clone().ok_or_else(|| {
-        format!(
-            "custom provider '{name}' must specify an api in {}",
-            config_path_label(config_path)
-        )
-    })?;
-    let api =
-        find_model_api(&api_name).ok_or_else(|| format!("unsupported provider API: {api_name}"))?;
-
-    if provider_config.models.is_empty() {
-        return Err(format!(
-            "custom provider '{name}' must specify at least one model in {}",
-            config_path_label(config_path)
-        )
-        .into());
-    }
-    if provider_config.base_url.is_none() {
-        return Err(format!(
-            "custom provider '{name}' must specify a base_url in {}",
-            config_path_label(config_path)
-        )
-        .into());
-    }
-
-    Ok(ConfiguredProvider {
-        name,
-        api,
-        api_key_env: provider_config
-            .api_key_env
-            .clone()
-            .unwrap_or_else(|| default_api_key_env(api).to_string()),
-        display_name: provider_config
-            .api
-            .clone()
-            .unwrap_or_else(|| api.name.to_string()),
-        api_key: provider_config.api_key.clone(),
-        base_url: provider_config.base_url.clone(),
-        options: provider_config.options.clone(),
-        models: configured_models_for_provider(api, provider_config)?,
-    })
-}
-
-fn configured_predefined_provider_with_overrides(
-    metadata: &'static ProviderMetadata,
-    provider_config: &ProviderConfig,
-) -> Result<ConfiguredProvider, Box<dyn std::error::Error>> {
-    let api = match provider_config.api.as_deref() {
-        Some(api_name) => find_model_api(api_name)
-            .ok_or_else(|| format!("unsupported provider API: {api_name}"))?,
-        None => metadata.api,
+    let entries = if config.providers.is_empty() {
+        vec![ProviderConfigEntry::OpenAiApi(
+            ApiKeyProviderConfig::default(),
+        )]
+    } else {
+        config.providers.clone()
     };
 
-    Ok(ConfiguredProvider {
-        name: metadata.name.to_string(),
-        api,
-        api_key_env: provider_config
-            .api_key_env
-            .clone()
-            .unwrap_or_else(|| metadata.api_key_env.to_string()),
-        display_name: metadata.display_name.to_string(),
-        api_key: provider_config.api_key.clone(),
-        base_url: Some(
-            provider_config
-                .base_url
-                .clone()
-                .unwrap_or_else(|| metadata.base_url.to_string()),
-        ),
-        options: provider_config.options.clone(),
-        models: if provider_config.models.is_empty() {
-            models_from_metadata(metadata.default_models())
-        } else {
-            configured_models_for_provider(api, provider_config)?
-        },
-    })
-}
-
-fn configured_predefined_provider(
-    metadata: &'static ProviderMetadata,
-    api_key: Option<String>,
-) -> ConfiguredProvider {
-    ConfiguredProvider {
-        name: metadata.name.to_string(),
-        api: metadata.api,
-        api_key_env: metadata.api_key_env.to_string(),
-        display_name: metadata.display_name.to_string(),
-        api_key,
-        base_url: Some(metadata.base_url.to_string()),
-        options: Value::Null,
-        models: models_from_metadata(metadata.default_models()),
-    }
-}
-
-fn configured_models_for_provider(
-    api: &'static ModelApiFactory,
-    provider_config: &ProviderConfig,
-) -> Result<Vec<ConfiguredModel>, Box<dyn std::error::Error>> {
-    provider_config
-        .models
+    entries
         .iter()
-        .map(|model| configured_model(api, model))
-        .collect()
-}
-
-fn configured_model(
-    api: &'static ModelApiFactory,
-    model: &ModelConfigEntry,
-) -> Result<ConfiguredModel, Box<dyn std::error::Error>> {
-    match model {
-        ModelConfigEntry::Name(name) => Ok(ConfiguredModel {
-            name: name.clone(),
-            id: name.clone(),
-            metadata: Some(ModelMetadata::custom(name.clone())),
-        }),
-        ModelConfigEntry::Detailed {
-            name,
-            id,
-            context_length,
-            max_tokens,
-            thinking_effort,
-            provider_config,
-        } => {
-            let id = id.clone().unwrap_or_else(|| name.clone());
-            Ok(ConfiguredModel {
-                name: name.clone(),
-                id: id.clone(),
-                metadata: Some(ModelMetadata {
-                    name: name.clone(),
-                    id,
-                    context_length: *context_length,
-                    max_tokens: *max_tokens,
-                    thinking_effort: *thinking_effort,
-                    provider_config: parse_provider_model_config(api, provider_config)?,
-                    costs: None,
-                }),
-            })
-        }
-    }
-}
-
-fn parse_provider_model_config(
-    api: &'static ModelApiFactory,
-    value: &Value,
-) -> Result<Option<Arc<dyn ProviderModelConfig>>, Box<dyn std::error::Error>> {
-    if value.is_null() {
-        return Ok(None);
-    }
-
-    match api.name {
-        "anthropic_messages" => Ok(Some(Arc::new(serde_json::from_value::<
-            anthropic::AnthropicModelConfig,
-        >(value.clone())?))),
-        _ => Err(format!(
-            "provider_config is not supported for provider API {}",
-            api.name
-        )
-        .into()),
-    }
-}
-
-fn models_from_metadata(models: Vec<ModelMetadata>) -> Vec<ConfiguredModel> {
-    models
-        .into_iter()
-        .map(|metadata| ConfiguredModel {
-            name: metadata.name.to_string(),
-            id: metadata.id.to_string(),
-            metadata: Some(metadata),
-        })
-        .collect()
+        .map(configured_provider_from_entry)
+        .collect::<Result<Vec<_>, _>>()
 }
 
 fn model_metadata_summary(model: &ConfiguredModel) -> String {
@@ -586,6 +354,78 @@ fn validate_model_selection(
     Ok(())
 }
 
+fn upsert_provider_entry(entries: &mut Vec<ProviderConfigEntry>, entry: ProviderConfigEntry) {
+    let key = provider_entry_key(&entry).to_string();
+    if let Some(existing) = entries
+        .iter_mut()
+        .find(|existing| provider_entry_key(existing) == key)
+    {
+        *existing = entry;
+    } else {
+        entries.push(entry);
+    }
+}
+
+fn provider_entry_key(entry: &ProviderConfigEntry) -> &str {
+    match entry {
+        ProviderConfigEntry::OpenAiApi(_) => "openai-api",
+        ProviderConfigEntry::OpenAiCodex(_) => "openai-codex",
+        ProviderConfigEntry::AnthropicApi(_) => "anthropic-api",
+        ProviderConfigEntry::Custom(config) => &config.name,
+    }
+}
+
+fn provider_status_lines(entries: &[ProviderConfigEntry]) -> Vec<String> {
+    let mut lines = vec![
+        builtin_provider_status_line("openai-api", entries),
+        builtin_provider_status_line("openai-codex", entries),
+        builtin_provider_status_line("anthropic-api", entries),
+    ];
+    lines.extend(entries.iter().filter_map(|entry| match entry {
+        ProviderConfigEntry::Custom(config) => Some(format!("custom/{}: configured", config.name)),
+        _ => None,
+    }));
+    lines
+}
+
+fn builtin_provider_status_line(provider_type: &str, entries: &[ProviderConfigEntry]) -> String {
+    let configured = entries
+        .iter()
+        .any(|entry| provider_entry_key(entry) == provider_type);
+    format!(
+        "{provider_type}: {}",
+        if configured {
+            "configured"
+        } else {
+            "not configured"
+        }
+    )
+}
+
+fn provider_statuses_json(entries: &[ProviderConfigEntry]) -> Value {
+    let mut statuses = vec![
+        builtin_provider_status_json("openai-api", entries),
+        builtin_provider_status_json("openai-codex", entries),
+        builtin_provider_status_json("anthropic-api", entries),
+    ];
+    statuses.extend(entries.iter().filter_map(|entry| match entry {
+        ProviderConfigEntry::Custom(config) => Some(json!({
+            "type": "custom",
+            "name": config.name,
+            "configured": true,
+        })),
+        _ => None,
+    }));
+    Value::Array(statuses)
+}
+
+fn builtin_provider_status_json(provider_type: &str, entries: &[ProviderConfigEntry]) -> Value {
+    json!({
+        "type": provider_type,
+        "configured": entries.iter().any(|entry| provider_entry_key(entry) == provider_type),
+    })
+}
+
 fn config_path_label(config_path: Option<&PathBuf>) -> String {
     config_path
         .map(|path| path.display().to_string())
@@ -609,8 +449,18 @@ fn load_providers_config() -> Result<(ProvidersConfig, Option<PathBuf>), Box<dyn
     Ok((config, Some(path)))
 }
 
-fn default_api_key_env(_api: &ModelApiFactory) -> &'static str {
-    "TAU_API_KEY"
+fn save_providers_config_to(
+    path: Option<PathBuf>,
+    config: &ProvidersConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = path
+        .or_else(providers_config_path)
+        .ok_or("cannot persist provider configuration because HOME is not set")?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_string_pretty(config)? + "\n")?;
+    Ok(())
 }
 
 fn providers_config_path() -> Option<PathBuf> {
@@ -622,16 +472,18 @@ fn providers_config_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libtau::providers::openai;
+    use libtau::api::find_model_api;
 
     fn provider(name: &str, models: &[&str]) -> ConfiguredProvider {
         ConfiguredProvider {
             name: name.to_string(),
             api: find_model_api("openai_responses").unwrap(),
-            api_key_env: openai::API_KEY_ENV.to_string(),
             display_name: name.to_string(),
-            api_key: None,
-            base_url: None,
+            auth: ProviderAuth::ApiKey {
+                api_key: None,
+                api_key_env: "OPENAI_API_KEY".to_string(),
+            },
+            base_url: "https://example.com".to_string(),
             options: Value::Null,
             models: models
                 .iter()
@@ -697,5 +549,31 @@ mod tests {
             first_configured_model_ref(&providers),
             Some("anthropic/claude-sonnet-4".to_string())
         );
+    }
+
+    #[test]
+    fn upserts_builtin_provider_entries() {
+        let mut entries = vec![ProviderConfigEntry::AnthropicApi(ApiKeyProviderConfig {
+            api_key: Some("old".to_string()),
+            api_key_env: None,
+            base_url: None,
+        })];
+
+        upsert_provider_entry(
+            &mut entries,
+            ProviderConfigEntry::AnthropicApi(ApiKeyProviderConfig {
+                api_key: Some("new".to_string()),
+                api_key_env: None,
+                base_url: None,
+            }),
+        );
+
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            ProviderConfigEntry::AnthropicApi(config) => {
+                assert_eq!(config.api_key.as_deref(), Some("new"));
+            }
+            _ => panic!("expected anthropic config"),
+        }
     }
 }

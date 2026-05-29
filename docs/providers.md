@@ -5,14 +5,14 @@ You can also configure a customer provider to access self-hosted models on tools
 # Providers
 
 The following providers are supported:
-- OpenAI (`openai`). Both API key and Codex (OAuth) account access is supported.
-- Anthropic (`anthropic`). Only API key access is supported.
-- Google (`google`) for Gemini series models
-- DeepSeek (`deepseek`) (to be implemented)
+- OpenAI (`openai-api` and `openai-codex`). Both API key and Codex (OAuth) account access is supported.
+- Anthropic (`anthropic-api`). Only API key access is supported.
+- Google (`google-api`) for Gemini series models
+- DeepSeek (`deepseek-api`) (to be implemented)
 - AWS Bedrock (`anthropic-aws`) (to be implemented)
 - Google Vertex AI (`anthropic-google`) (to be implemented)
 
-Access to built-in providers can be configured by running `tau provider-config` (e.g. `tau provider-config openai`). Providers can also be configured by editing `~/.tau/providers.json`. For programmatic configuration use appropriate tooling to edit the `providers.json` file.
+Access to built-in providers can be configured by running `tau provider-config` (e.g. `tau provider-config openai-api` or `tau provider-config openai-codex`). Providers can also be configured by editing `~/.tau/providers.json` directly.
 
 # Model APIs
 
@@ -32,20 +32,38 @@ Tau can be configured to connect to a `llama-server` process. llama.cpp supports
 
 ```json
 {
-  "providers" [
+  "providers": [
     // ...
     {
-      // You can set name to anything. This will be the provider name in Tau
-      "name": "llamacpp",
-      // Set api to either anthropic_messages or openai_requests
-      "api": "anthropic_messages",
-      // API Key configuration is optional
-      "api_key": "none",
-      // Set base_url as appropriate. Do not include any path
-      "base_url": "http://localhost:8080",
-      "options": null,
-      // List each model that is available. Typically you will want to specify a model name in llama.cpp
-      "models": ["the-model"]
+      "type": "openai-api",
+      "config": {
+        "api_key": "sk..."
+      }
+    },
+    {
+      "type": "anthropic-api",
+      "config": {
+        "api_key": "..."
+      }
+    },
+    {
+      "type": "
+    }
+    {
+      "type": "custom",
+      "config": {
+        // You can set name to anything. This will be the provider name in Tau
+        "name": "llamacpp",
+        // Set api to either anthropic_messages or openai_requests
+        "api": "anthropic_messages",
+        // API Key configuration is optional
+        "api_key": "none",
+        // Set base_url as appropriate. Do not include any path
+        "base_url": "http://localhost:8080",
+        "options": null,
+        // List each model that is available. Typically you will want to specify a model name in llama.cpp
+        "models": ["the-model"]
+      }
     }
     // ..
   ]

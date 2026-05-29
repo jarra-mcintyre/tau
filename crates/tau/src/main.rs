@@ -135,14 +135,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(())
         }
-        Command::ProviderConfig { provider } => {
-            let state = StateDb::open(state_path()?)?;
-            provider_config::configure_provider(&state, provider).await
-        }
-        Command::ProviderList => {
-            let state = StateDb::open(state_path()?)?;
-            provider_config::list_providers(&state, invocation.modifiers.json)
-        }
+        Command::ProviderConfig { provider } => provider_config::configure_provider(provider).await,
+        Command::ProviderList => config::list_providers(invocation.modifiers.json),
         Command::Version => {
             println!("{}", env!("CARGO_PKG_VERSION"));
             Ok(())

@@ -790,14 +790,19 @@ name = "libtau"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
+ "base64",
+ "rand",
  "reqwest",
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -1462,20 +1467,14 @@ dependencies = [
 name = "tau"
 version = "0.1.0"
 dependencies = [
- "axum",
- "base64",
  "clap",
  "libtau",
- "rand",
- "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
- "sha2",
  "tokio",
  "tracing-appender",
  "tracing-subscriber",
- "url",
  "uuid",
 ]
 

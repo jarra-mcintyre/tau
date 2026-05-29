@@ -8,6 +8,7 @@ Use normal Cargo commands for building, formatting, testing and running. Use `fi
 
 ## Design Considerations
 - We're targetting Linux and OS-X. However, future support for other platforms isn't out of the question
+- This is pre-alpha code. Legacy support/migrations should not be considered unless instructed otherwise
 
 ## Architecture
 
