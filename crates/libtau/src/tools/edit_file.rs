@@ -26,15 +26,8 @@ pub struct Substitution {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum EditFileStatus {
-    Success,
-    Error,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct EditFileOutput {
-    pub status: EditFileStatus,
+    pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub substitutions_applied: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,7 +149,7 @@ pub fn edit_file(input: EditFileInput) -> EditFileOutput {
 
     match fs::write(&input.path, edited) {
         Ok(()) => EditFileOutput {
-            status: EditFileStatus::Success,
+            success: true,
             substitutions_applied: Some(input.substitutions.len()),
             error: None,
         },
@@ -166,7 +159,7 @@ pub fn edit_file(input: EditFileInput) -> EditFileOutput {
 
 fn error_output(error: EditFileError) -> EditFileOutput {
     EditFileOutput {
-        status: EditFileStatus::Error,
+        success: false,
         substitutions_applied: None,
         error: Some(error),
     }
@@ -238,7 +231,7 @@ mod tests {
             }],
         });
 
-        assert_eq!(output.status, EditFileStatus::Success);
+        assert!(output.success);
         assert_eq!(output.substitutions_applied, Some(1));
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello tau\n");
 
@@ -258,7 +251,7 @@ mod tests {
             }],
         });
 
-        assert_eq!(output.status, EditFileStatus::Error);
+        assert!(!output.success);
         assert_eq!(output.error.unwrap().kind, EditFileErrorKind::NoMatch);
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
@@ -281,7 +274,7 @@ mod tests {
             }],
         });
 
-        assert_eq!(output.status, EditFileStatus::Error);
+        assert!(!output.success);
         assert_eq!(
             output.error.unwrap().kind,
             EditFileErrorKind::NonUniqueMatch
@@ -304,7 +297,7 @@ mod tests {
             }],
         });
 
-        assert_eq!(output.status, EditFileStatus::Error);
+        assert!(!output.success);
         assert_eq!(output.error.unwrap().kind, EditFileErrorKind::NoMatch);
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello world\n");
 

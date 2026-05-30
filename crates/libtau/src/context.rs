@@ -628,12 +628,20 @@ mod tests {
 
         assert_eq!(
             names,
-            vec!["bash", "edit_file", "find_files", "read_file", "write_file"]
+            vec![
+                "bash",
+                "edit_file",
+                "find_files",
+                "grep",
+                "read_file",
+                "write_file"
+            ]
         );
         assert!(context.get_tool("bash").is_some());
         assert!(context.get_tool("read_file").is_some());
         assert!(context.get_tool("edit_file").is_some());
         assert!(context.get_tool("find_files").is_some());
+        assert!(context.get_tool("grep").is_some());
         assert!(context.get_tool("write_file").is_some());
     }
 

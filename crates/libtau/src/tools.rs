@@ -7,6 +7,7 @@ use crate::context::{ContentPart, TauContext};
 pub mod bash;
 pub mod edit_file;
 pub mod find_files;
+pub mod grep;
 pub mod read_file;
 pub mod write_file;
 
@@ -49,6 +50,7 @@ pub fn register_builtin_tools(context: &mut TauContext) -> Result<(), ToolRegist
     read_file::register(context)?;
     edit_file::register(context)?;
     find_files::register(context)?;
+    grep::register(context)?;
     write_file::register(context)?;
     Ok(())
 }

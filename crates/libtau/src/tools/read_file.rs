@@ -25,15 +25,8 @@ pub struct ReadFileInput {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ReadFileStatus {
-    Success,
-    Error,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct ReadFileOutput {
-    pub status: ReadFileStatus,
+    pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contents: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -75,7 +68,7 @@ fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {
 pub fn read_file(input: ReadFileInput) -> ReadFileOutput {
     if let Err(error) = validate_line_range(input.first_line, input.last_line) {
         return ReadFileOutput {
-            status: ReadFileStatus::Error,
+            success: false,
             contents: None,
             error: Some(error),
         };
@@ -83,7 +76,7 @@ pub fn read_file(input: ReadFileInput) -> ReadFileOutput {
 
     match fs::read_to_string(&input.path) {
         Ok(contents) => ReadFileOutput {
-            status: ReadFileStatus::Success,
+            success: true,
             contents: Some(apply_line_range(
                 &contents,
                 input.first_line,
@@ -92,7 +85,7 @@ pub fn read_file(input: ReadFileInput) -> ReadFileOutput {
             error: None,
         },
         Err(error) => ReadFileOutput {
-            status: ReadFileStatus::Error,
+            success: false,
             contents: None,
             error: Some(ReadFileError::from_io_error(error)),
         },
@@ -188,7 +181,7 @@ mod tests {
             last_line: None,
         });
 
-        assert_eq!(output.status, ReadFileStatus::Success);
+        assert!(output.success);
         assert_eq!(output.contents, Some("hello tau".to_string()));
         assert_eq!(output.error, None);
 
@@ -207,7 +200,7 @@ mod tests {
             last_line: None,
         });
 
-        assert_eq!(output.status, ReadFileStatus::Error);
+        assert!(!output.success);
         assert_eq!(output.contents, None);
         assert_eq!(output.error.unwrap().kind, ReadFileErrorKind::NotFound);
     }
@@ -226,7 +219,7 @@ mod tests {
             last_line: Some(3),
         });
 
-        assert_eq!(output.status, ReadFileStatus::Success);
+        assert!(output.success);
         assert_eq!(output.contents, Some("two\nthree\n".to_string()));
         assert_eq!(output.error, None);
 
@@ -247,7 +240,7 @@ mod tests {
             last_line: Some(2),
         });
 
-        assert_eq!(output.status, ReadFileStatus::Success);
+        assert!(output.success);
         assert_eq!(output.contents, Some("one\ntwo\n".to_string()));
         assert_eq!(output.error, None);
 
@@ -267,7 +260,7 @@ mod tests {
             last_line: Some(2),
         });
 
-        assert_eq!(output.status, ReadFileStatus::Error);
+        assert!(!output.success);
         assert_eq!(output.contents, None);
         assert_eq!(output.error.unwrap().kind, ReadFileErrorKind::InvalidInput);
     }
@@ -285,7 +278,7 @@ mod tests {
             last_line: None,
         });
 
-        assert_eq!(output.status, ReadFileStatus::Error);
+        assert!(!output.success);
         assert_eq!(output.contents, None);
         assert_eq!(output.error.unwrap().kind, ReadFileErrorKind::InvalidInput);
     }

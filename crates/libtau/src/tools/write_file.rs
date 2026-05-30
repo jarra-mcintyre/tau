@@ -19,15 +19,8 @@ pub struct WriteFileInput {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum WriteFileStatus {
-    Success,
-    Error,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct WriteFileOutput {
-    pub status: WriteFileStatus,
+    pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bytes_written: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -71,12 +64,12 @@ pub fn write_file(input: WriteFileInput) -> WriteFileOutput {
 
     match fs::write(&input.path, input.contents) {
         Ok(()) => WriteFileOutput {
-            status: WriteFileStatus::Success,
+            success: true,
             bytes_written: Some(bytes_written),
             error: None,
         },
         Err(error) => WriteFileOutput {
-            status: WriteFileStatus::Error,
+            success: false,
             bytes_written: None,
             error: Some(WriteFileError::from_io_error(error)),
         },
@@ -117,7 +110,7 @@ mod tests {
             contents: "hello tau".to_string(),
         });
 
-        assert_eq!(output.status, WriteFileStatus::Success);
+        assert!(output.success);
         assert_eq!(output.bytes_written, Some("hello tau".len()));
         assert_eq!(output.error, None);
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello tau");
@@ -135,7 +128,7 @@ mod tests {
             contents: "new contents".to_string(),
         });
 
-        assert_eq!(output.status, WriteFileStatus::Success);
+        assert!(output.success);
         assert_eq!(output.bytes_written, Some("new contents".len()));
         assert_eq!(output.error, None);
         assert_eq!(fs::read_to_string(&path).unwrap(), "new contents");
@@ -157,7 +150,7 @@ mod tests {
             contents: "hello tau".to_string(),
         });
 
-        assert_eq!(output.status, WriteFileStatus::Error);
+        assert!(!output.success);
         assert_eq!(output.bytes_written, None);
         assert_eq!(output.error.unwrap().kind, WriteFileErrorKind::NotFound);
     }
