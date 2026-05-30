@@ -1,4 +1,4 @@
-use std::{ffi::OsStr, fs, io, path::PathBuf};
+use std::{fs, io, path::PathBuf};
 
 use regex::Regex;
 use schemars::JsonSchema;
@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::{
     context::TauContext,
-    path_ignore::IgnoreRules,
+    path_ignore,
     tools::{ToolCallError, ToolDefinition, ToolOutput, ToolRegistrationError},
 };
 
@@ -28,7 +28,7 @@ pub struct FindFilesInput {
     /// Search hidden directories when true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_hidden: Option<bool>,
-    /// Maximum number of matching files to return. Defaults to 100.
+    /// Maximum number of results to return. Applies to both errors and matches. Default 100.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_results: Option<usize>,
 }
@@ -122,118 +122,56 @@ pub fn find_files(input: FindFilesInput) -> FindFilesOutput {
     }
 
     let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS);
-    let include_ignored = input.include_ignored.unwrap_or(false);
-    let ignore_rules = if !include_ignored {
-        match IgnoreRules::from_directory_chain(&directory) {
-            Ok(rules) => Some(rules),
-            Err(error) => {
-                return FindFilesOutput {
-                    status: FindFilesStatus::Error,
-                    matches: Vec::new(),
-                    errors: vec![FindFilesError::from_io_error(directory, error)],
-                };
-            }
-        }
-    } else {
-        None
-    };
     let mut matches = Vec::new();
     let mut errors = Vec::new();
     walk_directory(
-        directory,
+        &directory,
         &regex,
         input.include_hidden.unwrap_or(false),
-        ignore_rules,
+        input.include_ignored.unwrap_or(false),
         &mut matches,
         &mut errors,
     );
     matches.sort();
     matches.truncate(max_results);
-
-    let status = if errors.is_empty() {
-        FindFilesStatus::Success
-    } else {
-        FindFilesStatus::Error
-    };
+    errors.truncate(max_results);
 
     FindFilesOutput {
-        status,
+        status: if errors.is_empty() { FindFilesStatus::Success } else { FindFilesStatus::Error },
         matches,
         errors,
     }
 }
 
 fn walk_directory(
-    directory: PathBuf,
+    directory: &PathBuf,
     regex: &Regex,
-    include_hidden_directories: bool,
-    ignore_rules: Option<IgnoreRules>,
+    include_hidden: bool,
+    include_ignored: bool,
     matches: &mut Vec<PathBuf>,
     errors: &mut Vec<FindFilesError>,
 ) {
-    let entries = match fs::read_dir(&directory) {
-        Ok(entries) => entries,
-        Err(error) => {
-            errors.push(FindFilesError::from_io_error(directory, error));
-            return;
-        }
-    };
-
-    for entry in entries {
+    for entry in path_ignore::find_files(directory, include_hidden, include_ignored) {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                errors.push(FindFilesError::from_io_error(directory.clone(), error));
-                continue;
-            }
-        };
-        let path = entry.path();
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(error) => {
-                errors.push(FindFilesError::from_io_error(path, error));
+                errors.push(FindFilesError::new(
+                    FindFilesErrorKind::Other,
+                    path_ignore::error_path(&error),
+                    error,
+                ));
                 continue;
             }
         };
 
-        if ignore_rules
-            .as_ref()
-            .is_some_and(|rules| rules.is_ignored(&path, file_type.is_dir()))
-        {
-            continue;
-        }
-
-        if file_type.is_dir() {
-            if include_hidden_directories || !is_hidden_directory(&entry.file_name()) {
-                let ignore_rules = match &ignore_rules {
-                    Some(rules) => match rules.with_rules_from_directory(&path) {
-                        Ok(updated) => Some(updated),
-                        Err(error) => {
-                            errors.push(FindFilesError::from_io_error(directory, error));
-                            return;
-                        }
-                    },
-                    None => None
-                };
-                walk_directory(
-                    path,
-                    regex,
-                    include_hidden_directories,
-                    ignore_rules,
-                    matches,
-                    errors,
-                );
-            }
-        } else if file_type.is_file()
+        if entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
             && regex.is_match(entry.file_name().to_string_lossy().as_ref())
         {
-            matches.push(path);
+            matches.push(entry.into_path());
         }
     }
-}
-
-fn is_hidden_directory(name: &OsStr) -> bool {
-    name.to_string_lossy().starts_with('.')
 }
 
 impl FindFilesError {

@@ -15,11 +15,13 @@ Use normal Cargo commands for building, formatting, testing and running. Use `fi
 The following guidelines are intended to keep the code cleaner and simpler to read:
 - Prefer imports over-qualified references (e.g. import `Error` rather than writing `std::error::Error`).
 - Function names should decribe what the function does, not how. Don't put implementation details in the name (e.g. just because a function takes an ARC doesn't mean you need `arc` in the function name. That's clear from the arguments already).
-- Avoid one-line helper functions. You do it too much and it ends up creating noise in the code.
+- Avoid one-line or unnecessary helper functions.  You do it too much and it ends up creating noise in the code.
 - Don't add public functions that you think will be useful but are not actually using.
 
 Additionally guidelines:
 - Don't choose defaults on your own. Ask.
+- Before implementing complex functionality consider whether a third-party library could be used instead.
+- Don't add new dependencies on your own but do be proactive in considering and suggesting them.
 
 ## Architecture
 
