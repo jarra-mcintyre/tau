@@ -41,7 +41,12 @@ pub enum WriteFileErrorKind {
 }
 
 pub fn register(context: &mut TauContext) -> Result<(), ToolRegistrationError> {
-    context.register_tool(ToolDefinition::new::<WriteFileInput>(NAME, DESCRIPTION, false, callback)?)
+    context.register_tool(ToolDefinition::new::<WriteFileInput>(
+        NAME,
+        DESCRIPTION,
+        false,
+        callback,
+    )?)
 }
 
 fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {
@@ -54,7 +59,6 @@ fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {
 }
 
 pub fn write_file(input: WriteFileInput) -> WriteFileOutput {
-
     match fs::write(&input.path, input.contents) {
         Ok(()) => WriteFileOutput {
             okay: true,

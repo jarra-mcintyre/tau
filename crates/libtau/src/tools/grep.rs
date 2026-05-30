@@ -66,7 +66,12 @@ pub enum GrepErrorKind {
 }
 
 pub fn register(context: &mut TauContext) -> Result<(), ToolRegistrationError> {
-    context.register_tool(ToolDefinition::new::<GrepInput>(NAME, DESCRIPTION, true, callback)?)
+    context.register_tool(ToolDefinition::new::<GrepInput>(
+        NAME,
+        DESCRIPTION,
+        true,
+        callback,
+    )?)
 }
 
 fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {

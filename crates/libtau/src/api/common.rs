@@ -47,9 +47,38 @@ pub fn media_to_url(media_type: &str, data: &MediaData) -> String {
 }
 
 pub fn tool_result_json(result: &ToolResult) -> Result<String, ProviderError> {
+    let content = result
+        .content
+        .iter()
+        .map(tool_result_part_json)
+        .collect::<Result<Vec<_>, _>>()?;
+
     Ok(serde_json::to_string(&json!({
         "name": result.name,
         "error": result.error,
-        "content": result.content,
+        "content": content,
     }))?)
+}
+
+fn tool_result_part_json(part: &ContentPart) -> Result<Value, ProviderError> {
+    Ok(match part {
+        ContentPart::Text { text, .. } => json!({ "type": "text", "text": text }),
+        ContentPart::Json { value, .. } => value.clone(),
+        ContentPart::Thinking { text, .. } => json!({ "type": "thinking", "text": text }),
+        ContentPart::Refusal { text, .. } => json!({ "type": "refusal", "text": text }),
+        ContentPart::Image {
+            media_type, data, ..
+        } => json!({
+            "type": "image",
+            "media_type": media_type,
+            "data": media_data_label(data),
+        }),
+        ContentPart::Binary {
+            media_type, data, ..
+        } => json!({
+            "type": "binary",
+            "media_type": media_type,
+            "data": media_data_label(data),
+        }),
+    })
 }

@@ -268,7 +268,14 @@ struct OpenAiFunctionCallOutputItem {
     #[serde(rename = "type")]
     kind: &'static str,
     call_id: String,
-    output: String,
+    output: OpenAiFunctionCallOutputContent,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(untagged)]
+enum OpenAiFunctionCallOutputContent {
+    Text(String),
+    Blocks(Vec<OpenAiContent>),
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -701,15 +708,29 @@ fn output_content_parts(parts: &[ContentPart]) -> Vec<OpenAiContent> {
         .collect()
 }
 
-fn tool_result_output(result: &ToolResult) -> Result<String, ProviderError> {
-    tool_result_json(result)
+fn tool_result_output(
+    result: &ToolResult,
+) -> Result<OpenAiFunctionCallOutputContent, ProviderError> {
+    if result
+        .content
+        .iter()
+        .any(|part| matches!(part, ContentPart::Image { .. }))
+    {
+        return Ok(OpenAiFunctionCallOutputContent::Blocks(
+            input_content_parts(&result.content)?,
+        ));
+    }
+
+    Ok(OpenAiFunctionCallOutputContent::Text(tool_result_json(
+        result,
+    )?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        context::ToolResult,
+        context::{MediaData, ToolResult},
         tools::{ToolDefinition, ToolOutput},
     };
     use serde_json::json;
@@ -724,6 +745,7 @@ mod tests {
         context
             .register_tool(ToolDefinition {
                 name: "echo".to_string(),
+                readonly: true,
                 description: "echo input".to_string(),
                 input_schema: json!({"type":"object"}),
                 callback,
@@ -766,6 +788,7 @@ mod tests {
         context
             .register_tool(ToolDefinition {
                 name: "echo".to_string(),
+                readonly: true,
                 description: "echo input".to_string(),
                 input_schema: json!({"type":"object"}),
                 callback,
@@ -803,6 +826,40 @@ mod tests {
         assert_eq!(value["previous_response_id"], "resp_previous");
         assert_eq!(value["input"].as_array().unwrap().len(), 1);
         assert_eq!(value["input"][0]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn sends_tool_result_images_in_function_call_output() {
+        let context = crate::context::TauContext::default();
+        let mut session = context.session(OpenAiResponsesApi::new("test-key"), "gpt-4.1-mini");
+        session.push_item(ConversationItem::ToolResult {
+            results: vec![ToolResult {
+                call_id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                content: vec![
+                    ContentPart::text("image summary"),
+                    ContentPart::Image {
+                        media_type: "image/png".to_string(),
+                        data: MediaData::Base64("abc123".to_string()),
+                        metadata: None,
+                    },
+                ],
+                error: None,
+            }],
+        });
+
+        let request = build_request(&mut session).unwrap();
+        let value = serde_json::to_value(request.0).unwrap();
+
+        assert_eq!(value["input"].as_array().unwrap().len(), 1);
+        assert_eq!(value["input"][0]["type"], "function_call_output");
+        assert_eq!(value["input"][0]["output"][0]["type"], "input_text");
+        assert_eq!(value["input"][0]["output"][0]["text"], "image summary");
+        assert_eq!(value["input"][0]["output"][1]["type"], "input_image");
+        assert_eq!(
+            value["input"][0]["output"][1]["image_url"],
+            "data:image/png;base64,abc123"
+        );
     }
 
     #[test]

@@ -10,8 +10,7 @@ use crate::{
 };
 
 pub const NAME: &str = "edit_file";
-pub const DESCRIPTION: &str =
-    "Edit a text file, substituting old contents for new contents.";
+pub const DESCRIPTION: &str = "Edit a text file, substituting old contents for new contents.";
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct EditFileInput {
@@ -63,7 +62,12 @@ struct ResolvedSubstitution {
 }
 
 pub fn register(context: &mut TauContext) -> Result<(), ToolRegistrationError> {
-    context.register_tool(ToolDefinition::new::<EditFileInput>(NAME, DESCRIPTION, false, callback)?)
+    context.register_tool(ToolDefinition::new::<EditFileInput>(
+        NAME,
+        DESCRIPTION,
+        false,
+        callback,
+    )?)
 }
 
 fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {

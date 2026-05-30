@@ -655,6 +655,7 @@ mod tests {
         let definition = ToolDefinition {
             name: "duplicate".to_string(),
             description: "first".to_string(),
+            readonly: true,
             input_schema: serde_json::json!({ "type": "object" }),
             callback,
         };
@@ -713,6 +714,7 @@ mod tests {
             .register_tool(ToolDefinition {
                 name: "echo".to_string(),
                 description: "echo".to_string(),
+                readonly: true,
                 input_schema: serde_json::json!({ "type": "object" }),
                 callback: echo,
             })

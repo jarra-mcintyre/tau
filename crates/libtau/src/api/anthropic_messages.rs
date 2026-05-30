@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::{
     api::{
         ModelApi, ModelApiFactory, ProviderError, TokenUsage,
-        common::{binary_content_as_text, json_as_text, tool_result_json},
+        common::{binary_content_as_text, json_as_text},
     },
     context::{
         ContentPart, ConversationItem, MediaData, ResponsePart, ResponseStop, ResponseStopReason,
@@ -310,10 +310,24 @@ enum AnthropicContent {
     },
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: AnthropicToolResultContent,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+enum AnthropicToolResultContent {
+    Text(String),
+    Blocks(Vec<AnthropicToolResultBlock>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicToolResultBlock {
+    Text { text: String },
+    Image { source: AnthropicImageSource },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -793,9 +807,77 @@ fn input_content_parts(parts: &[ContentPart]) -> Result<Vec<AnthropicContent>, P
 fn tool_result_content(result: &ToolResult) -> Result<AnthropicContent, ProviderError> {
     Ok(AnthropicContent::ToolResult {
         tool_use_id: result.call_id.clone(),
-        content: tool_result_json(result)?,
+        content: anthropic_tool_result_content(result)?,
         is_error: result.error.as_ref().map(|_| true),
     })
+}
+
+fn anthropic_tool_result_content(
+    result: &ToolResult,
+) -> Result<AnthropicToolResultContent, ProviderError> {
+    if result.content.is_empty() {
+        return Ok(AnthropicToolResultContent::Text(String::new()));
+    }
+
+    let has_media = result
+        .content
+        .iter()
+        .any(|part| matches!(part, ContentPart::Image { .. } | ContentPart::Binary { .. }));
+
+    if !has_media && result.content.len() == 1 {
+        return match &result.content[0] {
+            ContentPart::Text { text, .. } => Ok(AnthropicToolResultContent::Text(text.clone())),
+            ContentPart::Json { value, .. } => {
+                Ok(AnthropicToolResultContent::Text(json_as_text(value)?))
+            }
+            ContentPart::Thinking { text, .. } => Ok(AnthropicToolResultContent::Text(format!(
+                "[thinking: {text}]"
+            ))),
+            ContentPart::Refusal { text, .. } => Ok(AnthropicToolResultContent::Text(text.clone())),
+            ContentPart::Image { .. } | ContentPart::Binary { .. } => unreachable!(),
+        };
+    }
+
+    let mut blocks = Vec::new();
+    for part in &result.content {
+        match part {
+            ContentPart::Text { text, .. } => {
+                blocks.push(AnthropicToolResultBlock::Text { text: text.clone() })
+            }
+            ContentPart::Json { value, .. } => blocks.push(AnthropicToolResultBlock::Text {
+                text: json_as_text(value)?,
+            }),
+            ContentPart::Image {
+                media_type, data, ..
+            } => match data {
+                MediaData::Base64(data) => blocks.push(AnthropicToolResultBlock::Image {
+                    source: AnthropicImageSource::Base64 {
+                        media_type: media_type.clone(),
+                        data: data.clone(),
+                    },
+                }),
+                MediaData::Url(url) => blocks.push(AnthropicToolResultBlock::Image {
+                    source: AnthropicImageSource::Url { url: url.clone() },
+                }),
+                MediaData::Path(path) => blocks.push(AnthropicToolResultBlock::Text {
+                    text: format!("[image content: {media_type}, path={path}]"),
+                }),
+            },
+            ContentPart::Binary {
+                media_type, data, ..
+            } => blocks.push(AnthropicToolResultBlock::Text {
+                text: binary_content_as_text(media_type, data),
+            }),
+            ContentPart::Thinking { text, .. } => blocks.push(AnthropicToolResultBlock::Text {
+                text: format!("[thinking: {text}]"),
+            }),
+            ContentPart::Refusal { text, .. } => {
+                blocks.push(AnthropicToolResultBlock::Text { text: text.clone() })
+            }
+        }
+    }
+
+    Ok(AnthropicToolResultContent::Blocks(blocks))
 }
 
 #[cfg(test)]
@@ -839,6 +921,7 @@ mod tests {
             .register_tool(ToolDefinition {
                 name: "echo".to_string(),
                 description: "echo input".to_string(),
+                readonly: true,
                 input_schema: json!({"type":"object"}),
                 callback,
             })
@@ -936,6 +1019,37 @@ mod tests {
         assert_eq!(value["messages"][1]["content"][1]["signature"], "sig_1");
         assert_eq!(value["messages"][1]["content"][2]["type"], "tool_use");
         assert_eq!(value["messages"][2]["content"][0]["type"], "tool_result");
+    }
+
+    #[test]
+    fn serializes_tool_result_images_as_content_blocks() {
+        let context = crate::context::TauContext::default();
+        let mut session = context.session(AnthropicProvider::new("test-key"), test_model());
+        session.push_item(ConversationItem::ToolResult {
+            results: vec![ToolResult {
+                call_id: "toolu_1".to_string(),
+                name: "read_file".to_string(),
+                content: vec![
+                    ContentPart::text("image summary"),
+                    ContentPart::Image {
+                        media_type: "image/png".to_string(),
+                        data: MediaData::Base64("abc123".to_string()),
+                        metadata: None,
+                    },
+                ],
+                error: None,
+            }],
+        });
+
+        let request = build_request(&mut session, None, None).unwrap();
+        let value = serde_json::to_value(request.0).unwrap();
+
+        let content = &value["messages"][0]["content"][0]["content"];
+        assert_eq!(content[0], json!({"type": "text", "text": "image summary"}));
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "abc123");
     }
 
     #[test]
