@@ -47,9 +47,6 @@ Tau can be configured to connect to a `llama-server` process. llama.cpp supports
       }
     },
     {
-      "type": "
-    }
-    {
       "type": "custom",
       "config": {
         // You can set name to anything. This will be the provider name in Tau
