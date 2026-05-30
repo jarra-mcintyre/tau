@@ -26,7 +26,7 @@ pub struct ReadFileInput {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct ReadFileOutput {
-    pub success: bool,
+    pub okay: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contents: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -49,11 +49,7 @@ pub enum ReadFileErrorKind {
 }
 
 pub fn register(context: &mut TauContext) -> Result<(), ToolRegistrationError> {
-    context.register_tool(definition()?)
-}
-
-pub fn definition() -> Result<ToolDefinition, ToolRegistrationError> {
-    ToolDefinition::new::<ReadFileInput>(NAME, DESCRIPTION, callback)
+    context.register_tool(ToolDefinition::new::<ReadFileInput>(NAME, DESCRIPTION, true, callback)?)
 }
 
 fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {
@@ -68,7 +64,7 @@ fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {
 pub fn read_file(input: ReadFileInput) -> ReadFileOutput {
     if let Err(error) = validate_line_range(input.first_line, input.last_line) {
         return ReadFileOutput {
-            success: false,
+            okay: false,
             contents: None,
             error: Some(error),
         };
@@ -76,7 +72,7 @@ pub fn read_file(input: ReadFileInput) -> ReadFileOutput {
 
     match fs::read_to_string(&input.path) {
         Ok(contents) => ReadFileOutput {
-            success: true,
+            okay: true,
             contents: Some(apply_line_range(
                 &contents,
                 input.first_line,
@@ -85,7 +81,7 @@ pub fn read_file(input: ReadFileInput) -> ReadFileOutput {
             error: None,
         },
         Err(error) => ReadFileOutput {
-            success: false,
+            okay: false,
             contents: None,
             error: Some(ReadFileError::from_io_error(error)),
         },
@@ -181,7 +177,7 @@ mod tests {
             last_line: None,
         });
 
-        assert!(output.success);
+        assert!(output.okay);
         assert_eq!(output.contents, Some("hello tau".to_string()));
         assert_eq!(output.error, None);
 
@@ -200,7 +196,7 @@ mod tests {
             last_line: None,
         });
 
-        assert!(!output.success);
+        assert!(!output.okay);
         assert_eq!(output.contents, None);
         assert_eq!(output.error.unwrap().kind, ReadFileErrorKind::NotFound);
     }
@@ -219,7 +215,7 @@ mod tests {
             last_line: Some(3),
         });
 
-        assert!(output.success);
+        assert!(output.okay);
         assert_eq!(output.contents, Some("two\nthree\n".to_string()));
         assert_eq!(output.error, None);
 
@@ -240,7 +236,7 @@ mod tests {
             last_line: Some(2),
         });
 
-        assert!(output.success);
+        assert!(output.okay);
         assert_eq!(output.contents, Some("one\ntwo\n".to_string()));
         assert_eq!(output.error, None);
 
@@ -260,7 +256,7 @@ mod tests {
             last_line: Some(2),
         });
 
-        assert!(!output.success);
+        assert!(!output.okay);
         assert_eq!(output.contents, None);
         assert_eq!(output.error.unwrap().kind, ReadFileErrorKind::InvalidInput);
     }
@@ -278,7 +274,7 @@ mod tests {
             last_line: None,
         });
 
-        assert!(!output.success);
+        assert!(!output.okay);
         assert_eq!(output.contents, None);
         assert_eq!(output.error.unwrap().kind, ReadFileErrorKind::InvalidInput);
     }

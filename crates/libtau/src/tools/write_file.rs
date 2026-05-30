@@ -20,9 +20,7 @@ pub struct WriteFileInput {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct WriteFileOutput {
-    pub success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bytes_written: Option<usize>,
+    pub okay: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<WriteFileError>,
 }
@@ -43,11 +41,7 @@ pub enum WriteFileErrorKind {
 }
 
 pub fn register(context: &mut TauContext) -> Result<(), ToolRegistrationError> {
-    context.register_tool(definition()?)
-}
-
-pub fn definition() -> Result<ToolDefinition, ToolRegistrationError> {
-    ToolDefinition::new::<WriteFileInput>(NAME, DESCRIPTION, callback)
+    context.register_tool(ToolDefinition::new::<WriteFileInput>(NAME, DESCRIPTION, false, callback)?)
 }
 
 fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {
@@ -60,17 +54,14 @@ fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {
 }
 
 pub fn write_file(input: WriteFileInput) -> WriteFileOutput {
-    let bytes_written = input.contents.len();
 
     match fs::write(&input.path, input.contents) {
         Ok(()) => WriteFileOutput {
-            success: true,
-            bytes_written: Some(bytes_written),
+            okay: true,
             error: None,
         },
         Err(error) => WriteFileOutput {
-            success: false,
-            bytes_written: None,
+            okay: false,
             error: Some(WriteFileError::from_io_error(error)),
         },
     }
@@ -110,8 +101,7 @@ mod tests {
             contents: "hello tau".to_string(),
         });
 
-        assert!(output.success);
-        assert_eq!(output.bytes_written, Some("hello tau".len()));
+        assert!(output.okay);
         assert_eq!(output.error, None);
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello tau");
 
@@ -128,8 +118,7 @@ mod tests {
             contents: "new contents".to_string(),
         });
 
-        assert!(output.success);
-        assert_eq!(output.bytes_written, Some("new contents".len()));
+        assert!(output.okay);
         assert_eq!(output.error, None);
         assert_eq!(fs::read_to_string(&path).unwrap(), "new contents");
 
@@ -150,8 +139,7 @@ mod tests {
             contents: "hello tau".to_string(),
         });
 
-        assert!(!output.success);
-        assert_eq!(output.bytes_written, None);
+        assert!(!output.okay);
         assert_eq!(output.error.unwrap().kind, WriteFileErrorKind::NotFound);
     }
 

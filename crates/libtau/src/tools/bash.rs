@@ -76,7 +76,7 @@ pub fn register(context: &mut TauContext) -> Result<(), ToolRegistrationError> {
 }
 
 pub fn definition() -> Result<ToolDefinition, ToolRegistrationError> {
-    ToolDefinition::new::<BashInput>(NAME, DESCRIPTION, callback)
+    ToolDefinition::new::<BashInput>(NAME, DESCRIPTION, false, callback)
 }
 
 fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {

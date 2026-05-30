@@ -35,7 +35,7 @@ pub struct FindFilesInput {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct FindFilesOutput {
-    pub success: bool,
+    pub okay: bool,
     pub matches: Vec<PathBuf>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<FindFilesError>,
@@ -61,6 +61,7 @@ pub fn register(context: &mut TauContext) -> Result<(), ToolRegistrationError> {
     context.register_tool(ToolDefinition::new::<FindFilesInput>(
         "find_files",
         DESCRIPTION,
+        true,
         callback,
     )?)
 }
@@ -81,7 +82,7 @@ pub fn find_files(input: FindFilesInput) -> FindFilesOutput {
         Ok(regex) => regex,
         Err(error) => {
             return FindFilesOutput {
-                success: false,
+                okay: false,
                 matches: Vec::new(),
                 errors: vec![FindFilesError::new(
                     FindFilesErrorKind::InvalidInput,
@@ -96,7 +97,7 @@ pub fn find_files(input: FindFilesInput) -> FindFilesOutput {
         Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => {
             return FindFilesOutput {
-                success: false,
+                okay: false,
                 matches: Vec::new(),
                 errors: vec![FindFilesError::new(
                     FindFilesErrorKind::InvalidInput,
@@ -107,7 +108,7 @@ pub fn find_files(input: FindFilesInput) -> FindFilesOutput {
         }
         Err(error) => {
             return FindFilesOutput {
-                success: false,
+                okay: false,
                 matches: Vec::new(),
                 errors: vec![FindFilesError::from_io_error(directory, error)],
             };
@@ -130,7 +131,7 @@ pub fn find_files(input: FindFilesInput) -> FindFilesOutput {
     errors.truncate(max_results);
 
     FindFilesOutput {
-        success: errors.is_empty(),
+        okay: errors.is_empty(),
         matches,
         errors,
     }
@@ -224,7 +225,7 @@ mod tests {
             max_results: None,
         });
 
-        assert!(output.success);
+        assert!(output.okay);
         assert_eq!(
             output.matches,
             vec![root.join("alpha.rs"), root.join("nested").join("beta.rs")]
@@ -249,7 +250,7 @@ mod tests {
             max_results: None,
         });
 
-        assert!(output.success);
+        assert!(output.okay);
         assert_eq!(output.matches, vec![root.join("config")]);
 
         fs::remove_dir_all(root).unwrap();
@@ -269,7 +270,7 @@ mod tests {
             max_results: None,
         });
 
-        assert!(output.success);
+        assert!(output.okay);
         assert_eq!(output.matches, vec![root.join(".git").join("config")]);
 
         fs::remove_dir_all(root).unwrap();
@@ -290,7 +291,7 @@ mod tests {
             max_results: None,
         });
 
-        assert!(output.success);
+        assert!(output.okay);
         assert_eq!(output.matches, vec![root.join("data.txt")]);
 
         fs::remove_dir_all(root).unwrap();
@@ -317,7 +318,7 @@ mod tests {
             max_results: None,
         });
 
-        assert!(output.success);
+        assert!(output.okay);
         assert_eq!(
             output.matches,
             vec![root.join("keep.txt"), root.join("subdir").join("keep.txt")]
@@ -345,7 +346,7 @@ mod tests {
             max_results: None,
         });
 
-        assert!(output.success);
+        assert!(output.okay);
         assert_eq!(output.matches, vec![root.join("subdir").join("keep.txt")]);
 
         fs::remove_dir_all(root).unwrap();
@@ -365,7 +366,7 @@ mod tests {
             max_results: None,
         });
 
-        assert!(output.success);
+        assert!(output.okay);
         assert_eq!(output.matches, vec![root.join("debug.log")]);
 
         fs::remove_dir_all(root).unwrap();
@@ -386,7 +387,7 @@ mod tests {
             max_results: None,
         });
 
-        assert!(output.success);
+        assert!(output.okay);
         assert_eq!(output.matches.len(), DEFAULT_MAX_RESULTS);
         assert_eq!(output.matches[0], root.join("file-000.txt"));
         assert_eq!(output.matches[99], root.join("file-099.txt"));
@@ -409,7 +410,7 @@ mod tests {
             max_results: Some(2),
         });
 
-        assert!(output.success);
+        assert!(output.okay);
         assert_eq!(
             output.matches,
             vec![root.join("file-0.txt"), root.join("file-1.txt")]
@@ -430,7 +431,7 @@ mod tests {
             max_results: None,
         });
 
-        assert!(!output.success);
+        assert!(!output.okay);
         assert_eq!(output.matches, Vec::<PathBuf>::new());
         assert_eq!(output.errors[0].kind, FindFilesErrorKind::InvalidInput);
 

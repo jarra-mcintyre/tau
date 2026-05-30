@@ -36,7 +36,7 @@ pub struct GrepInput {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct GrepOutput {
-    pub success: bool,
+    pub okay: bool,
     pub matches: Vec<GrepMatch>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<GrepError>,
@@ -66,11 +66,7 @@ pub enum GrepErrorKind {
 }
 
 pub fn register(context: &mut TauContext) -> Result<(), ToolRegistrationError> {
-    context.register_tool(definition()?)
-}
-
-pub fn definition() -> Result<ToolDefinition, ToolRegistrationError> {
-    ToolDefinition::new::<GrepInput>(NAME, DESCRIPTION, callback)
+    context.register_tool(ToolDefinition::new::<GrepInput>(NAME, DESCRIPTION, true, callback)?)
 }
 
 fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {
@@ -89,7 +85,7 @@ pub fn grep(input: GrepInput) -> GrepOutput {
         Ok(matcher) => matcher,
         Err(error) => {
             return GrepOutput {
-                success: false,
+                okay: false,
                 matches: Vec::new(),
                 errors: vec![GrepError::new(
                     GrepErrorKind::InvalidInput,
@@ -104,7 +100,7 @@ pub fn grep(input: GrepInput) -> GrepOutput {
         Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => {
             return GrepOutput {
-                success: false,
+                okay: false,
                 matches: Vec::new(),
                 errors: vec![GrepError::new(
                     GrepErrorKind::InvalidInput,
@@ -115,7 +111,7 @@ pub fn grep(input: GrepInput) -> GrepOutput {
         }
         Err(error) => {
             return GrepOutput {
-                success: false,
+                okay: false,
                 matches: Vec::new(),
                 errors: vec![GrepError::from_io_error(directory, error)],
             };
@@ -138,7 +134,7 @@ pub fn grep(input: GrepInput) -> GrepOutput {
     errors.truncate(max_results);
 
     GrepOutput {
-        success: errors.is_empty(),
+        okay: errors.is_empty(),
         matches,
         errors,
     }
@@ -259,7 +255,7 @@ mod tests {
             max_results: None,
         });
 
-        assert!(output.success);
+        assert!(output.okay);
         assert_eq!(
             output.matches,
             vec![
@@ -295,7 +291,7 @@ mod tests {
             max_results: None,
         });
 
-        assert!(output.success);
+        assert!(output.okay);
         assert_eq!(output.matches.len(), 1);
         assert_eq!(output.matches[0].path, root.join("config"));
 
@@ -317,7 +313,7 @@ mod tests {
             max_results: None,
         });
 
-        assert!(output.success);
+        assert!(output.okay);
         assert_eq!(output.matches.len(), 1);
         assert_eq!(output.matches[0].path, root.join("keep.txt"));
 
@@ -337,7 +333,7 @@ mod tests {
             max_results: Some(2),
         });
 
-        assert!(output.success);
+        assert!(output.okay);
         assert_eq!(output.matches.len(), 2);
         assert_eq!(output.matches[0].line_number, 1);
         assert_eq!(output.matches[1].line_number, 2);
@@ -357,7 +353,7 @@ mod tests {
             max_results: None,
         });
 
-        assert!(!output.success);
+        assert!(!output.okay);
         assert_eq!(output.matches, Vec::<GrepMatch>::new());
         assert_eq!(output.errors[0].kind, GrepErrorKind::InvalidInput);
 

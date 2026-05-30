@@ -23,6 +23,7 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    pub readonly: bool,
     #[serde(skip_serializing)]
     pub callback: ToolCallback,
 }
@@ -73,6 +74,7 @@ impl ToolDefinition {
     pub fn new<Input>(
         name: &str,
         description: &str,
+        readonly: bool,
         callback: ToolCallback,
     ) -> Result<Self, ToolRegistrationError>
     where
@@ -85,6 +87,7 @@ impl ToolDefinition {
             name: name.to_string(),
             description: description.to_string(),
             input_schema,
+            readonly,
             callback,
         })
     }

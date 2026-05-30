@@ -11,7 +11,7 @@ use crate::{
 
 pub const NAME: &str = "edit_file";
 pub const DESCRIPTION: &str =
-    "Edit a UTF-8 text file using exact old contents to new contents substitutions.";
+    "Edit a text file, substituting old contents for new contents.";
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct EditFileInput {
@@ -27,7 +27,7 @@ pub struct Substitution {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct EditFileOutput {
-    pub success: bool,
+    pub okay: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub substitutions_applied: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -63,11 +63,7 @@ struct ResolvedSubstitution {
 }
 
 pub fn register(context: &mut TauContext) -> Result<(), ToolRegistrationError> {
-    context.register_tool(definition()?)
-}
-
-pub fn definition() -> Result<ToolDefinition, ToolRegistrationError> {
-    ToolDefinition::new::<EditFileInput>(NAME, DESCRIPTION, callback)
+    context.register_tool(ToolDefinition::new::<EditFileInput>(NAME, DESCRIPTION, false, callback)?)
 }
 
 fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {
@@ -149,7 +145,7 @@ pub fn edit_file(input: EditFileInput) -> EditFileOutput {
 
     match fs::write(&input.path, edited) {
         Ok(()) => EditFileOutput {
-            success: true,
+            okay: true,
             substitutions_applied: Some(input.substitutions.len()),
             error: None,
         },
@@ -159,7 +155,7 @@ pub fn edit_file(input: EditFileInput) -> EditFileOutput {
 
 fn error_output(error: EditFileError) -> EditFileOutput {
     EditFileOutput {
-        success: false,
+        okay: false,
         substitutions_applied: None,
         error: Some(error),
     }
@@ -231,7 +227,7 @@ mod tests {
             }],
         });
 
-        assert!(output.success);
+        assert!(output.okay);
         assert_eq!(output.substitutions_applied, Some(1));
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello tau\n");
 
@@ -251,7 +247,7 @@ mod tests {
             }],
         });
 
-        assert!(!output.success);
+        assert!(!output.okay);
         assert_eq!(output.error.unwrap().kind, EditFileErrorKind::NoMatch);
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
@@ -274,7 +270,7 @@ mod tests {
             }],
         });
 
-        assert!(!output.success);
+        assert!(!output.okay);
         assert_eq!(
             output.error.unwrap().kind,
             EditFileErrorKind::NonUniqueMatch
@@ -297,7 +293,7 @@ mod tests {
             }],
         });
 
-        assert!(!output.success);
+        assert!(!output.okay);
         assert_eq!(output.error.unwrap().kind, EditFileErrorKind::NoMatch);
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello world\n");
 
