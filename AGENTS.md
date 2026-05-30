@@ -10,6 +10,13 @@ Use normal Cargo commands for building, formatting, testing and running. Use `fi
 - We're targetting Linux and OS-X. However, future support for other platforms isn't out of the question
 - This is pre-alpha code. Legacy support/migrations should not be considered unless instructed otherwise
 
+## Coding Style
+
+The following guidelines are intended to keep the code cleaner and simpler to read:
+- Prefer imports over-qualified references (e.g. import `Error` rather than writing `std::error::Error`).
+- Function names should decribe what the function does. Not implementation details (e.g. just because a function takes an ARC doesn't mean you need `arc` in the function name. That's clear from the arguments already).
+- Avoid one-line helper functions. You do it too much and it ends up creating noise in the code.
+
 ## Architecture
 
 - "Context" tracks global configuration such as tool and provider definitions
@@ -18,7 +25,7 @@ Use normal Cargo commands for building, formatting, testing and running. Use `fi
 - "Providers": services that provide a model. Each provider uses a specific API (e.g. Anthropic Messages for Anthropic)
 - "Models": Models (e.g. GPT-5.5, Opus 4.7) are provided by a Provider.
 
-Providers track the complete conversation history in a provider specific format and optionally any resume IDs etc (e.g. OpenAI `previous_response_id`). Sessions track the conversation history in a model agnostic format suitable for display to users etc
+APIs track the complete conversation state in an API specific format suitable for cache-friendly, multi-turn conversation. Sessions track the conversation history in a model agnostic format suitable for display to users etc
 
 ## Files
 
