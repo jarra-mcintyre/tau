@@ -81,7 +81,42 @@ pub async fn authenticate() -> Result<CodexProviderConfig, Box<dyn std::error::E
 
     Ok(CodexProviderConfig {
         access: token.access_token,
-        refresh: token.refresh_token,
+        refresh: token
+            .refresh_token
+            .ok_or("OpenAI OAuth token exchange did not return a refresh token")?,
+        expires,
+        account_id,
+    })
+}
+
+pub async fn refresh_credentials(
+    refresh_token: &str,
+) -> Result<CodexProviderConfig, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(CODEX_TOKEN_URL)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", CODEX_CLIENT_ID),
+            ("refresh_token", refresh_token),
+        ])
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        return Err(format!("OpenAI OAuth token refresh failed ({status}): {body}").into());
+    }
+
+    let token: TokenResponse = serde_json::from_str(&body)?;
+    let account_id = account_id_from_access_token(&token.access_token)?;
+    let expires = unix_timestamp_millis()? + token.expires_in * 1000;
+
+    Ok(CodexProviderConfig {
+        access: token.access_token,
+        refresh: token
+            .refresh_token
+            .unwrap_or_else(|| refresh_token.to_string()),
         expires,
         account_id,
     })
@@ -145,7 +180,7 @@ fn authorization_url(code_challenge: &str, state: &str) -> String {
         .append_pair("state", state)
         .append_pair("id_token_add_organizations", "true")
         .append_pair("codex_cli_simplified_flow", "true")
-        .append_pair("originator", "pi");
+        .append_pair("originator", "tau");
     url.to_string()
 }
 
@@ -196,7 +231,7 @@ fn parse_manual_code(
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
-    refresh_token: String,
+    refresh_token: Option<String>,
     expires_in: i64,
 }
 

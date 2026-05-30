@@ -310,19 +310,29 @@ impl TauSession {
         self.config = config;
     }
 
-    pub fn set_provider_arc(&mut self, provider: Arc<dyn ModelApi>) {
+    /// Set the provider. This clears provider state.
+    pub fn set_provider(&mut self, provider: Arc<dyn ModelApi>) {
         self.provider = provider;
         self.provider_state.clear();
         self.conversation.provider_data = None;
         self.last_token_usage = None;
     }
 
+    /// Refresh the provider. This preserves provider state and will panic if changing provider.
+    /// The principle intended use-case is refreshing provider auth information
+    pub fn refresh_provider(&mut self, provider: Arc<dyn ModelApi>) {
+        assert_eq!(self.provider.name(), provider.name());
+        self.provider = provider;
+        self.last_token_usage = None;
+    }
+
+    /// Set both the provider and model, clearing provider conversation state
     pub fn set_provider_and_model(
         &mut self,
         provider: Arc<dyn ModelApi>,
         model: impl Into<ModelMetadata>,
     ) {
-        self.set_provider_arc(provider);
+        self.set_provider(provider);
         self.set_model(model);
     }
 

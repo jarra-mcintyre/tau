@@ -1,12 +1,22 @@
 #![allow(dead_code)]
 
-use std::{fmt, fs, path::PathBuf, str::FromStr};
+use std::{
+    error::Error,
+    fmt,
+    fs::{self, OpenOptions},
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use libtau::{
+    api::ModelApi,
     context::{TauContext, TauSession},
     providers::{
-        ApiKeyProviderConfig, ConfiguredModel, ConfiguredProvider, ModelMetadata, ProviderAuth,
-        ProviderConfigEntry, configured_provider_from_entry,
+        ApiKeyProviderConfig, ConfiguredModel, ConfiguredProvider, ModelMetadata,
+        ProviderConfigEntry, configured_provider_from_entry, refresh_oauth_provider,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -15,6 +25,7 @@ use serde_json::{Value, json};
 const CONFIG_PATH: &str = ".tau/providers.json";
 const DEFAULT_PROVIDER: &str = "openai";
 const DEFAULT_MODEL: &str = "gpt-5.4-mini";
+const PROVIDERS_CONFIG_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -40,7 +51,7 @@ pub(crate) struct CliConfig {
 }
 
 impl CliConfig {
-    pub(crate) fn load() -> Result<Self, Box<dyn std::error::Error>> {
+    pub(crate) fn load() -> Result<Self, Box<dyn Error>> {
         let (providers_config, config_path) = load_providers_config()?;
         let providers = configured_providers(&providers_config)?;
         let current_model_ref = std::env::var("TAU_MODEL")
@@ -63,9 +74,7 @@ impl CliConfig {
         &self.current_model
     }
 
-    pub(crate) fn current_model_metadata(
-        &self,
-    ) -> Result<ModelMetadata, Box<dyn std::error::Error>> {
+    pub(crate) fn current_model_metadata(&self) -> Result<ModelMetadata, Box<dyn Error>> {
         self.resolve_model_metadata(&self.current_model)
     }
 
@@ -76,7 +85,7 @@ impl CliConfig {
     pub(crate) fn session_for_current_model(
         &self,
         context: &TauContext,
-    ) -> Result<TauSession, Box<dyn std::error::Error>> {
+    ) -> Result<TauSession, Box<dyn Error>> {
         let provider = self.build_provider_for_selection(&self.current_model)?;
         let model = self.resolve_model_metadata(&self.current_model)?;
         let thinking_effort = model.thinking_effort;
@@ -85,6 +94,49 @@ impl CliConfig {
             session.set_thinking_effort(thinking_effort);
         }
         Ok(session)
+    }
+
+    pub(crate) fn build_provider_for_current_model(
+        &self,
+    ) -> Result<Arc<dyn libtau::api::ModelApi>, Box<dyn Error>> {
+        self.build_provider_for_selection(&self.current_model)
+    }
+
+    pub(crate) async fn refresh_current_oauth_provider(
+        &mut self,
+        expected: OAuthRefreshRequest,
+    ) -> Result<(), Box<dyn Error>> {
+        if self.current_model.provider_name != expected.provider {
+            return Err(format!(
+                "current provider '{}' does not match OAuth provider '{}'",
+                self.current_model.provider_name, expected.provider
+            )
+            .into());
+        }
+
+        let stored = if let Some(current) = oauth_provider_entry_if_changed(&expected)? {
+            current
+        } else {
+            let refreshed =
+                match refresh_oauth_provider(&expected.provider, &expected.refresh).await {
+                    Ok(refreshed) => refreshed,
+                    Err(error) => {
+                        if let Some(current) = oauth_provider_entry_if_changed(&expected)? {
+                            self.apply_provider_entry(current)?;
+                            return Ok(());
+                        }
+                        return Err(error);
+                    }
+                };
+            update_oauth_credentials(&expected, refreshed)?
+        };
+        self.apply_provider_entry(stored)
+    }
+
+    fn apply_provider_entry(&mut self, entry: ProviderConfigEntry) -> Result<(), Box<dyn Error>> {
+        upsert_provider_entry(&mut self.providers_config.providers, entry);
+        self.providers = configured_providers(&self.providers_config)?;
+        Ok(())
     }
 
     pub(crate) fn restore_current_model(
@@ -178,7 +230,7 @@ impl CliConfig {
     fn build_provider_for_selection(
         &self,
         selection: &ModelSelection,
-    ) -> Result<std::sync::Arc<dyn libtau::api::ModelApi>, Box<dyn std::error::Error>> {
+    ) -> Result<Arc<dyn ModelApi>, Box<dyn Error>> {
         let provider = self
             .providers
             .iter()
@@ -187,15 +239,12 @@ impl CliConfig {
         provider.build_api()
     }
 
-    fn save_current_model(
-        &mut self,
-        selection: &ModelSelection,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn save_current_model(&mut self, selection: &ModelSelection) -> Result<(), Box<dyn Error>> {
         self.providers_config.current_model = Some(selection.to_string());
         self.save_providers_config()
     }
 
-    fn save_providers_config(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn save_providers_config(&mut self) -> Result<(), Box<dyn Error>> {
         let path = self
             .config_path
             .clone()
@@ -243,15 +292,21 @@ impl fmt::Display for ModelSelection {
     }
 }
 
-pub(crate) fn configure_provider_entry(
-    entry: ProviderConfigEntry,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn configure_provider_entry(entry: ProviderConfigEntry) -> Result<(), Box<dyn Error>> {
     let (mut config, path) = load_providers_config()?;
     upsert_provider_entry(&mut config.providers, entry);
     save_providers_config_to(path, &config)
 }
 
-pub(crate) fn list_providers(json_output: bool) -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Debug, Clone)]
+pub(crate) struct OAuthRefreshRequest {
+    pub(crate) provider: String,
+    pub(crate) access: String,
+    pub(crate) refresh: String,
+    pub(crate) expires: i64,
+}
+
+pub(crate) fn list_providers(json_output: bool) -> Result<(), Box<dyn Error>> {
     let (config, config_path) = load_providers_config()?;
     let configured = config.providers;
 
@@ -272,9 +327,121 @@ pub(crate) fn list_providers(json_output: bool) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+fn oauth_provider_entry_if_changed(
+    expected: &OAuthRefreshRequest,
+) -> Result<Option<ProviderConfigEntry>, Box<dyn Error>> {
+    let path = providers_config_path()
+        .ok_or("cannot read provider configuration because HOME is not set")?;
+    let _lock = ProvidersConfigLock::acquire(&path)?;
+    let (config, _) = load_providers_config()?;
+    let current = config
+        .providers
+        .iter()
+        .find(|entry| entry.provider_name() == expected.provider)
+        .ok_or_else(|| format!("provider '{}' is no longer configured", expected.provider))?;
+
+    if !entry_matches_expected_oauth(current, expected)? {
+        return Ok(Some(current.clone()));
+    }
+    Ok(None)
+}
+
+fn entry_matches_expected_oauth(
+    entry: &ProviderConfigEntry,
+    expected: &OAuthRefreshRequest,
+) -> Result<bool, Box<dyn Error>> {
+    let credentials = entry.oauth_credentials().ok_or_else(|| {
+        format!(
+            "provider '{}' is not configured with OAuth",
+            expected.provider
+        )
+    })?;
+    Ok(credentials.access == expected.access
+        && credentials.refresh == expected.refresh
+        && credentials.expires == expected.expires)
+}
+
+fn update_oauth_credentials(
+    expected: &OAuthRefreshRequest,
+    refreshed: ProviderConfigEntry,
+) -> Result<ProviderConfigEntry, Box<dyn Error>> {
+    let path = providers_config_path()
+        .ok_or("cannot persist provider configuration because HOME is not set")?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let _lock = ProvidersConfigLock::acquire(&path)?;
+    let (mut config, _) = load_providers_config()?;
+    let entry = config
+        .providers
+        .iter_mut()
+        .find(|entry| entry.provider_name() == expected.provider)
+        .ok_or_else(|| format!("provider '{}' is no longer configured", expected.provider))?;
+
+    if !entry_matches_expected_oauth(entry, expected)? {
+        return Ok(entry.clone());
+    }
+
+    if refreshed.provider_name() != expected.provider {
+        return Err(format!(
+            "OAuth refresh for provider '{}' returned credentials for '{}'",
+            expected.provider,
+            refreshed.provider_name()
+        )
+        .into());
+    }
+
+    *entry = refreshed.clone();
+    let temp_path = path.with_extension(format!("json.tmp-{}", uuid::Uuid::new_v4()));
+    fs::write(&temp_path, serde_json::to_string_pretty(&config)? + "\n")?;
+    fs::rename(&temp_path, &path)?;
+    Ok(refreshed)
+}
+
+struct ProvidersConfigLock {
+    path: PathBuf,
+}
+
+impl ProvidersConfigLock {
+    fn acquire(config_path: &Path) -> Result<Self, Box<dyn Error>> {
+        let lock_path = config_path.with_extension("json.lock");
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let start = Instant::now();
+        loop {
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(_) => return Ok(Self { path: lock_path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if start.elapsed() >= PROVIDERS_CONFIG_LOCK_TIMEOUT {
+                        return Err(format!(
+                            "timed out waiting for provider configuration lock {}",
+                            lock_path.display()
+                        )
+                        .into());
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
+impl Drop for ProvidersConfigLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 fn configured_providers(
     config: &ProvidersConfig,
-) -> Result<Vec<ConfiguredProvider>, Box<dyn std::error::Error>> {
+) -> Result<Vec<ConfiguredProvider>, Box<dyn Error>> {
     let entries = if config.providers.is_empty() {
         vec![ProviderConfigEntry::OpenAiApi(
             ApiKeyProviderConfig::default(),
@@ -324,7 +491,7 @@ fn validate_model_selection(
     providers: &[ConfiguredProvider],
     selection: &ModelSelection,
     config_path: Option<&PathBuf>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn Error>> {
     let provider = providers
         .iter()
         .find(|provider| provider.name == selection.provider_name)
@@ -432,8 +599,7 @@ fn config_path_label(config_path: Option<&PathBuf>) -> String {
         .unwrap_or_else(|| CONFIG_PATH.to_string())
 }
 
-fn load_providers_config() -> Result<(ProvidersConfig, Option<PathBuf>), Box<dyn std::error::Error>>
-{
+fn load_providers_config() -> Result<(ProvidersConfig, Option<PathBuf>), Box<dyn Error>> {
     let Some(path) = providers_config_path() else {
         return Ok((ProvidersConfig::default(), None));
     };
@@ -452,7 +618,7 @@ fn load_providers_config() -> Result<(ProvidersConfig, Option<PathBuf>), Box<dyn
 fn save_providers_config_to(
     path: Option<PathBuf>,
     config: &ProvidersConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn Error>> {
     let path = path
         .or_else(providers_config_path)
         .ok_or("cannot persist provider configuration because HOME is not set")?;
@@ -472,7 +638,7 @@ fn providers_config_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libtau::api::find_model_api;
+    use libtau::{api::find_model_api, providers::ProviderAuth};
 
     fn provider(name: &str, models: &[&str]) -> ConfiguredProvider {
         ConfiguredProvider {

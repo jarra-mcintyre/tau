@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -29,7 +32,17 @@ pub struct OpenAiResponsesApi {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    oauth: Option<OAuthCredentials>,
 }
+
+#[derive(Debug, Clone)]
+struct OAuthCredentials {
+    provider: String,
+    refresh: String,
+    expires: i64,
+}
+
+const OAUTH_EXPIRY_SKEW_MILLIS: i64 = 60_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpenAiResponsesState {
@@ -43,9 +56,11 @@ struct OpenAiConversationData {
 }
 
 fn build_api(config: ProviderConfig) -> Result<Arc<dyn ModelApi>, ProviderError> {
-    Ok(Arc::new(OpenAiResponsesApi::with_base_url(
+    let oauth = OAuthCredentials::from_options(&config.options)?;
+    Ok(Arc::new(OpenAiResponsesApi::with_base_url_and_oauth(
         config.api_key,
         config.base_url,
+        oauth,
     )))
 }
 
@@ -65,12 +80,74 @@ impl OpenAiResponsesApi {
     }
 
     pub fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
+        Self::with_base_url_and_oauth(api_key, base_url, None)
+    }
+
+    fn with_base_url_and_oauth(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        oauth: Option<OAuthCredentials>,
+    ) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_key: api_key.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            oauth,
         }
     }
+
+    fn reauthentication_required(&self) -> ProviderError {
+        ProviderError::ReauthenticationRequired {
+            provider: self
+                .oauth
+                .as_ref()
+                .map(|oauth| oauth.provider.clone())
+                .unwrap_or_else(|| self.name().to_string()),
+            access: self.api_key.clone(),
+            refresh: self
+                .oauth
+                .as_ref()
+                .map(|oauth| oauth.refresh.clone())
+                .unwrap_or_default(),
+            expires: self.oauth.as_ref().map(|oauth| oauth.expires).unwrap_or(0),
+        }
+    }
+}
+
+impl OAuthCredentials {
+    fn from_options(options: &Value) -> Result<Option<Self>, ProviderError> {
+        let Some(refresh) = options.get("refresh").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let provider = options
+            .get("provider")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ProviderError::Configuration("OAuth provider missing provider name".to_string())
+            })?;
+        let expires = options
+            .get("expires")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| {
+                ProviderError::Configuration("OAuth provider missing expires".to_string())
+            })?;
+        Ok(Some(Self {
+            provider: provider.to_string(),
+            refresh: refresh.to_string(),
+            expires,
+        }))
+    }
+}
+
+fn unix_timestamp_millis() -> Result<i64, ProviderError> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            ProviderError::Configuration(format!("system clock is before UNIX_EPOCH: {error}"))
+        })?
+        .as_millis()
+        .try_into()
+        .map_err(|_| ProviderError::Configuration("system timestamp overflowed i64".to_string()))?)
 }
 
 #[async_trait]
@@ -80,6 +157,12 @@ impl ModelApi for OpenAiResponsesApi {
     }
 
     async fn respond(&self, session: &mut TauSession) -> Result<TauResponse, ProviderError> {
+        if let Some(oauth) = &self.oauth {
+            if oauth.expires <= unix_timestamp_millis()? + OAUTH_EXPIRY_SKEW_MILLIS {
+                return Err(self.reauthentication_required());
+            }
+        }
+
         let (request, conversation) = build_request(session)?;
         let url = format!("{}/responses", self.base_url);
         let request_body = serde_json::to_string_pretty(&request)?;
@@ -107,6 +190,9 @@ impl ModelApi for OpenAiResponsesApi {
             "response"
         );
         if !status.is_success() {
+            if status == reqwest::StatusCode::UNAUTHORIZED && self.oauth.is_some() {
+                return Err(self.reauthentication_required());
+            }
             return Err(ProviderError::Api { status, body });
         }
 

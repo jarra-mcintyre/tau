@@ -45,6 +45,13 @@ pub enum ProviderError {
         status: reqwest::StatusCode,
         body: String,
     },
+    #[error("provider '{provider}' requires OAuth re-authentication")]
+    ReauthenticationRequired {
+        provider: String,
+        access: String,
+        refresh: String,
+        expires: i64,
+    },
     #[error("failed to serialize provider request: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("provider response was not understood: {0}")]

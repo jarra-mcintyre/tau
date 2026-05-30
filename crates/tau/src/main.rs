@@ -20,7 +20,7 @@ mod session;
 mod state;
 
 use cli::{Command, parse_cli_from};
-use config::CliConfig;
+use config::{CliConfig, OAuthRefreshRequest};
 use session::{SessionPersistence, load_session_from_path, save_session, session_path_for_id};
 use state::{SessionRecord, StateDb};
 
@@ -97,7 +97,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 invocation.modifiers.read_only,
             )?;
 
-            match run_turn(&mut session, &message, &output).await {
+            match run_turn(&mut session, &mut cli_config, &message, &output).await {
                 Ok(usage) => {
                     save_session(&persistence, cli_config.current_model(), &session)?;
                     state.touch_session(&record.id)?;
@@ -253,13 +253,14 @@ fn edit_message() -> Result<String, Box<dyn std::error::Error>> {
 
 async fn run_turn(
     context: &mut TauSession,
+    cli_config: &mut CliConfig,
     user_message: &str,
     output: &OutputStyle,
 ) -> Result<Option<TokenUsage>, Box<dyn std::error::Error>> {
     output.println_styled("muted", "[Sending message]");
     context.push_user_content(vec![ContentPart::text(user_message)]);
     output.println_styled("muted", "[Message sent. Waiting for model response]");
-    let mut response = context.request_response().await?;
+    let mut response = request_response_with_reauth(context, cli_config).await?;
     let mut total_usage = context.last_token_usage().cloned();
 
     loop {
@@ -284,8 +285,36 @@ async fn run_turn(
             "muted",
             "[Sending tool results. Waiting for model response]",
         );
-        response = context.request_response().await?;
+        response = request_response_with_reauth(context, cli_config).await?;
         add_usage(&mut total_usage, context.last_token_usage());
+    }
+}
+
+async fn request_response_with_reauth(
+    context: &mut TauSession,
+    cli_config: &mut CliConfig,
+) -> Result<libtau::context::TauResponse, Box<dyn std::error::Error>> {
+    match context.request_response().await {
+        Ok(response) => Ok(response),
+        Err(libtau::api::ProviderError::ReauthenticationRequired {
+            provider,
+            access,
+            refresh,
+            expires,
+        }) => {
+            cli_config
+                .refresh_current_oauth_provider(OAuthRefreshRequest {
+                    provider,
+                    access,
+                    refresh,
+                    expires,
+                })
+                .await?;
+            let provider = cli_config.build_provider_for_current_model()?;
+            context.refresh_provider(provider);
+            context.request_response().await.map_err(Into::into)
+        }
+        Err(error) => Err(error.into()),
     }
 }
 

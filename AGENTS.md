@@ -7,15 +7,19 @@ Tau is implemented in Rust. The repository root is a Cargo workspace with two pa
 Use normal Cargo commands for building, formatting, testing and running. Use `find crates/ -name '*.rs'` to get a quick idea of the source layout.
 
 ## Design Considerations
-- We're targetting Linux and OS-X. However, future support for other platforms isn't out of the question
+- We're targetting Linux and OS-X. However, future support for other platforms isn't out of the question.
 - This is pre-alpha code. Legacy support/migrations should not be considered unless instructed otherwise
 
 ## Coding Style
 
 The following guidelines are intended to keep the code cleaner and simpler to read:
 - Prefer imports over-qualified references (e.g. import `Error` rather than writing `std::error::Error`).
-- Function names should decribe what the function does. Not implementation details (e.g. just because a function takes an ARC doesn't mean you need `arc` in the function name. That's clear from the arguments already).
+- Function names should decribe what the function does, not how. Don't put implementation details in the name (e.g. just because a function takes an ARC doesn't mean you need `arc` in the function name. That's clear from the arguments already).
 - Avoid one-line helper functions. You do it too much and it ends up creating noise in the code.
+- Don't add public functions that you think will be useful but are not actually using.
+
+Additionally guidelines:
+- Don't choose defaults on your own. Ask.
 
 ## Architecture
 

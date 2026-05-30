@@ -101,6 +101,15 @@ pub struct CodexProviderConfig {
     pub account_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthProviderCredentials {
+    pub provider: String,
+    pub access: String,
+    pub refresh: String,
+    pub expires: i64,
+    pub account_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", content = "config")]
 pub enum ProviderConfigEntry {
@@ -181,6 +190,30 @@ pub struct ConfiguredModel {
     pub metadata: Option<ModelMetadata>,
 }
 
+impl ProviderConfigEntry {
+    pub fn provider_name(&self) -> &str {
+        match self {
+            ProviderConfigEntry::OpenAiApi(_) => openai::PROVIDER_NAME,
+            ProviderConfigEntry::OpenAiCodex(_) => codex::PROVIDER_NAME,
+            ProviderConfigEntry::AnthropicApi(_) => anthropic::PROVIDER_NAME,
+            ProviderConfigEntry::Custom(config) => &config.name,
+        }
+    }
+
+    pub fn oauth_credentials(&self) -> Option<OAuthProviderCredentials> {
+        match self {
+            ProviderConfigEntry::OpenAiCodex(config) => Some(OAuthProviderCredentials {
+                provider: codex::PROVIDER_NAME.to_string(),
+                access: config.access.clone(),
+                refresh: config.refresh.clone(),
+                expires: config.expires,
+                account_id: Some(config.account_id.clone()),
+            }),
+            _ => None,
+        }
+    }
+}
+
 impl ConfiguredProvider {
     pub fn build_api(&self) -> Result<Arc<dyn api::ModelApi>, Box<dyn std::error::Error>> {
         let api_key = match &self.auth {
@@ -220,12 +253,25 @@ impl ConfiguredProvider {
                     options = serde_json::json!({});
                 }
                 let map = options.as_object_mut().expect("options was object above");
+                map.insert("provider".to_string(), Value::String(self.name.clone()));
                 map.insert("refresh".to_string(), Value::String(refresh.clone()));
                 map.insert("expires".to_string(), Value::Number((*expires).into()));
                 map.insert("accountId".to_string(), Value::String(account_id.clone()));
                 options
             }
         }
+    }
+}
+
+pub async fn refresh_oauth_provider(
+    provider: &str,
+    refresh_token: &str,
+) -> Result<ProviderConfigEntry, Box<dyn std::error::Error>> {
+    match provider {
+        codex::PROVIDER_NAME => Ok(ProviderConfigEntry::OpenAiCodex(
+            codex::refresh_credentials(refresh_token).await?,
+        )),
+        _ => Err(format!("provider '{provider}' does not support OAuth refresh").into()),
     }
 }
 
