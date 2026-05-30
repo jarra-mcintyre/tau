@@ -1,4 +1,4 @@
-use std::{fs, io, path::PathBuf};
+use std::{ffi::OsStr, fs, io, path::PathBuf};
 
 use regex::Regex;
 use schemars::JsonSchema;
@@ -7,24 +7,27 @@ use serde_json::Value;
 
 use crate::{
     context::TauContext,
+    path_ignore::IgnoreRules,
     tools::{ToolCallError, ToolDefinition, ToolOutput, ToolRegistrationError},
 };
 
 pub const NAME: &str = "find_files";
-pub const DESCRIPTION: &str = "Find files under a directory whose filenames match a regular expression. By default, version-control metadata directories such as .git, .hg, and .svn are not searched, and results are limited to 100 files.";
+pub const DESCRIPTION: &str = "Find files in directory matching pattern. By default ignores hidden folders and respects .gitignore and friends";
 
-const BLACKLISTED_DIRS: &[&str] = &[".git", ".hg", ".svn"];
 const DEFAULT_MAX_RESULTS: usize = 100;
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct FindFilesInput {
     /// Directory to search recursively.
-    pub directory: PathBuf,
-    /// Regular expression matched against each file's filename, not its full path.
-    pub filename_regex: String,
-    /// Search normally blacklisted directories such as .git, .hg, and .svn when true.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub include_blacklisted_directories: bool,
+    pub directory: Option<PathBuf>,
+    /// Regex matched against each file's filename, not its full path.
+    pub pattern: String,
+    /// Include files ignored by .gitignore etc
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_ignored: Option<bool>,
+    /// Search hidden directories when true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_hidden: Option<bool>,
     /// Maximum number of matching files to return. Defaults to 100.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_results: Option<usize>,
@@ -79,7 +82,9 @@ fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {
 }
 
 pub fn find_files(input: FindFilesInput) -> FindFilesOutput {
-    let regex = match Regex::new(&input.filename_regex) {
+    let directory = input.directory.unwrap_or_else(|| PathBuf::from("."));
+
+    let regex = match Regex::new(&input.pattern) {
         Ok(regex) => regex,
         Err(error) => {
             return FindFilesOutput {
@@ -87,14 +92,14 @@ pub fn find_files(input: FindFilesInput) -> FindFilesOutput {
                 matches: Vec::new(),
                 errors: vec![FindFilesError::new(
                     FindFilesErrorKind::InvalidInput,
-                    input.directory,
+                    directory,
                     error,
                 )],
             };
         }
     };
 
-    match fs::metadata(&input.directory) {
+    match fs::metadata(&directory) {
         Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => {
             return FindFilesOutput {
@@ -102,7 +107,7 @@ pub fn find_files(input: FindFilesInput) -> FindFilesOutput {
                 matches: Vec::new(),
                 errors: vec![FindFilesError::new(
                     FindFilesErrorKind::InvalidInput,
-                    input.directory,
+                    directory,
                     "directory is not a directory",
                 )],
             };
@@ -111,18 +116,34 @@ pub fn find_files(input: FindFilesInput) -> FindFilesOutput {
             return FindFilesOutput {
                 status: FindFilesStatus::Error,
                 matches: Vec::new(),
-                errors: vec![FindFilesError::from_io_error(input.directory, error)],
+                errors: vec![FindFilesError::from_io_error(directory, error)],
             };
         }
     }
 
     let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS);
+    let include_ignored = input.include_ignored.unwrap_or(false);
+    let ignore_rules = if !include_ignored {
+        match IgnoreRules::from_directory_chain(&directory) {
+            Ok(rules) => Some(rules),
+            Err(error) => {
+                return FindFilesOutput {
+                    status: FindFilesStatus::Error,
+                    matches: Vec::new(),
+                    errors: vec![FindFilesError::from_io_error(directory, error)],
+                };
+            }
+        }
+    } else {
+        None
+    };
     let mut matches = Vec::new();
     let mut errors = Vec::new();
     walk_directory(
-        input.directory,
+        directory,
         &regex,
-        input.include_blacklisted_directories,
+        input.include_hidden.unwrap_or(false),
+        ignore_rules,
         &mut matches,
         &mut errors,
     );
@@ -145,7 +166,8 @@ pub fn find_files(input: FindFilesInput) -> FindFilesOutput {
 fn walk_directory(
     directory: PathBuf,
     regex: &Regex,
-    include_blacklisted_directories: bool,
+    include_hidden_directories: bool,
+    ignore_rules: Option<IgnoreRules>,
     matches: &mut Vec<PathBuf>,
     errors: &mut Vec<FindFilesError>,
 ) {
@@ -174,12 +196,30 @@ fn walk_directory(
             }
         };
 
+        if ignore_rules
+            .as_ref()
+            .is_some_and(|rules| rules.is_ignored(&path, file_type.is_dir()))
+        {
+            continue;
+        }
+
         if file_type.is_dir() {
-            if include_blacklisted_directories || !is_blacklisted_directory(&entry.file_name()) {
+            if include_hidden_directories || !is_hidden_directory(&entry.file_name()) {
+                let ignore_rules = match &ignore_rules {
+                    Some(rules) => match rules.with_rules_from_directory(&path) {
+                        Ok(updated) => Some(updated),
+                        Err(error) => {
+                            errors.push(FindFilesError::from_io_error(directory, error));
+                            return;
+                        }
+                    },
+                    None => None
+                };
                 walk_directory(
                     path,
                     regex,
-                    include_blacklisted_directories,
+                    include_hidden_directories,
+                    ignore_rules,
                     matches,
                     errors,
                 );
@@ -192,14 +232,8 @@ fn walk_directory(
     }
 }
 
-fn is_blacklisted_directory(name: &std::ffi::OsStr) -> bool {
-    BLACKLISTED_DIRS
-        .iter()
-        .any(|blacklisted| name == std::ffi::OsStr::new(blacklisted))
-}
-
-fn is_false(value: &bool) -> bool {
-    !value
+fn is_hidden_directory(name: &OsStr) -> bool {
+    name.to_string_lossy().starts_with('.')
 }
 
 impl FindFilesError {
@@ -252,9 +286,10 @@ mod tests {
         fs::write(root.join("nested").join("beta.rs"), "").unwrap();
 
         let output = find_files(FindFilesInput {
-            directory: root.clone(),
-            filename_regex: r".*\.rs$".to_string(),
-            include_blacklisted_directories: false,
+            directory: Some(root.clone()),
+            pattern: r".*\.rs$".to_string(),
+            include_ignored: None,
+            include_hidden: None,
             max_results: None,
         });
 
@@ -269,16 +304,17 @@ mod tests {
     }
 
     #[test]
-    fn skips_blacklisted_directories_by_default() {
-        let root = test_directory("blacklist");
+    fn skips_hidden_directories_by_default() {
+        let root = test_directory("hidden");
         fs::create_dir(root.join(".git")).unwrap();
         fs::write(root.join(".git").join("config"), "").unwrap();
         fs::write(root.join("config"), "").unwrap();
 
         let output = find_files(FindFilesInput {
-            directory: root.clone(),
-            filename_regex: "config".to_string(),
-            include_blacklisted_directories: false,
+            directory: Some(root.clone()),
+            pattern: "config".to_string(),
+            include_ignored: None,
+            include_hidden: None,
             max_results: None,
         });
 
@@ -289,20 +325,117 @@ mod tests {
     }
 
     #[test]
-    fn includes_blacklisted_directories_when_requested() {
-        let root = test_directory("include-blacklist");
+    fn includes_hidden_directories_when_requested() {
+        let root = test_directory("include-hidden");
         fs::create_dir(root.join(".git")).unwrap();
         fs::write(root.join(".git").join("config"), "").unwrap();
 
         let output = find_files(FindFilesInput {
-            directory: root.clone(),
-            filename_regex: "config".to_string(),
-            include_blacklisted_directories: true,
+            directory: Some(root.clone()),
+            pattern: "config".to_string(),
+            include_ignored: None,
+            include_hidden: Some(true),
             max_results: None,
         });
 
         assert_eq!(output.status, FindFilesStatus::Success);
         assert_eq!(output.matches, vec![root.join(".git").join("config")]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn skips_all_hidden_directories_by_default() {
+        let root = test_directory("all-hidden");
+        fs::create_dir(root.join(".cache")).unwrap();
+        fs::write(root.join(".cache").join("data.txt"), "").unwrap();
+        fs::write(root.join("data.txt"), "").unwrap();
+
+        let output = find_files(FindFilesInput {
+            directory: Some(root.clone()),
+            pattern: r".*\.txt$".to_string(),
+            include_ignored: None,
+            include_hidden: None,
+            max_results: None,
+        });
+
+        assert_eq!(output.status, FindFilesStatus::Success);
+        assert_eq!(output.matches, vec![root.join("data.txt")]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn obeys_ignore_files() {
+        let root = test_directory("ignore-files");
+        fs::write(root.join(".gitignore"), "*.log\nignored-dir/\n").unwrap();
+        fs::write(root.join("debug.log"), "").unwrap();
+        fs::write(root.join("keep.txt"), "").unwrap();
+        fs::create_dir(root.join("ignored-dir")).unwrap();
+        fs::write(root.join("ignored-dir").join("nested.txt"), "").unwrap();
+        fs::create_dir(root.join("subdir")).unwrap();
+        fs::write(root.join("subdir").join(".svnignore"), "ignored.txt\n").unwrap();
+        fs::write(root.join("subdir").join("ignored.txt"), "").unwrap();
+        fs::write(root.join("subdir").join("keep.txt"), "").unwrap();
+
+        let output = find_files(FindFilesInput {
+            directory: Some(root.clone()),
+            pattern: r".*\.(log|txt)$".to_string(),
+            include_ignored: None,
+            include_hidden: None,
+            max_results: None,
+        });
+
+        assert_eq!(output.status, FindFilesStatus::Success);
+        assert_eq!(
+            output.matches,
+            vec![root.join("keep.txt"), root.join("subdir").join("keep.txt")]
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loads_ignore_files_from_repository_root_to_search_directory() {
+        let root = test_directory("ignore-chain");
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        fs::create_dir(root.join("subdir")).unwrap();
+        fs::write(root.join("subdir").join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(root.join("subdir").join("debug.log"), "").unwrap();
+        fs::write(root.join("subdir").join("ignored.txt"), "").unwrap();
+        fs::write(root.join("subdir").join("keep.txt"), "").unwrap();
+
+        let output = find_files(FindFilesInput {
+            directory: Some(root.join("subdir")),
+            pattern: r".*\.(log|txt)$".to_string(),
+            include_ignored: None,
+            include_hidden: None,
+            max_results: None,
+        });
+
+        assert_eq!(output.status, FindFilesStatus::Success);
+        assert_eq!(output.matches, vec![root.join("subdir").join("keep.txt")]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn includes_ignored_files_when_requested() {
+        let root = test_directory("include-ignored");
+        fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        fs::write(root.join("debug.log"), "").unwrap();
+
+        let output = find_files(FindFilesInput {
+            directory: Some(root.clone()),
+            pattern: r".*\.log$".to_string(),
+            include_ignored: Some(true),
+            include_hidden: None,
+            max_results: None,
+        });
+
+        assert_eq!(output.status, FindFilesStatus::Success);
+        assert_eq!(output.matches, vec![root.join("debug.log")]);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -315,9 +448,10 @@ mod tests {
         }
 
         let output = find_files(FindFilesInput {
-            directory: root.clone(),
-            filename_regex: r".*\.txt$".to_string(),
-            include_blacklisted_directories: false,
+            directory: Some(root.clone()),
+            pattern: r".*\.txt$".to_string(),
+            include_ignored: None,
+            include_hidden: None,
             max_results: None,
         });
 
@@ -337,9 +471,10 @@ mod tests {
         }
 
         let output = find_files(FindFilesInput {
-            directory: root.clone(),
-            filename_regex: r".*\.txt$".to_string(),
-            include_blacklisted_directories: false,
+            directory: Some(root.clone()),
+            pattern: r".*\.txt$".to_string(),
+            include_ignored: None,
+            include_hidden: None,
             max_results: Some(2),
         });
 
@@ -357,9 +492,10 @@ mod tests {
         let root = test_directory("invalid-regex");
 
         let output = find_files(FindFilesInput {
-            directory: root.clone(),
-            filename_regex: "(".to_string(),
-            include_blacklisted_directories: false,
+            directory: Some(root.clone()),
+            pattern: "(".to_string(),
+            include_ignored: None,
+            include_hidden: None,
             max_results: None,
         });
 
