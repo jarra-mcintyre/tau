@@ -1,3 +1,14 @@
+//! This implements the read_file tool. The principal behaviours are:
+//! - We support reading images and text files. Encoding is detected automatically, but can be overwritten
+//! - We support reading subsets of text-files
+//! - We cap the maximum allowed read size (no point dumping huge files in conetxt). This applies to either the whole file, or to the line range if specified.
+//! - We put a soft-cap on file size to avoid inadvertantly dumping large files into model context, but let the model override it.
+//! - When we hit the soft-cap we let the model know the file-size and number of lines so it can choose how to read it.
+//!
+//! Key actions:
+//! - Image: put image content to tool output list
+//! - Text: add text content as is to tool output (either filtered by line range; or after optionally applying the soft-cap on file size)
+
 use std::{
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom},
@@ -5,6 +16,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use bon::Builder;
 use chardetng::EncodingDetector;
 use encoding_rs::{CoderResult, Encoding, UTF_8};
 use schemars::JsonSchema;
@@ -17,26 +29,26 @@ use crate::{
 };
 
 pub const NAME: &str = "read_file";
-pub const DESCRIPTION: &str = "Read text and image files from disk. Content encoding is detected automatically. Text files larger than 100 KiB return only size and line count unless ignore_soft_limit=true. Text reads can specify line ranges.";
+pub const DESCRIPTION: &str = "Read text/image files. Content encoding is detected automatically. Large text files will only be read if either a line range is specified or the ignore_soft_limit flag is set";
 
 const DEFAULT_MAX_BYTES: u64 = 20 * 1024 * 1024;
 const TEXT_SOFT_LIMIT_BYTES: u64 = 100 * 1024;
 const DETECTION_BYTES: u64 = 8192;
 const STREAM_BUFFER_BYTES: usize = 8192;
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Builder)]
 pub struct ReadFileInput {
     pub path: PathBuf,
-    /// Optional 1-based first line to read. Defaults to the first line.
+    /// First line to read (optional; starts from 1)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_line: Option<i64>,
-    /// Optional 1-based last line to read, inclusive. Defaults to the last line.
+    /// Last line to read (optional; starts from 1)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_line: Option<i64>,
-    /// Optional content type override, such as text/plain or image/png.
+    /// Content type override (optional; e.g. image/png)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
-    /// Allow reading text files larger than the soft limit.
+    /// Allow reading large text files (optional; default false)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignore_soft_limit: Option<bool>,
 }
@@ -46,8 +58,8 @@ pub struct ReadFileOutput {
     pub okay: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contents: Option<String>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub soft_limited: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_limited: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_size_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -80,10 +92,6 @@ pub fn register(context: &mut TauContext) -> Result<(), ToolRegistrationError> {
         true,
         callback,
     )?)
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {
@@ -132,7 +140,7 @@ pub fn read_file(input: ReadFileInput) -> ReadFileOutput {
         } => ReadFileOutput {
             okay: true,
             contents: None,
-            soft_limited: false,
+            soft_limited: None,
             total_size_bytes: Some(total_size_bytes),
             total_lines: None,
             message: Some(format!("read image file ({media_type})")),
@@ -212,16 +220,19 @@ fn read_file_result(input: ReadFileInput) -> ReadFileResult {
 
     let (encoding, bom_length) = detect_text_encoding(&sample);
 
-    if length > TEXT_SOFT_LIMIT_BYTES && !input.ignore_soft_limit.unwrap_or(false) {
+    if length > TEXT_SOFT_LIMIT_BYTES
+        && !input.ignore_soft_limit.unwrap_or(false)
+        && !(input.first_line.is_some() && input.last_line.is_some())
+    {
         return match count_lines_streaming(&input.path, encoding, bom_length) {
             Ok(total_lines) => ReadFileResult::Output(ReadFileOutput {
                 okay: true,
                 contents: None,
-                soft_limited: true,
+                soft_limited: Some(true),
                 total_size_bytes: Some(length),
                 total_lines: Some(total_lines),
                 message: Some(format!(
-                    "text file is larger than the soft limit ({length} bytes; soft limit is {TEXT_SOFT_LIMIT_BYTES} bytes). Request again with ignore_soft_limit=true to read it."
+                    "text file is too large ({length} bytes) either specify a line range or set ignore_soft_limit=true"
                 )),
                 error: None,
             }),
@@ -247,7 +258,7 @@ fn read_file_result(input: ReadFileInput) -> ReadFileResult {
         Ok(contents) => ReadFileResult::Output(ReadFileOutput {
             okay: true,
             contents: Some(contents),
-            soft_limited: false,
+            soft_limited: None,
             total_size_bytes: Some(length),
             total_lines: None,
             message: None,
@@ -442,7 +453,7 @@ impl ReadFileOutput {
         Self {
             okay: false,
             contents: None,
-            soft_limited: false,
+            soft_limited: None,
             total_size_bytes: None,
             total_lines: None,
             message: None,
@@ -490,13 +501,7 @@ mod tests {
         ));
         fs::write(&path, "hello tau").unwrap();
 
-        let output = read_file(ReadFileInput {
-            path: path.clone(),
-            first_line: None,
-            last_line: None,
-            content_type: None,
-            ignore_soft_limit: None,
-        });
+        let output = read_file(ReadFileInput::builder().path(path.clone()).build());
 
         assert!(output.okay);
         assert_eq!(output.contents, Some("hello tau".to_string()));
@@ -511,13 +516,7 @@ mod tests {
             "tau-read-file-test-{}-missing.txt",
             std::process::id()
         ));
-        let output = read_file(ReadFileInput {
-            path,
-            first_line: None,
-            last_line: None,
-            content_type: None,
-            ignore_soft_limit: None,
-        });
+        let output = read_file(ReadFileInput::builder().path(path).build());
 
         assert!(!output.okay);
         assert_eq!(output.contents, None);
@@ -532,13 +531,13 @@ mod tests {
         ));
         fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
 
-        let output = read_file(ReadFileInput {
-            path: path.clone(),
-            first_line: Some(2),
-            last_line: Some(3),
-            content_type: None,
-            ignore_soft_limit: None,
-        });
+        let output = read_file(
+            ReadFileInput::builder()
+                .path(path.clone())
+                .first_line(2)
+                .last_line(3)
+                .build(),
+        );
 
         assert!(output.okay);
         assert_eq!(output.contents, Some("two\nthree\n".to_string()));
@@ -555,13 +554,12 @@ mod tests {
         ));
         fs::write(&path, "one\ntwo\nthree").unwrap();
 
-        let output = read_file(ReadFileInput {
-            path: path.clone(),
-            first_line: None,
-            last_line: Some(2),
-            content_type: None,
-            ignore_soft_limit: None,
-        });
+        let output = read_file(
+            ReadFileInput::builder()
+                .path(path.clone())
+                .last_line(2)
+                .build(),
+        );
 
         assert!(output.okay);
         assert_eq!(output.contents, Some("one\ntwo\n".to_string()));
@@ -577,13 +575,13 @@ mod tests {
             std::process::id()
         ));
 
-        let output = read_file(ReadFileInput {
-            path,
-            first_line: Some(3),
-            last_line: Some(2),
-            content_type: None,
-            ignore_soft_limit: None,
-        });
+        let output = read_file(
+            ReadFileInput::builder()
+                .path(path)
+                .first_line(3)
+                .last_line(2)
+                .build(),
+        );
 
         assert!(!output.okay);
         assert_eq!(output.contents, None);
@@ -597,13 +595,7 @@ mod tests {
             std::process::id()
         ));
 
-        let output = read_file(ReadFileInput {
-            path,
-            first_line: Some(-1),
-            last_line: None,
-            content_type: None,
-            ignore_soft_limit: None,
-        });
+        let output = read_file(ReadFileInput::builder().path(path).first_line(-1).build());
 
         assert!(!output.okay);
         assert_eq!(output.contents, None);
@@ -619,13 +611,7 @@ mod tests {
         let bytes = b"\x89PNG\r\n\x1a\nimage bytes";
         fs::write(&path, bytes).unwrap();
 
-        let output = read_file(ReadFileInput {
-            path: path.clone(),
-            first_line: None,
-            last_line: None,
-            content_type: None,
-            ignore_soft_limit: None,
-        });
+        let output = read_file(ReadFileInput::builder().path(path.clone()).build());
 
         assert!(output.okay);
         assert_eq!(output.contents, None);
@@ -645,13 +631,12 @@ mod tests {
         let bytes = b"not detectable but caller knows";
         fs::write(&path, bytes).unwrap();
 
-        let output = read_file(ReadFileInput {
-            path: path.clone(),
-            first_line: None,
-            last_line: None,
-            content_type: Some("image/jpeg".to_string()),
-            ignore_soft_limit: None,
-        });
+        let output = read_file(
+            ReadFileInput::builder()
+                .path(path.clone())
+                .content_type("image/jpeg".to_string())
+                .build(),
+        );
 
         assert!(output.okay);
         assert_eq!(output.contents, None);
@@ -670,13 +655,7 @@ mod tests {
         ));
         fs::write(&path, b"caf\xe9").unwrap();
 
-        let output = read_file(ReadFileInput {
-            path: path.clone(),
-            first_line: None,
-            last_line: None,
-            content_type: None,
-            ignore_soft_limit: None,
-        });
+        let output = read_file(ReadFileInput::builder().path(path.clone()).build());
 
         assert!(output.okay);
         assert_eq!(output.contents, Some("café".to_string()));
@@ -693,13 +672,7 @@ mod tests {
         ));
         fs::write(&path, vec![b'a'; DEFAULT_MAX_BYTES as usize + 1]).unwrap();
 
-        let output = read_file(ReadFileInput {
-            path: path.clone(),
-            first_line: None,
-            last_line: None,
-            content_type: None,
-            ignore_soft_limit: None,
-        });
+        let output = read_file(ReadFileInput::builder().path(path.clone()).build());
 
         assert!(!output.okay);
         assert_eq!(output.contents, None);
@@ -718,13 +691,13 @@ mod tests {
         contents.extend(vec![b'a'; DEFAULT_MAX_BYTES as usize + 1]);
         fs::write(&path, contents).unwrap();
 
-        let output = read_file(ReadFileInput {
-            path: path.clone(),
-            first_line: Some(2),
-            last_line: Some(2),
-            content_type: None,
-            ignore_soft_limit: None,
-        });
+        let output = read_file(
+            ReadFileInput::builder()
+                .path(path.clone())
+                .first_line(2)
+                .last_line(2)
+                .build(),
+        );
 
         assert!(!output.okay);
         assert_eq!(output.contents, None);
@@ -742,17 +715,11 @@ mod tests {
         let contents = format!("one\ntwo\n{}", "a".repeat(TEXT_SOFT_LIMIT_BYTES as usize));
         fs::write(&path, &contents).unwrap();
 
-        let output = read_file(ReadFileInput {
-            path: path.clone(),
-            first_line: None,
-            last_line: None,
-            content_type: None,
-            ignore_soft_limit: None,
-        });
+        let output = read_file(ReadFileInput::builder().path(path.clone()).build());
 
         assert!(output.okay);
         assert_eq!(output.contents, None);
-        assert!(output.soft_limited);
+        assert_eq!(output.soft_limited, Some(true));
         assert_eq!(output.total_size_bytes, Some(contents.len() as u64));
         assert_eq!(output.total_lines, Some(3));
         assert!(output.message.unwrap().contains("ignore_soft_limit=true"));
@@ -770,17 +737,18 @@ mod tests {
         let contents = format!("one\ntwo\n{}", "a".repeat(TEXT_SOFT_LIMIT_BYTES as usize));
         fs::write(&path, &contents).unwrap();
 
-        let output = read_file(ReadFileInput {
-            path: path.clone(),
-            first_line: Some(2),
-            last_line: Some(2),
-            content_type: None,
-            ignore_soft_limit: Some(true),
-        });
+        let output = read_file(
+            ReadFileInput::builder()
+                .path(path.clone())
+                .ignore_soft_limit(true)
+                .first_line(2)
+                .last_line(2)
+                .build(),
+        );
 
         assert!(output.okay);
         assert_eq!(output.contents, Some("two\n".to_string()));
-        assert!(!output.soft_limited);
+        assert_eq!(output.soft_limited, None);
         assert_eq!(output.error, None);
 
         fs::remove_file(path).unwrap();

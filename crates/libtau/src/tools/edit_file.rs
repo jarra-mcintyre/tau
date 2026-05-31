@@ -73,10 +73,7 @@ pub fn register(context: &mut TauContext) -> Result<(), ToolRegistrationError> {
 fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {
     let input: EditFileInput = serde_json::from_value(input)
         .map_err(|error| ToolCallError::InvalidInput(error.to_string()))?;
-    let output = edit_file(input);
-    let value = serde_json::to_value(output)
-        .map_err(|error| ToolCallError::OutputSerializationFailed(error.to_string()))?;
-    Ok(ToolOutput::json(value))
+    Ok(edit_file(input).into_tool_output())
 }
 
 pub fn edit_file(input: EditFileInput) -> EditFileOutput {
@@ -154,6 +151,24 @@ pub fn edit_file(input: EditFileInput) -> EditFileOutput {
             error: None,
         },
         Err(error) => error_output(EditFileError::from_io_error(error, None)),
+    }
+}
+
+impl EditFileOutput {
+    fn into_tool_output(self) -> ToolOutput {
+        match self.error {
+            None => ToolOutput::text(format!(
+                "applied {} substitution(s)",
+                self.substitutions_applied.unwrap_or(0)
+            )),
+            Some(error) => {
+                let location = error
+                    .substitution_index
+                    .map(|index| format!(" at substitution {index}"))
+                    .unwrap_or_default();
+                ToolOutput::error(format!("{}{location}", error.message))
+            }
+        }
     }
 }
 

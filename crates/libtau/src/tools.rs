@@ -57,6 +57,7 @@ pub fn register_builtin_tools(context: &mut TauContext) -> Result<(), ToolRegist
 }
 
 impl ToolOutput {
+    // FIXME: DELETE THIS FUNCTION
     pub fn json(value: Value) -> Self {
         Self {
             content: vec![ContentPart::json(value)],
@@ -66,6 +67,15 @@ impl ToolOutput {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             content: vec![ContentPart::text(text)],
+        }
+    }
+
+    pub fn error(text: impl Into<String>) -> Self {
+        Self {
+            content: vec![ContentPart::FailedToolCall {
+                text: text.into(),
+                metadata: None,
+            }],
         }
     }
 }
@@ -90,5 +100,20 @@ impl ToolDefinition {
             readonly,
             callback,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_schema_definitions() {
+        let mut context = TauContext::default();
+        register_builtin_tools(&mut context).expect("can register builtin tools");
+        for tool in context.tools() {
+            let schema = serde_json::to_string_pretty(&tool.input_schema).unwrap();
+            println!("** {}:\n {}\n", tool.name, schema);
+        }
     }
 }

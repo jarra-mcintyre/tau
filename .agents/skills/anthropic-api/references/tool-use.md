@@ -20,19 +20,19 @@ Request format:
     "description": "Get the current weather in a given location",
     "strict": true,
     "input_schema": {
-    "type": "object",
-    "properties": {
-      "location": {
-        "type": "string",
-        "description": "The city and state, e.g. Melbourne, Australia"
+      "type": "object",
+      "properties": {
+        "location": {
+          "type": "string",
+          "description": "The city and state, e.g. Melbourne, Australia"
+        },
+        "unit": {
+          "type": "string",
+          "enum": ["celsius", "fahrenheit"]
+        }
       },
-      "unit": {
-        "type": "string",
-        "enum": ["celsius", "fahrenheit"]
-      }
-    },
-    "required": ["location"],
-    "additionalProperties": false
+      "required": ["location"],
+      "additionalProperties": false
     }
   }]
 }

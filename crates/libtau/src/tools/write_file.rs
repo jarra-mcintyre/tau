@@ -14,7 +14,9 @@ pub const DESCRIPTION: &str = "Create or overwrite a text file";
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct WriteFileInput {
+    /// File path
     pub path: PathBuf,
+    /// Text to write
     pub contents: String,
 }
 
@@ -52,10 +54,7 @@ pub fn register(context: &mut TauContext) -> Result<(), ToolRegistrationError> {
 fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {
     let input: WriteFileInput = serde_json::from_value(input)
         .map_err(|error| ToolCallError::InvalidInput(error.to_string()))?;
-    let output = write_file(input);
-    let value = serde_json::to_value(output)
-        .map_err(|error| ToolCallError::OutputSerializationFailed(error.to_string()))?;
-    Ok(ToolOutput::json(value))
+    Ok(write_file(input).into_tool_output())
 }
 
 pub fn write_file(input: WriteFileInput) -> WriteFileOutput {
@@ -68,6 +67,15 @@ pub fn write_file(input: WriteFileInput) -> WriteFileOutput {
             okay: false,
             error: Some(WriteFileError::from_io_error(error)),
         },
+    }
+}
+
+impl WriteFileOutput {
+    fn into_tool_output(self) -> ToolOutput {
+        match self.error {
+            None => ToolOutput::text("written"),
+            Some(error) => ToolOutput::error(error.message),
+        }
     }
 }
 

@@ -688,6 +688,9 @@ fn input_content_parts(parts: &[ContentPart]) -> Result<Vec<OpenAiContent>, Prov
             ContentPart::Refusal { text, .. } => {
                 Ok(OpenAiContent::InputText { text: text.clone() })
             }
+            ContentPart::FailedToolCall { text, .. } => {
+                Ok(OpenAiContent::InputText { text: text.clone() })
+            }
         })
         .collect()
 }
@@ -701,6 +704,9 @@ fn output_content_parts(parts: &[ContentPart]) -> Vec<OpenAiContent> {
                 text: format!("[thinking: {text}]"),
             },
             ContentPart::Refusal { text, .. } => OpenAiContent::OutputText { text: text.clone() },
+            ContentPart::FailedToolCall { text, .. } => {
+                OpenAiContent::OutputText { text: text.clone() }
+            }
             part => OpenAiContent::OutputText {
                 text: assistant_content_as_text(part),
             },
@@ -721,9 +727,27 @@ fn tool_result_output(
         ));
     }
 
+    if result
+        .content
+        .iter()
+        .any(|part| matches!(part, ContentPart::FailedToolCall { .. }))
+    {
+        return Ok(OpenAiFunctionCallOutputContent::Text(tool_result_text(
+            &result.content,
+        )));
+    }
+
     Ok(OpenAiFunctionCallOutputContent::Text(tool_result_json(
         result,
     )?))
+}
+
+fn tool_result_text(parts: &[ContentPart]) -> String {
+    parts
+        .iter()
+        .map(assistant_content_as_text)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]

@@ -800,6 +800,9 @@ fn input_content_parts(parts: &[ContentPart]) -> Result<Vec<AnthropicContent>, P
                 text: format!("[thinking: {text}]"),
             }),
             ContentPart::Refusal { text, .. } => Ok(AnthropicContent::Text { text: text.clone() }),
+            ContentPart::FailedToolCall { text, .. } => {
+                Ok(AnthropicContent::Text { text: text.clone() })
+            }
         })
         .collect()
 }
@@ -808,8 +811,18 @@ fn tool_result_content(result: &ToolResult) -> Result<AnthropicContent, Provider
     Ok(AnthropicContent::ToolResult {
         tool_use_id: result.call_id.clone(),
         content: anthropic_tool_result_content(result)?,
-        is_error: result.error.as_ref().map(|_| true),
+        is_error: result.error.as_ref().map(|_| true).or_else(|| {
+            result
+                .content
+                .iter()
+                .any(is_failed_tool_call)
+                .then_some(true)
+        }),
     })
+}
+
+fn is_failed_tool_call(part: &ContentPart) -> bool {
+    matches!(part, ContentPart::FailedToolCall { .. })
 }
 
 fn anthropic_tool_result_content(
@@ -834,6 +847,9 @@ fn anthropic_tool_result_content(
                 "[thinking: {text}]"
             ))),
             ContentPart::Refusal { text, .. } => Ok(AnthropicToolResultContent::Text(text.clone())),
+            ContentPart::FailedToolCall { text, .. } => {
+                Ok(AnthropicToolResultContent::Text(text.clone()))
+            }
             ContentPart::Image { .. } | ContentPart::Binary { .. } => unreachable!(),
         };
     }
@@ -872,6 +888,9 @@ fn anthropic_tool_result_content(
                 text: format!("[thinking: {text}]"),
             }),
             ContentPart::Refusal { text, .. } => {
+                blocks.push(AnthropicToolResultBlock::Text { text: text.clone() })
+            }
+            ContentPart::FailedToolCall { text, .. } => {
                 blocks.push(AnthropicToolResultBlock::Text { text: text.clone() })
             }
         }

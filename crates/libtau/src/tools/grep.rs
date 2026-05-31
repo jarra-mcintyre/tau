@@ -77,10 +77,7 @@ pub fn register(context: &mut TauContext) -> Result<(), ToolRegistrationError> {
 fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {
     let input: GrepInput = serde_json::from_value(input)
         .map_err(|error| ToolCallError::InvalidInput(error.to_string()))?;
-    let output = grep(input);
-    let value = serde_json::to_value(output)
-        .map_err(|error| ToolCallError::OutputSerializationFailed(error.to_string()))?;
-    Ok(ToolOutput::json(value))
+    Ok(grep(input).into_tool_output())
 }
 
 pub fn grep(input: GrepInput) -> GrepOutput {
@@ -202,6 +199,40 @@ fn search_file(
             Ok(true)
         }),
     )
+}
+
+impl GrepOutput {
+    fn into_tool_output(self) -> ToolOutput {
+        let mut lines: Vec<String> = self
+            .matches
+            .iter()
+            .map(|matched| {
+                format!(
+                    "{}:{}:{}",
+                    matched.path.display(),
+                    matched.line_number,
+                    matched.line
+                )
+            })
+            .collect();
+        lines.extend(
+            self.errors
+                .iter()
+                .map(|error| format!("{}: {}", error.path.display(), error.message)),
+        );
+
+        let text = if lines.is_empty() {
+            "no matches".to_string()
+        } else {
+            lines.join("\n")
+        };
+
+        if self.okay {
+            ToolOutput::text(text)
+        } else {
+            ToolOutput::error(text)
+        }
+    }
 }
 
 impl GrepError {

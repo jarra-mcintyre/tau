@@ -94,6 +94,12 @@ pub enum ContentPart {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<Value>,
     },
+    // This is a text type
+    FailedToolCall {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<Value>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,8 +1,17 @@
+//! This implements the bash tool. The principal behaviours are:
+//! - Runs command in bash shell. Buffering output stdout and stderr into a temp file
+//! - If the file contents are not overly long, then returns the contents as is
+//! - Otherwise moves the temp file to a permanent location and returns a message pointing the model towards it
+
 use std::{
     fs,
     io::{self, Read, Write},
     path::PathBuf,
     process::{Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
     time::{Duration, SystemTime},
 };
@@ -17,15 +26,17 @@ use crate::{
 };
 
 pub const NAME: &str = "bash";
-pub const DESCRIPTION: &str = "Run a command in a bash shell (with an optional timeout).  Both stdout and stderr are truncated to the last 2000 lines or 50 KiB. Full stream output is saved to a file when truncated";
+pub const DESCRIPTION: &str = "Run a command in a bash shell (with an optional timeout). Output is truncated to the last 2000 lines or 50 KiB. Full output is saved to a file when truncated";
 
 const MAX_OUTPUT_LINES: usize = 2000;
 const MAX_OUTPUT_BYTES: usize = 50 * 1024;
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct BashInput {
+    /// Command to run
     pub command: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Timeout in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
 }
 
@@ -42,8 +53,7 @@ pub struct BashOutput {
     pub status: BashStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
-    pub stdout: BashStreamOutput,
-    pub stderr: BashStreamOutput,
+    pub output: BashStreamOutput,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<BashError>,
 }
@@ -82,10 +92,7 @@ pub fn definition() -> Result<ToolDefinition, ToolRegistrationError> {
 fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {
     let input: BashInput = serde_json::from_value(input)
         .map_err(|error| ToolCallError::InvalidInput(error.to_string()))?;
-    let output = bash(input);
-    let value = serde_json::to_value(output)
-        .map_err(|error| ToolCallError::OutputSerializationFailed(error.to_string()))?;
-    Ok(ToolOutput::json(value))
+    Ok(bash(input).into_tool_output())
 }
 
 pub fn bash(input: BashInput) -> BashOutput {
@@ -100,10 +107,12 @@ pub fn bash(input: BashInput) -> BashOutput {
         Err(error) => return error_output(BashError::new(BashErrorKind::SpawnFailed, error)),
     };
 
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let sequence = Arc::new(AtomicUsize::new(0));
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
-    let stdout_handle = thread::spawn(move || read_stream("stdout", stdout));
-    let stderr_handle = thread::spawn(move || read_stream("stderr", stderr));
+    let stdout_handle = read_stream(stdout, Arc::clone(&output), Arc::clone(&sequence));
+    let stderr_handle = read_stream(stderr, Arc::clone(&output), Arc::clone(&sequence));
 
     let timeout = input.timeout_seconds.map(Duration::from_secs);
     let start = SystemTime::now();
@@ -124,7 +133,6 @@ pub fn bash(input: BashInput) -> BashOutput {
                             timeout.as_secs()
                         ),
                     });
-                    // FIXME(FUTURE): This might leave dependent processes
                     let _ = child.kill();
                     break child.wait().ok();
                 }
@@ -134,8 +142,8 @@ pub fn bash(input: BashInput) -> BashOutput {
         }
     };
 
-    let (stdout, stdout_error) = join_stream(stdout_handle);
-    let (stderr, stderr_error) = join_stream(stderr_handle);
+    let stdout_error = join_stream(stdout_handle);
+    let stderr_error = join_stream(stderr_handle);
     let error = stdout_error.or(stderr_error).or(timeout_error);
 
     let exit_code = exit_status.and_then(|status| status.code());
@@ -147,37 +155,72 @@ pub fn bash(input: BashInput) -> BashOutput {
         BashStatus::Error
     };
 
+    let output = match build_stream_output(output) {
+        Ok(output) => output,
+        Err(error) => {
+            return BashOutput {
+                status: BashStatus::Error,
+                exit_code,
+                output: BashStreamOutput::default(),
+                error: Some(BashError::new(BashErrorKind::Io, error)),
+            };
+        }
+    };
+
     BashOutput {
         status,
         exit_code,
-        stdout,
-        stderr,
+        output,
         error,
     }
 }
 
-fn read_stream(stream_name: &'static str, mut pipe: impl Read) -> io::Result<BashStreamOutput> {
+fn read_stream(
+    mut pipe: impl Read + Send + 'static,
+    output: Arc<Mutex<Vec<StreamChunk>>>,
+    sequence: Arc<AtomicUsize>,
+) -> thread::JoinHandle<io::Result<()>> {
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let bytes_read = pipe.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            output
+                .lock()
+                .expect("output mutex poisoned")
+                .push(StreamChunk {
+                    sequence: sequence.fetch_add(1, Ordering::SeqCst),
+                    bytes: buffer[..bytes_read].to_vec(),
+                });
+        }
+        Ok(())
+    })
+}
+
+fn build_stream_output(output: Arc<Mutex<Vec<StreamChunk>>>) -> io::Result<BashStreamOutput> {
+    let mut chunks = Arc::try_unwrap(output)
+        .map_err(|_| io::Error::other("output stream is still shared"))?
+        .into_inner()
+        .map_err(|_| io::Error::other("output mutex poisoned"))?;
+    chunks.sort_by_key(|chunk| chunk.sequence);
+
     let mut full_output = tempfile::Builder::new()
-        .prefix(&format!("tau-bash-{stream_name}-"))
+        .prefix("tau-bash-output-")
         .suffix(".txt")
         .tempfile_in(tau_home_dir()?)?;
     let mut tail = TailBuffer::new();
-    let mut chunk = [0_u8; 8192];
 
-    loop {
-        let bytes_read = pipe.read(&mut chunk)?;
-        if bytes_read == 0 {
-            break;
-        }
-
-        let bytes = &chunk[..bytes_read];
-        full_output.write_all(bytes)?;
-        tail.push(bytes);
+    for chunk in chunks {
+        full_output.write_all(&chunk.bytes)?;
+        tail.push(&chunk.bytes);
     }
 
     if tail.truncated {
         let (_file, temp_path) = full_output.keep().map_err(|error| error.error)?;
-        let path = move_output_to_working_directory(&temp_path, stream_name)?;
+        let path = move_output_to_working_directory(&temp_path)?;
         Ok(BashStreamOutput {
             output: tail.output(),
             truncated: true,
@@ -192,6 +235,12 @@ fn read_stream(stream_name: &'static str, mut pipe: impl Read) -> io::Result<Bas
     }
 }
 
+#[derive(Debug)]
+struct StreamChunk {
+    sequence: usize,
+    bytes: Vec<u8>,
+}
+
 fn tau_home_dir() -> io::Result<PathBuf> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -201,12 +250,9 @@ fn tau_home_dir() -> io::Result<PathBuf> {
     Ok(path)
 }
 
-fn move_output_to_working_directory(
-    temp_path: &std::path::Path,
-    stream_name: &str,
-) -> io::Result<PathBuf> {
+fn move_output_to_working_directory(temp_path: &std::path::Path) -> io::Result<PathBuf> {
     let mut output_file = tempfile::Builder::new()
-        .prefix(&format!("tau-bash-{stream_name}-"))
+        .prefix("tau-bash-output-")
         .suffix(".txt")
         .tempfile_in(std::env::current_dir()?)?;
     let mut temp_file = fs::File::open(temp_path)?;
@@ -217,22 +263,14 @@ fn move_output_to_working_directory(
     Ok(path)
 }
 
-fn join_stream(
-    handle: thread::JoinHandle<io::Result<BashStreamOutput>>,
-) -> (BashStreamOutput, Option<BashError>) {
+fn join_stream(handle: thread::JoinHandle<io::Result<()>>) -> Option<BashError> {
     match handle.join() {
-        Ok(Ok(output)) => (output, None),
-        Ok(Err(error)) => (
-            BashStreamOutput::default(),
-            Some(BashError::new(BashErrorKind::Io, error)),
-        ),
-        Err(_) => (
-            BashStreamOutput::default(),
-            Some(BashError::new(
-                BashErrorKind::Other,
-                "stream reader thread panicked",
-            )),
-        ),
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(BashError::new(BashErrorKind::Io, error)),
+        Err(_) => Some(BashError::new(
+            BashErrorKind::Other,
+            "stream reader thread panicked",
+        )),
     }
 }
 
@@ -292,9 +330,53 @@ fn error_output(error: BashError) -> BashOutput {
     BashOutput {
         status: BashStatus::Error,
         exit_code: None,
-        stdout: BashStreamOutput::default(),
-        stderr: BashStreamOutput::default(),
+        output: BashStreamOutput::default(),
         error: Some(error),
+    }
+}
+
+impl BashOutput {
+    fn into_tool_output(self) -> ToolOutput {
+        let mut text = self.output.output;
+
+        if self.output.truncated {
+            let path = self
+                .output
+                .full_output_path
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&format!(
+                "(output was truncated; full output saved to {path})"
+            ));
+        }
+
+        if let Some(error) = &self.error {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&error.message);
+        }
+
+        if !matches!(self.status, BashStatus::Success) {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            let code = self.exit_code.unwrap_or(-1);
+            text.push_str(&format!("(return code was {code})"));
+        }
+
+        if text.is_empty() {
+            text = "done".to_string();
+        }
+
+        if matches!(self.status, BashStatus::Success) && self.error.is_none() {
+            ToolOutput::text(text)
+        } else {
+            ToolOutput::error(text)
+        }
     }
 }
 
@@ -320,10 +402,8 @@ mod tests {
 
         assert_eq!(output.status, BashStatus::Success);
         assert_eq!(output.exit_code, Some(0));
-        assert_eq!(output.stdout.output.trim(), "hello-Tau");
-        assert_eq!(output.stderr.output, "");
-        assert!(!output.stdout.truncated);
-        assert!(!output.stderr.truncated);
+        assert_eq!(output.output.output.trim(), "hello-Tau");
+        assert!(!output.output.truncated);
     }
 
     #[test]
@@ -335,8 +415,7 @@ mod tests {
 
         assert_eq!(output.status, BashStatus::Error);
         assert_eq!(output.exit_code, Some(7));
-        assert!(output.stderr.output.contains("nope"));
-        assert_eq!(output.stdout.output, "");
+        assert!(output.output.output.contains("nope"));
     }
 
     #[test]
@@ -370,15 +449,14 @@ mod tests {
         });
 
         assert_eq!(output.status, BashStatus::Success);
-        assert!(output.stdout.truncated);
-        assert!(!output.stderr.truncated);
-        assert!(output.stdout.output.len() <= MAX_OUTPUT_BYTES);
-        let path = output.stdout.full_output_path.expect("full output path");
+        assert!(output.output.truncated);
+        assert!(output.output.output.len() <= MAX_OUTPUT_BYTES);
+        let path = output.output.full_output_path.expect("full output path");
         assert!(
             path.file_name()
                 .unwrap()
                 .to_string_lossy()
-                .starts_with("tau-bash-stdout-")
+                .starts_with("tau-bash-output-")
         );
         let full = std::fs::read_to_string(&path).unwrap();
         assert!(full.len() > MAX_OUTPUT_BYTES);

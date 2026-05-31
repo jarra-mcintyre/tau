@@ -403,6 +403,9 @@ fn print_content(content: &ContentPart, output: &OutputStyle) {
         ContentPart::Refusal { text, .. } => {
             output.println_indented_styled("muted", &format!("[refusal]\n{text}"))
         }
+        ContentPart::FailedToolCall { text, .. } => {
+            output.println_indented_styled("error", &format!("[failed tool call]\n{text}"))
+        }
         ContentPart::Image {
             media_type, data, ..
         } => {

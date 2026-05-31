@@ -69,10 +69,7 @@ pub fn register(context: &mut TauContext) -> Result<(), ToolRegistrationError> {
 fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {
     let input: FindFilesInput = serde_json::from_value(input)
         .map_err(|error| ToolCallError::InvalidInput(error.to_string()))?;
-    let output = find_files(input);
-    let value = serde_json::to_value(output)
-        .map_err(|error| ToolCallError::OutputSerializationFailed(error.to_string()))?;
-    Ok(ToolOutput::json(value))
+    Ok(find_files(input).into_tool_output())
 }
 
 pub fn find_files(input: FindFilesInput) -> FindFilesOutput {
@@ -164,6 +161,33 @@ fn walk_directory(
             && regex.is_match(entry.file_name().to_string_lossy().as_ref())
         {
             matches.push(entry.into_path());
+        }
+    }
+}
+
+impl FindFilesOutput {
+    fn into_tool_output(self) -> ToolOutput {
+        let mut lines: Vec<String> = self
+            .matches
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        lines.extend(
+            self.errors
+                .iter()
+                .map(|error| format!("{}: {}", error.path.display(), error.message)),
+        );
+
+        let text = if lines.is_empty() {
+            "no matches".to_string()
+        } else {
+            lines.join("\n")
+        };
+
+        if self.okay {
+            ToolOutput::text(text)
+        } else {
+            ToolOutput::error(text)
         }
     }
 }

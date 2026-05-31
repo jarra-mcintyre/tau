@@ -15,6 +15,7 @@ pub fn assistant_content_as_text(part: &ContentPart) -> String {
         ContentPart::Json { value, .. } => value.to_string(),
         ContentPart::Thinking { text, .. } => format!("[thinking: {text}]"),
         ContentPart::Refusal { text, .. } => text.clone(),
+        ContentPart::FailedToolCall { text, .. } => text.clone(),
         ContentPart::Image {
             media_type, data, ..
         }
@@ -66,6 +67,9 @@ fn tool_result_part_json(part: &ContentPart) -> Result<Value, ProviderError> {
         ContentPart::Json { value, .. } => value.clone(),
         ContentPart::Thinking { text, .. } => json!({ "type": "thinking", "text": text }),
         ContentPart::Refusal { text, .. } => json!({ "type": "refusal", "text": text }),
+        ContentPart::FailedToolCall { text, .. } => {
+            json!({ "type": "failed_tool_call", "text": text })
+        }
         ContentPart::Image {
             media_type, data, ..
         } => json!({
