@@ -1,4 +1,4 @@
-use std::{fs, io, path::PathBuf};
+use std::{fs, path::PathBuf};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -20,28 +20,6 @@ pub struct WriteFileInput {
     pub contents: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-pub struct WriteFileOutput {
-    pub okay: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<WriteFileError>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-pub struct WriteFileError {
-    pub kind: WriteFileErrorKind,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum WriteFileErrorKind {
-    NotFound,
-    PermissionDenied,
-    InvalidInput,
-    Other,
-}
-
 pub fn register(context: &mut TauContext) -> Result<(), ToolRegistrationError> {
     context.register_tool(ToolDefinition::new::<WriteFileInput>(
         NAME,
@@ -54,54 +32,26 @@ pub fn register(context: &mut TauContext) -> Result<(), ToolRegistrationError> {
 fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {
     let input: WriteFileInput = serde_json::from_value(input)
         .map_err(|error| ToolCallError::InvalidInput(error.to_string()))?;
-    Ok(write_file(input).into_tool_output())
+    Result::Ok(write_file(input))
 }
 
-pub fn write_file(input: WriteFileInput) -> WriteFileOutput {
+fn write_file(input: WriteFileInput) -> ToolOutput {
     match fs::write(&input.path, input.contents) {
-        Ok(()) => WriteFileOutput {
-            okay: true,
-            error: None,
-        },
-        Err(error) => WriteFileOutput {
-            okay: false,
-            error: Some(WriteFileError::from_io_error(error)),
-        },
-    }
-}
-
-impl WriteFileOutput {
-    fn into_tool_output(self) -> ToolOutput {
-        match self.error {
-            None => ToolOutput::text("written"),
-            Some(error) => ToolOutput::error(error.message),
-        }
-    }
-}
-
-impl WriteFileError {
-    fn from_io_error(error: io::Error) -> Self {
-        Self {
-            kind: WriteFileErrorKind::from_io_error_kind(error.kind()),
-            message: error.to_string(),
-        }
-    }
-}
-
-impl WriteFileErrorKind {
-    fn from_io_error_kind(kind: io::ErrorKind) -> Self {
-        match kind {
-            io::ErrorKind::NotFound => Self::NotFound,
-            io::ErrorKind::PermissionDenied => Self::PermissionDenied,
-            io::ErrorKind::InvalidInput => Self::InvalidInput,
-            _ => Self::Other,
-        }
+        Ok(()) => ToolOutput::text(format!("Wrote {}", input.path.display())),
+        Err(err) => ToolOutput::text(format!(
+            "Error {} when writing file {}",
+            err,
+            input.path.display()
+        )),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::context::ContentPart;
+
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn creates_file() {
@@ -113,8 +63,8 @@ mod tests {
             contents: "hello tau".to_string(),
         });
 
-        assert!(output.okay);
-        assert_eq!(output.error, None);
+        assert_eq!(1, output.content.len());
+        assert_matches!(&output.content[0], ContentPart::Text{text,..} if text.contains("Wrote"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello tau");
 
         fs::remove_file(path).unwrap();
@@ -130,8 +80,8 @@ mod tests {
             contents: "new contents".to_string(),
         });
 
-        assert!(output.okay);
-        assert_eq!(output.error, None);
+        assert_eq!(1, output.content.len());
+        assert_matches!(&output.content[0], ContentPart::Text{text,..} if text.contains("Wrote"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "new contents");
 
         fs::remove_file(path).unwrap();
@@ -151,8 +101,13 @@ mod tests {
             contents: "hello tau".to_string(),
         });
 
-        assert!(!output.okay);
-        assert_eq!(output.error.unwrap().kind, WriteFileErrorKind::NotFound);
+        assert_eq!(1, output.content.len());
+        if let ContentPart::Text { text, .. } = &output.content[0] {
+            println!("Got message: '{}'", text);
+            assert!(text.contains("Error"));
+        } else {
+            panic!("Expected text content");
+        }
     }
 
     fn temp_path(name: &str) -> PathBuf {

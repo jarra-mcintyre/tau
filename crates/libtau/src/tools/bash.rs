@@ -7,12 +7,10 @@
 //! - If the command returns an error code this is appended on the end as "(return code was -1)" or similar
 //! - If the command does not output anything at all then the string "(Completed with no output)" is returned
 //! - Large outputs are never read into memory.
-//! 
+//!
 //! Future work:
 //! - Currently this supports the bash shell. In the future I expect to rename this to the "shell" tool and support other shells
 //! - Currently just does UTF8 encoding
-
-
 
 use std::{
     fs::File,
