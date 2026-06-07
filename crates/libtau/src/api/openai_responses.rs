@@ -5,19 +5,18 @@ use std::{
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     api::{
         ModelApi, ModelApiFactory, ProviderError, TokenUsage,
         common::{
-            assistant_content_as_text, binary_content_as_text, json_as_text, media_to_url,
-            tool_result_json,
+            assistant_content_as_text, binary_content_as_text, media_to_url, tool_result_json,
         },
     },
     context::{
-        ContentPart, ConversationItem, ResponsePart, ResponseStop, ResponseStopReason, TauResponse,
-        TauSession, ToolResult, ToolUse,
+        ContentPart, ConversationItem, ResponsePart, ResponseStop, ResponseStopReason,
+        ServerToolUse, TauResponse, TauSession, ToolResult, ToolUse,
     },
     providers::{ProviderConfig, ThinkingEffort},
 };
@@ -517,8 +516,23 @@ fn parse_response(response: OpenAiResponse) -> Result<TauResponse, ProviderError
                     content: content_part.clone(),
                 });
             }
+            Some("web_search_call") => {
+                parts.push(ResponsePart::ServerToolUse {
+                    call: ServerToolUse {
+                        id: item
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string),
+                        name: "web_search".to_string(),
+                        input: item
+                            .get("action")
+                            .map_or_else(|| json!("[unspecified]"), Value::clone),
+                        metadata: None,
+                    },
+                });
+            }
             _ => {
-                let content_part = ContentPart::json(item.clone());
+                let content_part = ContentPart::text(item.to_string());
                 parts.push(ResponsePart::Content {
                     content: content_part.clone(),
                 });
@@ -623,9 +637,8 @@ fn parse_message_output_item(
                 });
             }
             _ => {
-                let content_part = ContentPart::json(part.clone());
                 parts_out.push(ResponsePart::Content {
-                    content: content_part,
+                    content: ContentPart::unknown(&part),
                 });
             }
         }
@@ -669,9 +682,6 @@ fn input_content_parts(parts: &[ContentPart]) -> Result<Vec<OpenAiContent>, Prov
         .iter()
         .map(|part| match part {
             ContentPart::Text { text, .. } => Ok(OpenAiContent::InputText { text: text.clone() }),
-            ContentPart::Json { value, .. } => Ok(OpenAiContent::InputText {
-                text: json_as_text(value)?,
-            }),
             ContentPart::Image {
                 media_type, data, ..
             } => Ok(OpenAiContent::InputImage {
@@ -789,7 +799,7 @@ mod tests {
             results: vec![ToolResult {
                 call_id: "call_1".to_string(),
                 name: "echo".to_string(),
-                content: vec![ContentPart::json(json!({"text":"hello"}))],
+                content: vec![ContentPart::text("hello")],
                 error: None,
             }],
         });
@@ -833,7 +843,7 @@ mod tests {
             results: vec![ToolResult {
                 call_id: "call_1".to_string(),
                 name: "echo".to_string(),
-                content: vec![ContentPart::json(json!({"text":"hello"}))],
+                content: vec![ContentPart::text("hello")],
                 error: None,
             }],
         });
@@ -940,7 +950,7 @@ mod tests {
         let parsed = parse_response(response).unwrap();
 
         let content = parsed.content();
-        assert_eq!(content.len(), 3);
+        assert_eq!(content.len(), 2);
         match &content[0] {
             ContentPart::Text { text, metadata } => {
                 assert_eq!(text, "I'll check.");
@@ -957,13 +967,13 @@ mod tests {
             }
             other => panic!("expected thinking content, got {other:?}"),
         }
-        match &content[2] {
-            ContentPart::Json { value, metadata } => {
-                assert_eq!(value["type"], "web_search_call");
-                assert!(metadata.is_none());
-            }
-            other => panic!("expected json content, got {other:?}"),
-        }
+        assert!(matches!(
+            &parsed.parts[4],
+            ResponsePart::ServerToolUse { call }
+                if call.id.as_deref() == Some("ws_1")
+                    && call.name == "web_search"
+                    && call.input == json!({"type": "search", "query": "latest news about AI"})
+        ));
         let tool_calls = parsed.tool_calls();
         assert_eq!(tool_calls.len(), 2);
         assert_eq!(tool_calls[0].id, "call_a");

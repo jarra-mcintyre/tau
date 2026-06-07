@@ -60,7 +60,7 @@ impl ToolOutput {
     // FIXME: DELETE THIS FUNCTION
     pub fn json(value: Value) -> Self {
         Self {
-            content: vec![ContentPart::json(value)],
+            content: vec![ContentPart::text(value.to_string())],
         }
     }
 

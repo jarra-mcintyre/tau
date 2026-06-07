@@ -65,11 +65,6 @@ pub enum ContentPart {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<Value>,
     },
-    Json {
-        value: Value,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        metadata: Option<Value>,
-    },
     Image {
         media_type: String,
         data: MediaData,
@@ -132,6 +127,7 @@ pub enum ResponsePart {
     Content { content: ContentPart },
     ToolUse { call: ToolUse },
     ServerToolUse { call: ServerToolUse },
+    ServerToolResult { result: ServerToolResult },
     Stop { stop: ResponseStop },
 }
 
@@ -166,6 +162,13 @@ pub struct ServerToolUse {
     pub input: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServerToolResult {
+    pub tool_use_id: Option<String>,
+    pub name: String,
+    pub content: Vec<ContentPart>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -218,14 +221,6 @@ impl TauContext {
             .ok_or_else(|| ToolCallError::UnknownTool(name.to_string()))?;
 
         (tool.callback)(input)
-    }
-
-    pub fn call_tool_json(&self, name: &str, input: Value) -> Result<Value, ToolCallError> {
-        match self.call_tool(name, input)?.content.as_slice() {
-            [ContentPart::Json { value, .. }] => Ok(value.clone()),
-            other => serde_json::to_value(other)
-                .map_err(|error| ToolCallError::OutputSerializationFailed(error.to_string())),
-        }
     }
 
     pub fn call_tools_parallel(&self, calls: &[ToolUse]) -> Vec<ToolResult> {
@@ -495,7 +490,7 @@ impl TauSession {
             match part {
                 ResponsePart::Content { content: part } => content.push(part.clone()),
                 ResponsePart::ToolUse { call } => tool_calls.push(call.clone()),
-                ResponsePart::ServerToolUse { .. } => {}
+                ResponsePart::ServerToolUse { .. } | ResponsePart::ServerToolResult { .. } => {}
                 ResponsePart::Stop { stop } => stops.push(stop.clone()),
             }
         }
@@ -535,31 +530,15 @@ impl TauResponse {
 }
 
 impl ContentPart {
+    /// Used to call out unknown/unsupported content types in fallback branches
+    pub fn unknown(value: &Value) -> Self {
+        Self::text(format!("[Unknown content]: {}", value))
+    }
+
     pub fn text(text: impl Into<String>) -> Self {
         Self::Text {
             text: text.into(),
             metadata: None,
-        }
-    }
-
-    pub fn text_with_metadata(text: impl Into<String>, metadata: Value) -> Self {
-        Self::Text {
-            text: text.into(),
-            metadata: Some(metadata),
-        }
-    }
-
-    pub fn json(value: Value) -> Self {
-        Self::Json {
-            value,
-            metadata: None,
-        }
-    }
-
-    pub fn json_with_metadata(value: Value, metadata: Value) -> Self {
-        Self::Json {
-            value,
-            metadata: Some(metadata),
         }
     }
 
@@ -568,25 +547,6 @@ impl ContentPart {
             text: text.into(),
             signature: None,
             metadata: None,
-        }
-    }
-
-    pub fn thinking_with_metadata(
-        text: impl Into<String>,
-        signature: Option<String>,
-        metadata: Value,
-    ) -> Self {
-        Self::Thinking {
-            text: text.into(),
-            signature,
-            metadata: Some(metadata),
-        }
-    }
-
-    pub fn refusal_with_metadata(text: impl Into<String>, metadata: Value) -> Self {
-        Self::Refusal {
-            text: text.into(),
-            metadata: Some(metadata),
         }
     }
 }
@@ -740,7 +700,9 @@ mod tests {
         assert_eq!(session.conversation().items.len(), 3);
         assert_eq!(
             results[0].content,
-            vec![ContentPart::json(serde_json::json!({ "ok": true }))]
+            vec![ContentPart::text(
+                serde_json::json!({ "ok": true }).to_string()
+            )]
         );
     }
 }

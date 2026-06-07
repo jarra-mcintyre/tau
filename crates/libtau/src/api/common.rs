@@ -5,14 +5,9 @@ use crate::{
     context::{ContentPart, MediaData, ToolResult},
 };
 
-pub fn json_as_text(value: &Value) -> Result<String, ProviderError> {
-    Ok(serde_json::to_string(value)?)
-}
-
 pub fn assistant_content_as_text(part: &ContentPart) -> String {
     match part {
         ContentPart::Text { text, .. } => text.clone(),
-        ContentPart::Json { value, .. } => value.to_string(),
         ContentPart::Thinking { text, .. } => format!("[thinking: {text}]"),
         ContentPart::Refusal { text, .. } => text.clone(),
         ContentPart::FailedToolCall { text, .. } => text.clone(),
@@ -64,7 +59,6 @@ pub fn tool_result_json(result: &ToolResult) -> Result<String, ProviderError> {
 fn tool_result_part_json(part: &ContentPart) -> Result<Value, ProviderError> {
     Ok(match part {
         ContentPart::Text { text, .. } => json!({ "type": "text", "text": text }),
-        ContentPart::Json { value, .. } => value.clone(),
         ContentPart::Thinking { text, .. } => json!({ "type": "thinking", "text": text }),
         ContentPart::Refusal { text, .. } => json!({ "type": "refusal", "text": text }),
         ContentPart::FailedToolCall { text, .. } => {

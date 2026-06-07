@@ -6,7 +6,7 @@ use std::{
 };
 
 use libtau::{
-    context::{ContentPart, ResponsePart, TauSession, ToolResult, ToolUse},
+    context::{ContentPart, ResponsePart, ServerToolResult, TauSession, ToolResult, ToolUse},
     providers::TokenUsage,
     tools,
 };
@@ -270,7 +270,10 @@ async fn run_turn(
                 ResponsePart::Content { content } => print_content(&content, output),
                 ResponsePart::ToolUse { call } => tool_calls.push(call),
                 ResponsePart::ServerToolUse { call } => {
-                    output.println_indented_styled("tool", &format!("[server tool] {}", call.name));
+                    output.println_indented_styled("tool", &format_server_tool_use(&call));
+                }
+                ResponsePart::ServerToolResult { result } => {
+                    print_server_tool_result(&result, output)
                 }
                 ResponsePart::Stop { .. } => {}
             }
@@ -396,7 +399,6 @@ fn format_optional_u64(value: Option<u64>) -> String {
 fn print_content(content: &ContentPart, output: &OutputStyle) {
     match content {
         ContentPart::Text { text, .. } => output.println_styled("agent", text),
-        ContentPart::Json { value, .. } => output.println_styled("agent", &pretty_json(value)),
         ContentPart::Thinking { text, .. } => {
             output.println_indented_styled("muted", &format!("[thinking]\n{text}"))
         }
@@ -423,8 +425,23 @@ fn compact_json(value: &serde_json::Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "<invalid json>".to_string())
 }
 
-fn pretty_json(value: &serde_json::Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+fn print_server_tool_result(result: &ServerToolResult, output: &OutputStyle) {
+    for content in &result.content {
+        match content {
+            ContentPart::Text { text, .. } => output.println_indented_styled("tool", text),
+            other => print_content(other, output),
+        }
+    }
+}
+
+fn format_server_tool_use(call: &libtau::context::ServerToolUse) -> String {
+    if call.name == "web_search"
+        && let Some(query) = call.input.get("query").and_then(serde_json::Value::as_str)
+    {
+        return format!("[server tool] web_search\nquery: {query}");
+    }
+
+    format!("[server tool] {}", call.name)
 }
 
 fn indent_display_block(text: &str) -> String {

@@ -5,13 +5,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    api::{
-        ModelApi, ModelApiFactory, ProviderError, TokenUsage,
-        common::{binary_content_as_text, json_as_text},
-    },
+    api::{ModelApi, ModelApiFactory, ProviderError, TokenUsage, common::binary_content_as_text},
     context::{
         ContentPart, ConversationItem, MediaData, ResponsePart, ResponseStop, ResponseStopReason,
-        ServerToolUse, TauResponse, TauSession, ToolResult, ToolUse,
+        ServerToolResult, ServerToolUse, TauResponse, TauSession, ToolResult, ToolUse,
     },
     providers::{ModelMetadata, ProviderConfig, ThinkingEffort, anthropic::AnthropicModelConfig},
 };
@@ -676,12 +673,20 @@ fn parse_response(response: AnthropicResponse) -> Result<TauResponse, ProviderEr
                         .unwrap_or("web_search")
                         .to_string(),
                     input: part.get("input").cloned().unwrap_or(Value::Null),
-                    metadata: Some(provider_metadata("anthropic.server_tool_use")),
+                    metadata: None,
                 };
                 parts.push(ResponsePart::ServerToolUse { call });
-                let content_part = ContentPart::json(part.clone());
-                parts.push(ResponsePart::Content {
-                    content: content_part,
+            }
+            Some("web_search_tool_result") => {
+                parts.push(ResponsePart::ServerToolResult {
+                    result: ServerToolResult {
+                        tool_use_id: part
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string),
+                        name: "web_search".to_string(),
+                        content: vec![ContentPart::text(format_web_search_tool_result(&part))],
+                    },
                 });
             }
             Some("thinking") => {
@@ -707,15 +712,13 @@ fn parse_response(response: AnthropicResponse) -> Result<TauResponse, ProviderEr
                 });
             }
             Some("redacted_thinking") => {
-                let content_part = ContentPart::json(part.clone());
                 parts.push(ResponsePart::Content {
-                    content: content_part,
+                    content: ContentPart::text("[Redacted Thinking]"),
                 });
             }
             _ => {
-                let content_part = ContentPart::json(part.clone());
                 parts.push(ResponsePart::Content {
-                    content: content_part,
+                    content: ContentPart::unknown(&part),
                 });
             }
         }
@@ -760,11 +763,44 @@ fn content_block_metadata(block: &Value) -> Option<Value> {
     })
 }
 
-fn provider_metadata(kind: &str) -> Value {
-    serde_json::json!({
-        "provider": crate::providers::anthropic::PROVIDER_NAME,
-        "kind": kind,
-    })
+fn format_web_search_tool_result(block: &Value) -> String {
+    let Some(content) = block.get("content") else {
+        return "[web search results unavailable]".to_string();
+    };
+
+    if content.get("type").and_then(Value::as_str) == Some("web_search_tool_result_error") {
+        let error = content
+            .get("error_code")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        return format!("[web search error]\n{error}");
+    }
+
+    let Some(results) = content.as_array() else {
+        return "[web search results unavailable]".to_string();
+    };
+
+    if results.is_empty() {
+        return "[web search results]\nNo results".to_string();
+    }
+
+    let mut lines = vec!["[web search results]".to_string()];
+    for result in results {
+        let title = result
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("Untitled result");
+        lines.push(format!("- {title}"));
+
+        if let Some(url) = result.get("url").and_then(Value::as_str) {
+            lines.push(format!("  URL: {url}"));
+        }
+        if let Some(page_age) = result.get("page_age").and_then(Value::as_str) {
+            lines.push(format!("  Page age: {page_age}"));
+        }
+    }
+
+    lines.join("\n")
 }
 
 fn input_content_parts(parts: &[ContentPart]) -> Result<Vec<AnthropicContent>, ProviderError> {
@@ -772,9 +808,6 @@ fn input_content_parts(parts: &[ContentPart]) -> Result<Vec<AnthropicContent>, P
         .iter()
         .map(|part| match part {
             ContentPart::Text { text, .. } => Ok(AnthropicContent::Text { text: text.clone() }),
-            ContentPart::Json { value, .. } => Ok(AnthropicContent::Text {
-                text: json_as_text(value)?,
-            }),
             ContentPart::Image {
                 media_type, data, ..
             } => match data {
@@ -815,14 +848,10 @@ fn tool_result_content(result: &ToolResult) -> Result<AnthropicContent, Provider
             result
                 .content
                 .iter()
-                .any(is_failed_tool_call)
+                .any(|part| matches!(part, ContentPart::FailedToolCall { .. }))
                 .then_some(true)
         }),
     })
-}
-
-fn is_failed_tool_call(part: &ContentPart) -> bool {
-    matches!(part, ContentPart::FailedToolCall { .. })
 }
 
 fn anthropic_tool_result_content(
@@ -840,9 +869,6 @@ fn anthropic_tool_result_content(
     if !has_media && result.content.len() == 1 {
         return match &result.content[0] {
             ContentPart::Text { text, .. } => Ok(AnthropicToolResultContent::Text(text.clone())),
-            ContentPart::Json { value, .. } => {
-                Ok(AnthropicToolResultContent::Text(json_as_text(value)?))
-            }
             ContentPart::Thinking { text, .. } => Ok(AnthropicToolResultContent::Text(format!(
                 "[thinking: {text}]"
             ))),
@@ -860,9 +886,6 @@ fn anthropic_tool_result_content(
             ContentPart::Text { text, .. } => {
                 blocks.push(AnthropicToolResultBlock::Text { text: text.clone() })
             }
-            ContentPart::Json { value, .. } => blocks.push(AnthropicToolResultBlock::Text {
-                text: json_as_text(value)?,
-            }),
             ContentPart::Image {
                 media_type, data, ..
             } => match data {
@@ -906,7 +929,7 @@ mod tests {
     use serde_json::json;
 
     fn callback(input: Value) -> Result<ToolOutput, crate::tools::ToolCallError> {
-        Ok(ToolOutput::json(input))
+        Ok(ToolOutput::text(input.to_string()))
     }
 
     fn test_model() -> ModelMetadata {
@@ -969,7 +992,7 @@ mod tests {
             results: vec![ToolResult {
                 call_id: "toolu_1".to_string(),
                 name: "echo".to_string(),
-                content: vec![ContentPart::json(json!({"text":"hello"}))],
+                content: vec![ContentPart::text("hello")],
                 error: None,
             }],
         });
@@ -1231,14 +1254,25 @@ mod tests {
                     "name": "read_file",
                     "input": {"path":"README.md"}
                 }),
-                json!({"type": "server_tool_use", "id": "srv_1", "name": "web_search"}),
+                json!({"type": "server_tool_use", "id": "srv_1", "name": "web_search", "input": {"query": "tau coding agent"}}),
+                json!({
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srv_1",
+                    "content": [{
+                        "type": "web_search_result",
+                        "url": "https://example.com/tau",
+                        "title": "Tau",
+                        "encrypted_content": "hidden",
+                        "page_age": "June 2026"
+                    }]
+                }),
             ],
         };
 
         let parsed = parse_response(response).unwrap();
 
         let content = parsed.content();
-        assert_eq!(content.len(), 3);
+        assert_eq!(content.len(), 2);
         match &content[0] {
             ContentPart::Text { text, metadata } => {
                 assert_eq!(text, "I'll check.");
@@ -1262,18 +1296,31 @@ mod tests {
             }
             other => panic!("expected thinking content, got {other:?}"),
         }
-        match &content[2] {
-            ContentPart::Json { value, metadata } => {
-                assert_eq!(value["type"], "server_tool_use");
-                assert!(metadata.is_none());
-            }
-            other => panic!("expected json content, got {other:?}"),
-        }
         assert!(matches!(
             &parsed.parts[4],
             ResponsePart::ServerToolUse { call }
-                if call.id.as_deref() == Some("srv_1") && call.name == "web_search"
+                if call.id.as_deref() == Some("srv_1")
+                    && call.name == "web_search"
+                    && call.input == json!({"query": "tau coding agent"})
         ));
+        match &parsed.parts[5] {
+            ResponsePart::ServerToolResult { result } => {
+                assert_eq!(result.tool_use_id.as_deref(), Some("srv_1"));
+                assert_eq!(result.name, "web_search");
+                match &result.content[0] {
+                    ContentPart::Text { text, metadata } => {
+                        assert_eq!(
+                            text,
+                            "[web search results]\n- Tau\n  URL: https://example.com/tau\n  Page age: June 2026"
+                        );
+                        assert!(metadata.is_none());
+                        assert!(!text.contains("encrypted_content"));
+                    }
+                    other => panic!("expected web search result text content, got {other:?}"),
+                }
+            }
+            other => panic!("expected server tool result, got {other:?}"),
+        }
         let tool_calls = parsed.tool_calls();
         assert_eq!(tool_calls.len(), 2);
         assert_eq!(tool_calls[0].id, "toolu_a");
