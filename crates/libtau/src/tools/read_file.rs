@@ -111,8 +111,7 @@ fn callback(input: Value) -> Result<ToolOutput, ToolCallError> {
                 )),
                 ContentPart::Image {
                     media_type,
-                    data: MediaData::Base64(data),
-                    metadata: None,
+                    data: MediaData::Base64(data)
                 },
             ],
         }),

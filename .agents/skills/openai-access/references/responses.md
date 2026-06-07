@@ -214,7 +214,28 @@ Response:
 
 Function call results are sent with a `function_call_output` block.
 
+## Annotations/Citations
 
+```json
+{
+  // ... standard fields ...
+  "content": [
+    {
+      "type": "output_text",
+      "text": "On June 7, 2026, alients landed in Antarctica ..",
+      "annotations": [
+        {
+          "type": "url_citation",
+          "start_index": 2606,
+          "end_index": 2758,
+          "url": "https://...",
+          "title": "Title..."
+        }
+      ]
+    }
+  ]
+}
+```
 
 # Response Types
 
@@ -285,6 +306,8 @@ A web_search_call output item with the ID of the search call, along with the act
   "created_by": "somebody" // optional
 }
 ```
+
+Annotations will generally be added to further messages to cite web-search results.
 
 # Compaction
 

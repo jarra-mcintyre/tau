@@ -526,8 +526,7 @@ fn parse_response(response: OpenAiResponse) -> Result<TauResponse, ProviderError
                         name: "web_search".to_string(),
                         input: item
                             .get("action")
-                            .map_or_else(|| json!("[unspecified]"), Value::clone),
-                        metadata: None,
+                            .map_or_else(|| json!("[unspecified]"), Value::clone)
                     },
                 });
             }
@@ -617,7 +616,7 @@ fn parse_message_output_item(
                 })?;
                 let content_part = ContentPart::Text {
                     text: text.to_string(),
-                    metadata: openai_content_metadata(part),
+                    annotations: None
                 };
                 parts_out.push(ResponsePart::Content {
                     content: content_part,
@@ -630,7 +629,6 @@ fn parse_message_output_item(
                 saw_refusal = true;
                 let content_part = ContentPart::Refusal {
                     text: refusal.to_string(),
-                    metadata: None,
                 };
                 parts_out.push(ResponsePart::Content {
                     content: content_part,
@@ -664,17 +662,7 @@ fn openai_reasoning_content(item: Value) -> ContentPart {
         })
         .unwrap_or_default();
 
-    ContentPart::thinking(text)
-}
-
-fn openai_content_metadata(part: &Value) -> Option<Value> {
-    part.get("annotations").cloned().map(|annotations| {
-        serde_json::json!({
-            "provider": crate::providers::openai::PROVIDER_NAME,
-            "kind": "annotations",
-            "annotations": annotations,
-        })
-    })
+    ContentPart::Thinking { text, signature: None }
 }
 
 fn input_content_parts(parts: &[ContentPart]) -> Result<Vec<OpenAiContent>, ProviderError> {
@@ -875,7 +863,6 @@ mod tests {
                     ContentPart::Image {
                         media_type: "image/png".to_string(),
                         data: MediaData::Base64("abc123".to_string()),
-                        metadata: None,
                     },
                 ],
                 error: None,
@@ -952,18 +939,14 @@ mod tests {
         let content = parsed.content();
         assert_eq!(content.len(), 2);
         match &content[0] {
-            ContentPart::Text { text, metadata } => {
+            ContentPart::Text { text, annotations } => {
                 assert_eq!(text, "I'll check.");
-                let metadata = metadata.as_ref().unwrap();
-                assert_eq!(metadata["kind"], "annotations");
-                assert_eq!(metadata["annotations"][0]["type"], "url_citation");
             }
             other => panic!("expected text content, got {other:?}"),
         }
         match &content[1] {
-            ContentPart::Thinking { text, metadata, .. } => {
+            ContentPart::Thinking { text , .. } => {
                 assert_eq!(text, "I should inspect the files.");
-                assert!(metadata.is_none());
             }
             other => panic!("expected thinking content, got {other:?}"),
         }

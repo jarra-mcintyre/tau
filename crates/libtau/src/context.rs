@@ -58,42 +58,48 @@ pub enum ConversationItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Citation {
+    url: String,
+    title: Option<String>,
+    /// cited text (this is primarily an Anthropic API field)
+    citation: Option<String>,
+    /// index of the start of the citation in the message text (this is primarily an OpenAI API field)
+    start_index: Option<u32>,
+    /// index of the end of the citation in the message text (this is primarily an OpenAI API field)
+    end_index: Option<u32>
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum Annotation {
+    Citation(Citation)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
     Text {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        metadata: Option<Value>,
+        annotations: Option<Vec<Annotation>>
     },
     Image {
         media_type: String,
-        data: MediaData,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        metadata: Option<Value>,
+        data: MediaData
     },
     Binary {
         media_type: String,
         data: MediaData,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        metadata: Option<Value>,
     },
     Thinking {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        metadata: Option<Value>,
     },
     Refusal {
         text: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        metadata: Option<Value>,
     },
-    // This is a text type
     FailedToolCall {
         text: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        metadata: Option<Value>,
     },
 }
 
@@ -160,8 +166,6 @@ pub struct ServerToolUse {
     pub id: Option<String>,
     pub name: String,
     pub input: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -538,15 +542,7 @@ impl ContentPart {
     pub fn text(text: impl Into<String>) -> Self {
         Self::Text {
             text: text.into(),
-            metadata: None,
-        }
-    }
-
-    pub fn thinking(text: impl Into<String>) -> Self {
-        Self::Thinking {
-            text: text.into(),
-            signature: None,
-            metadata: None,
+            annotations: None
         }
     }
 }

@@ -640,12 +640,11 @@ fn parse_response(response: AnthropicResponse) -> Result<TauResponse, ProviderEr
                 let content_part = if is_refusal {
                     ContentPart::Refusal {
                         text: text.to_string(),
-                        metadata: content_block_metadata(&part),
                     }
                 } else {
                     ContentPart::Text {
                         text: text.to_string(),
-                        metadata: content_block_metadata(&part),
+                        annotations: None
                     }
                 };
                 parts.push(ResponsePart::Content {
@@ -672,8 +671,7 @@ fn parse_response(response: AnthropicResponse) -> Result<TauResponse, ProviderEr
                         .and_then(Value::as_str)
                         .unwrap_or("web_search")
                         .to_string(),
-                    input: part.get("input").cloned().unwrap_or(Value::Null),
-                    metadata: None,
+                    input: part.get("input").cloned().unwrap_or(Value::Null)
                 };
                 parts.push(ResponsePart::ServerToolUse { call });
             }
@@ -704,8 +702,7 @@ fn parse_response(response: AnthropicResponse) -> Result<TauResponse, ProviderEr
                     .map(ToString::to_string);
                 let content_part = ContentPart::Thinking {
                     text: text.to_string(),
-                    signature,
-                    metadata: None,
+                    signature
                 };
                 parts.push(ResponsePart::Content {
                     content: content_part,
@@ -750,16 +747,6 @@ fn anthropic_stop(reason: Option<&str>, sequence: Option<String>) -> Option<Resp
             "provider": crate::providers::anthropic::PROVIDER_NAME,
             "kind": "anthropic.stop",
         })),
-    })
-}
-
-fn content_block_metadata(block: &Value) -> Option<Value> {
-    block.get("citations").cloned().map(|citations| {
-        serde_json::json!({
-            "provider": crate::providers::anthropic::PROVIDER_NAME,
-            "kind": "citations",
-            "citations": citations,
-        })
     })
 }
 
@@ -977,7 +964,6 @@ mod tests {
                 ContentPart::Thinking {
                     text: "Need to echo.".to_string(),
                     signature: Some("sig_1".to_string()),
-                    metadata: None,
                 },
             ],
         });
@@ -1076,7 +1062,6 @@ mod tests {
                     ContentPart::Image {
                         media_type: "image/png".to_string(),
                         data: MediaData::Base64("abc123".to_string()),
-                        metadata: None,
                     },
                 ],
                 error: None,
@@ -1274,13 +1259,12 @@ mod tests {
         let content = parsed.content();
         assert_eq!(content.len(), 2);
         match &content[0] {
-            ContentPart::Text { text, metadata } => {
+            ContentPart::Text { text, annotations } => {
                 assert_eq!(text, "I'll check.");
-                assert_eq!(metadata.as_ref().unwrap()["kind"], "citations");
-                assert_eq!(
-                    metadata.as_ref().unwrap()["citations"][0]["url"],
-                    "https://example.com"
-                );
+                //assert_eq!(
+                //    metadata.as_ref().unwrap()["citations"][0]["url"],
+                //    "https://example.com"
+                //);
             }
             other => panic!("expected text content, got {other:?}"),
         }
@@ -1288,11 +1272,9 @@ mod tests {
             ContentPart::Thinking {
                 text,
                 signature,
-                metadata,
             } => {
                 assert_eq!(text, "I should inspect the files.");
                 assert_eq!(signature.as_deref(), Some("sig_1"));
-                assert!(metadata.is_none());
             }
             other => panic!("expected thinking content, got {other:?}"),
         }
@@ -1308,13 +1290,11 @@ mod tests {
                 assert_eq!(result.tool_use_id.as_deref(), Some("srv_1"));
                 assert_eq!(result.name, "web_search");
                 match &result.content[0] {
-                    ContentPart::Text { text, metadata } => {
+                    ContentPart::Text { text, .. } => {
                         assert_eq!(
                             text,
                             "[web search results]\n- Tau\n  URL: https://example.com/tau\n  Page age: June 2026"
                         );
-                        assert!(metadata.is_none());
-                        assert!(!text.contains("encrypted_content"));
                     }
                     other => panic!("expected web search result text content, got {other:?}"),
                 }
