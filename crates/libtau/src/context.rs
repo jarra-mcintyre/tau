@@ -66,12 +66,12 @@ pub struct Citation {
     /// index of the start of the citation in the message text (this is primarily an OpenAI API field)
     start_index: Option<u32>,
     /// index of the end of the citation in the message text (this is primarily an OpenAI API field)
-    end_index: Option<u32>
+    end_index: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum Annotation {
-    Citation(Citation)
+    Citation(Citation),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -80,11 +80,11 @@ pub enum ContentPart {
     Text {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        annotations: Option<Vec<Annotation>>
+        annotations: Option<Vec<Annotation>>,
     },
     Image {
         media_type: String,
-        data: MediaData
+        data: MediaData,
     },
     Binary {
         media_type: String,
@@ -542,7 +542,7 @@ impl ContentPart {
     pub fn text(text: impl Into<String>) -> Self {
         Self::Text {
             text: text.into(),
-            annotations: None
+            annotations: None,
         }
     }
 }

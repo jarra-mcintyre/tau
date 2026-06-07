@@ -644,7 +644,7 @@ fn parse_response(response: AnthropicResponse) -> Result<TauResponse, ProviderEr
                 } else {
                     ContentPart::Text {
                         text: text.to_string(),
-                        annotations: None
+                        annotations: None,
                     }
                 };
                 parts.push(ResponsePart::Content {
@@ -671,7 +671,7 @@ fn parse_response(response: AnthropicResponse) -> Result<TauResponse, ProviderEr
                         .and_then(Value::as_str)
                         .unwrap_or("web_search")
                         .to_string(),
-                    input: part.get("input").cloned().unwrap_or(Value::Null)
+                    input: part.get("input").cloned().unwrap_or(Value::Null),
                 };
                 parts.push(ResponsePart::ServerToolUse { call });
             }
@@ -702,7 +702,7 @@ fn parse_response(response: AnthropicResponse) -> Result<TauResponse, ProviderEr
                     .map(ToString::to_string);
                 let content_part = ContentPart::Thinking {
                     text: text.to_string(),
-                    signature
+                    signature,
                 };
                 parts.push(ResponsePart::Content {
                     content: content_part,
@@ -1269,10 +1269,7 @@ mod tests {
             other => panic!("expected text content, got {other:?}"),
         }
         match &content[1] {
-            ContentPart::Thinking {
-                text,
-                signature,
-            } => {
+            ContentPart::Thinking { text, signature } => {
                 assert_eq!(text, "I should inspect the files.");
                 assert_eq!(signature.as_deref(), Some("sig_1"));
             }

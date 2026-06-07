@@ -15,8 +15,8 @@ use crate::{
         },
     },
     context::{
-        ContentPart, ConversationItem, ResponsePart, ResponseStop, ResponseStopReason,
-        ServerToolUse, TauResponse, TauSession, ToolResult, ToolUse,
+        Annotation, Citation, ContentPart, ConversationItem, ResponsePart, ResponseStop,
+        ResponseStopReason, ServerToolUse, TauResponse, TauSession, ToolResult, ToolUse,
     },
     providers::{ProviderConfig, ThinkingEffort},
 };
@@ -526,7 +526,7 @@ fn parse_response(response: OpenAiResponse) -> Result<TauResponse, ProviderError
                         name: "web_search".to_string(),
                         input: item
                             .get("action")
-                            .map_or_else(|| json!("[unspecified]"), Value::clone)
+                            .map_or_else(|| json!("[unspecified]"), Value::clone),
                     },
                 });
             }
@@ -616,7 +616,7 @@ fn parse_message_output_item(
                 })?;
                 let content_part = ContentPart::Text {
                     text: text.to_string(),
-                    annotations: None
+                    annotations: openai_text_annotations(part)?,
                 };
                 parts_out.push(ResponsePart::Content {
                     content: content_part,
@@ -645,6 +645,24 @@ fn parse_message_output_item(
     Ok(saw_refusal)
 }
 
+fn openai_text_annotations(part: &Value) -> Result<Option<Vec<Annotation>>, ProviderError> {
+    let Some(annotations) = part.get("annotations").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+
+    let citations = annotations
+        .iter()
+        .filter(|annotation| annotation.get("type").and_then(Value::as_str) == Some("url_citation"))
+        .map(|annotation| {
+            serde_json::from_value::<Citation>(annotation.clone())
+                .map(Annotation::Citation)
+                .map_err(ProviderError::from)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok((!citations.is_empty()).then_some(citations))
+}
+
 fn openai_reasoning_content(item: Value) -> ContentPart {
     let text = item
         .get("summary")
@@ -662,7 +680,10 @@ fn openai_reasoning_content(item: Value) -> ContentPart {
         })
         .unwrap_or_default();
 
-    ContentPart::Thinking { text, signature: None }
+    ContentPart::Thinking {
+        text,
+        signature: None,
+    }
 }
 
 fn input_content_parts(parts: &[ContentPart]) -> Result<Vec<OpenAiContent>, ProviderError> {
@@ -941,11 +962,25 @@ mod tests {
         match &content[0] {
             ContentPart::Text { text, annotations } => {
                 assert_eq!(text, "I'll check.");
+                let annotations = annotations.as_ref().unwrap();
+                assert_eq!(annotations.len(), 1);
+                match &annotations[0] {
+                    Annotation::Citation(citation) => assert_eq!(
+                        serde_json::to_value(citation).unwrap(),
+                        json!({
+                            "url": "https://example.com",
+                            "title": "Example",
+                            "citation": null,
+                            "start_index": 0,
+                            "end_index": 5
+                        })
+                    ),
+                }
             }
             other => panic!("expected text content, got {other:?}"),
         }
         match &content[1] {
-            ContentPart::Thinking { text , .. } => {
+            ContentPart::Thinking { text, .. } => {
                 assert_eq!(text, "I should inspect the files.");
             }
             other => panic!("expected thinking content, got {other:?}"),

@@ -72,9 +72,7 @@ impl ToolOutput {
 
     pub fn error(text: impl Into<String>) -> Self {
         Self {
-            content: vec![ContentPart::FailedToolCall {
-                text: text.into()
-            }],
+            content: vec![ContentPart::FailedToolCall { text: text.into() }],
         }
     }
 }
