@@ -23,71 +23,65 @@ pub struct Modifiers {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    Message {
-        contents: Option<String>,
-    },
-    MessageAdd {
-        contents: Option<String>,
-    },
-    MessageInclude {
-        paths: Vec<PathBuf>,
-    },
-    MessagePaste,
-    MessageReference {
-        paths: Vec<PathBuf>,
-    },
-    MessageSend,
-    MessageEcho,
-    MessageClear,
-    MessageUndo {
-        offset: isize,
-    },
-
+    Message(MessageCommand),
     Status,
-    Conversation {
+    Conversation(ConversationCommand),
+    Provider(ProviderCommand),
+    Query { query: String },
+    Prompt { prompt: String },
+    File { path: PathBuf },
+    Version,
+    Help { question: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageCommand {
+    Message { contents: Option<String> },
+    Add { contents: Option<String> },
+    Include { paths: Vec<PathBuf> },
+    Paste,
+    Reference { paths: Vec<PathBuf> },
+    Send,
+    Echo,
+    Clear,
+    Undo { offset: isize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConversationCommand {
+    Create {
         alias: Option<String>,
     },
-    ConversationAlias {
+    Alias {
         alias: String,
     },
-    ConversationHistory,
-    ConversationCompact,
-    ConversationFork {
+    History,
+    Compact,
+    Fork {
         offset: Option<isize>,
         alias: Option<String>,
     },
-    ConversationSwitch {
+    Switch {
         alias: String,
     },
-    ConversationList,
-    ConversationDelete {
+    List,
+    Delete {
         alias: String,
     },
+}
 
-    Provider {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderCommand {
+    Select {
         model: String,
     },
-    ProviderThinking {
+    Thinking {
         level: ThinkingLevel,
     },
-    ProviderConfig {
+    Config {
         provider: Option<ConfigurableProvider>,
     },
-    ProviderList,
-
-    Query {
-        query: String,
-    },
-    Prompt {
-        prompt: String,
-    },
-    File {
-        path: PathBuf,
-    },
-    Version,
-    Help {
-        question: Option<String>,
-    },
+    List,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -388,33 +382,38 @@ impl Command {
         match self {
             Command::Status => AllowedModifiers::NONE,
 
-            Command::Message { .. }
-            | Command::MessageAdd { .. }
-            | Command::MessageInclude { .. }
-            | Command::MessagePaste
-            | Command::MessageReference { .. }
-            | Command::MessageSend
-            | Command::MessageEcho => AllowedModifiers::NONE.conversation(),
+            Command::Message(command) => match command {
+                MessageCommand::Message { .. }
+                | MessageCommand::Add { .. }
+                | MessageCommand::Include { .. }
+                | MessageCommand::Paste
+                | MessageCommand::Reference { .. }
+                | MessageCommand::Send
+                | MessageCommand::Echo => AllowedModifiers::NONE.conversation(),
+                MessageCommand::Clear | MessageCommand::Undo { .. } => {
+                    AllowedModifiers::NONE.conversation().yes()
+                }
+            },
 
-            Command::MessageClear | Command::MessageUndo { .. } => {
-                AllowedModifiers::NONE.conversation().yes()
-            }
+            Command::Conversation(command) => match command {
+                ConversationCommand::Create { .. } => AllowedModifiers::NONE.alias().read_only(),
+                ConversationCommand::Alias { .. } => AllowedModifiers::NONE,
+                ConversationCommand::History => AllowedModifiers::NONE.json(),
+                ConversationCommand::Compact => AllowedModifiers::NONE.yes(),
+                ConversationCommand::Fork { .. } => {
+                    AllowedModifiers::NONE.alias().read_only().writes_allowed()
+                }
+                ConversationCommand::Switch { .. } => AllowedModifiers::NONE,
+                ConversationCommand::List => AllowedModifiers::NONE.json(),
+                ConversationCommand::Delete { .. } => AllowedModifiers::NONE.yes(),
+            },
 
-            Command::Conversation { .. } => AllowedModifiers::NONE.alias().read_only(),
-            Command::ConversationAlias { .. } => AllowedModifiers::NONE,
-            Command::ConversationHistory => AllowedModifiers::NONE.json(),
-            Command::ConversationCompact => AllowedModifiers::NONE.yes(),
-            Command::ConversationFork { .. } => {
-                AllowedModifiers::NONE.alias().read_only().writes_allowed()
-            }
-            Command::ConversationSwitch { .. } => AllowedModifiers::NONE,
-            Command::ConversationList => AllowedModifiers::NONE.json(),
-            Command::ConversationDelete { .. } => AllowedModifiers::NONE.yes(),
-
-            Command::Provider { .. } => AllowedModifiers::NONE.yes(),
-            Command::ProviderThinking { .. } => AllowedModifiers::NONE,
-            Command::ProviderConfig { .. } => AllowedModifiers::NONE,
-            Command::ProviderList => AllowedModifiers::NONE.json(),
+            Command::Provider(command) => match command {
+                ProviderCommand::Select { .. } => AllowedModifiers::NONE.yes(),
+                ProviderCommand::Thinking { .. } => AllowedModifiers::NONE,
+                ProviderCommand::Config { .. } => AllowedModifiers::NONE,
+                ProviderCommand::List => AllowedModifiers::NONE.json(),
+            },
 
             Command::Query { .. } => AllowedModifiers::NONE.model(),
             Command::Prompt { .. } | Command::File { .. } => {
@@ -464,38 +463,54 @@ fn unsupported_modifier(modifier: &str, _command: &Command) -> clap::Error {
 
 fn command_from_raw(command: RawCommand, alias_modifier: Option<String>) -> Command {
     match command {
-        RawCommand::Message { contents } => Command::Message {
+        RawCommand::Message { contents } => Command::Message(MessageCommand::Message {
             contents: join_optional(contents),
-        },
-        RawCommand::MessageAdd { contents } => Command::MessageAdd {
+        }),
+        RawCommand::MessageAdd { contents } => Command::Message(MessageCommand::Add {
             contents: join_optional(contents),
-        },
-        RawCommand::MessageInclude { paths } => Command::MessageInclude { paths },
-        RawCommand::MessagePaste => Command::MessagePaste,
-        RawCommand::MessageReference { paths } => Command::MessageReference { paths },
-        RawCommand::MessageSend => Command::MessageSend,
-        RawCommand::MessageEcho => Command::MessageEcho,
-        RawCommand::MessageClear => Command::MessageClear,
-        RawCommand::MessageUndo { offset } => Command::MessageUndo {
+        }),
+        RawCommand::MessageInclude { paths } => Command::Message(MessageCommand::Include { paths }),
+        RawCommand::MessagePaste => Command::Message(MessageCommand::Paste),
+        RawCommand::MessageReference { paths } => {
+            Command::Message(MessageCommand::Reference { paths })
+        }
+        RawCommand::MessageSend => Command::Message(MessageCommand::Send),
+        RawCommand::MessageEcho => Command::Message(MessageCommand::Echo),
+        RawCommand::MessageClear => Command::Message(MessageCommand::Clear),
+        RawCommand::MessageUndo { offset } => Command::Message(MessageCommand::Undo {
             offset: offset.unwrap_or(-1),
-        },
-        RawCommand::Conversation => Command::Conversation {
+        }),
+        RawCommand::Conversation => Command::Conversation(ConversationCommand::Create {
             alias: alias_modifier,
-        },
-        RawCommand::ConversationAlias { alias } => Command::ConversationAlias { alias },
-        RawCommand::ConversationHistory => Command::ConversationHistory,
-        RawCommand::ConversationCompact => Command::ConversationCompact,
-        RawCommand::ConversationFork { offset } => Command::ConversationFork {
-            offset,
-            alias: alias_modifier,
-        },
-        RawCommand::ConversationSwitch { alias } => Command::ConversationSwitch { alias },
-        RawCommand::ConversationList => Command::ConversationList,
-        RawCommand::ConversationDelete { alias } => Command::ConversationDelete { alias },
-        RawCommand::Provider { model_ref } => Command::Provider { model: model_ref },
-        RawCommand::ProviderThinking { level } => Command::ProviderThinking { level },
-        RawCommand::ProviderConfig { provider } => Command::ProviderConfig { provider },
-        RawCommand::ProviderList => Command::ProviderList,
+        }),
+        RawCommand::ConversationAlias { alias } => {
+            Command::Conversation(ConversationCommand::Alias { alias })
+        }
+        RawCommand::ConversationHistory => Command::Conversation(ConversationCommand::History),
+        RawCommand::ConversationCompact => Command::Conversation(ConversationCommand::Compact),
+        RawCommand::ConversationFork { offset } => {
+            Command::Conversation(ConversationCommand::Fork {
+                offset,
+                alias: alias_modifier,
+            })
+        }
+        RawCommand::ConversationSwitch { alias } => {
+            Command::Conversation(ConversationCommand::Switch { alias })
+        }
+        RawCommand::ConversationList => Command::Conversation(ConversationCommand::List),
+        RawCommand::ConversationDelete { alias } => {
+            Command::Conversation(ConversationCommand::Delete { alias })
+        }
+        RawCommand::Provider { model_ref } => {
+            Command::Provider(ProviderCommand::Select { model: model_ref })
+        }
+        RawCommand::ProviderThinking { level } => {
+            Command::Provider(ProviderCommand::Thinking { level })
+        }
+        RawCommand::ProviderConfig { provider } => {
+            Command::Provider(ProviderCommand::Config { provider })
+        }
+        RawCommand::ProviderList => Command::Provider(ProviderCommand::List),
         RawCommand::Query { query } => Command::Query { query },
         RawCommand::Prompt { prompt } => Command::Prompt { prompt },
         RawCommand::File { path } => Command::File { path },
@@ -528,9 +543,9 @@ mod tests {
             parse(&["tau", "m", "Also", "check", "tests"]),
             CliInvocation {
                 modifiers: Modifiers::default(),
-                command: Command::Message {
+                command: Command::Message(MessageCommand::Message {
                     contents: Some("Also check tests".to_string())
-                },
+                }),
             }
         );
     }
@@ -541,7 +556,7 @@ mod tests {
             parse(&["tau", "message"]),
             CliInvocation {
                 modifiers: Modifiers::default(),
-                command: Command::Message { contents: None },
+                command: Command::Message(MessageCommand::Message { contents: None }),
             }
         );
     }
@@ -555,29 +570,41 @@ mod tests {
                     conversation: Some("bug-1234".to_string()),
                     ..Modifiers::default()
                 },
-                command: Command::MessageInclude {
+                command: Command::Message(MessageCommand::Include {
                     paths: vec![PathBuf::from("a.rs"), PathBuf::from("image.png")]
-                },
+                }),
             }
         );
 
-        assert_eq!(parse(&["tau", "mp"]).command, Command::MessagePaste);
+        assert_eq!(
+            parse(&["tau", "mp"]).command,
+            Command::Message(MessageCommand::Paste)
+        );
         assert_eq!(
             parse(&["tau", "mr", "src/main.rs"]).command,
-            Command::MessageReference {
+            Command::Message(MessageCommand::Reference {
                 paths: vec![PathBuf::from("src/main.rs")]
-            }
+            })
         );
-        assert_eq!(parse(&["tau", "ms"]).command, Command::MessageSend);
-        assert_eq!(parse(&["tau", "me"]).command, Command::MessageEcho);
-        assert_eq!(parse(&["tau", "-y", "mc"]).command, Command::MessageClear);
+        assert_eq!(
+            parse(&["tau", "ms"]).command,
+            Command::Message(MessageCommand::Send)
+        );
+        assert_eq!(
+            parse(&["tau", "me"]).command,
+            Command::Message(MessageCommand::Echo)
+        );
+        assert_eq!(
+            parse(&["tau", "-y", "mc"]).command,
+            Command::Message(MessageCommand::Clear)
+        );
         assert_eq!(
             parse(&["tau", "mu", "-2"]).command,
-            Command::MessageUndo { offset: -2 }
+            Command::Message(MessageCommand::Undo { offset: -2 })
         );
         assert_eq!(
             parse(&["tau", "mu"]).command,
-            Command::MessageUndo { offset: -1 }
+            Command::Message(MessageCommand::Undo { offset: -1 })
         );
     }
 
@@ -585,37 +612,46 @@ mod tests {
     fn parses_conversation_commands() {
         assert_eq!(
             parse(&["tau", "c", "-a", "Feature work phase 2"]).command,
-            Command::Conversation {
+            Command::Conversation(ConversationCommand::Create {
                 alias: Some("Feature work phase 2".to_string())
-            }
+            })
         );
         assert_eq!(
             parse(&["tau", "ca", "My awesome feature"]).command,
-            Command::ConversationAlias {
+            Command::Conversation(ConversationCommand::Alias {
                 alias: "My awesome feature".to_string()
-            }
+            })
         );
-        assert_eq!(parse(&["tau", "ch"]).command, Command::ConversationHistory);
-        assert_eq!(parse(&["tau", "cc"]).command, Command::ConversationCompact);
+        assert_eq!(
+            parse(&["tau", "ch"]).command,
+            Command::Conversation(ConversationCommand::History)
+        );
+        assert_eq!(
+            parse(&["tau", "cc"]).command,
+            Command::Conversation(ConversationCommand::Compact)
+        );
         assert_eq!(
             parse(&["tau", "cf", "-2", "-a", "forked"]).command,
-            Command::ConversationFork {
+            Command::Conversation(ConversationCommand::Fork {
                 offset: Some(-2),
                 alias: Some("forked".to_string())
-            }
+            })
         );
         assert_eq!(
             parse(&["tau", "cs", "bug-1234"]).command,
-            Command::ConversationSwitch {
+            Command::Conversation(ConversationCommand::Switch {
                 alias: "bug-1234".to_string()
-            }
+            })
         );
-        assert_eq!(parse(&["tau", "cl"]).command, Command::ConversationList);
+        assert_eq!(
+            parse(&["tau", "cl"]).command,
+            Command::Conversation(ConversationCommand::List)
+        );
         assert_eq!(
             parse(&["tau", "cd", "old-feature"]).command,
-            Command::ConversationDelete {
+            Command::Conversation(ConversationCommand::Delete {
                 alias: "old-feature".to_string()
-            }
+            })
         );
     }
 
@@ -628,28 +664,31 @@ mod tests {
                     yes: true,
                     ..Modifiers::default()
                 },
-                command: Command::Provider {
+                command: Command::Provider(ProviderCommand::Select {
                     model: "anthropic/opus-4.7".to_string()
-                },
+                }),
             }
         );
         assert_eq!(
             parse(&["tau", "pt", "xhigh"]).command,
-            Command::ProviderThinking {
+            Command::Provider(ProviderCommand::Thinking {
                 level: ThinkingLevel::XHigh
-            }
+            })
         );
         assert_eq!(
             parse(&["tau", "provider-config", "anthropic-api"]).command,
-            Command::ProviderConfig {
+            Command::Provider(ProviderCommand::Config {
                 provider: Some(ConfigurableProvider::AnthropicApi)
-            }
+            })
         );
         assert_eq!(
             parse(&["tau", "provider-config"]).command,
-            Command::ProviderConfig { provider: None }
+            Command::Provider(ProviderCommand::Config { provider: None })
         );
-        assert_eq!(parse(&["tau", "pl"]).command, Command::ProviderList);
+        assert_eq!(
+            parse(&["tau", "pl"]).command,
+            Command::Provider(ProviderCommand::List)
+        );
     }
 
     #[test]
