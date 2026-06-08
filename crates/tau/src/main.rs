@@ -1,26 +1,23 @@
-use std::{
-    fs,
-    io::{self, IsTerminal},
-    path::PathBuf,
-    process::Command as ProcessCommand,
-};
+use std::path::PathBuf;
 
-use libtau::{
-    context::{ContentPart, ResponsePart, ServerToolResult, TauSession, ToolResult, ToolUse},
-    providers::TokenUsage,
-    tools,
-};
+use libtau::{context::TauSession, tools};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
+mod agent;
 mod cli;
 mod config;
+mod editor;
+mod output;
 mod provider_config;
 mod session;
 mod state;
 
+use agent::run_turn;
 use cli::{Command, parse_cli_from};
-use config::{CliConfig, OAuthRefreshRequest};
+use config::CliConfig;
+use editor::edit_message;
+use output::{OutputStyle, print_token_usage};
 use session::{SessionPersistence, load_session_from_path, save_session, session_path_for_id};
 use state::{SessionRecord, StateDb};
 
@@ -210,6 +207,13 @@ fn create_new_session(
     Ok((record, session, persistence))
 }
 
+fn state_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Err("cannot open Tau state because HOME is not set".into());
+    };
+    Ok(PathBuf::from(home).join(".tau/state.db"))
+}
+
 fn generate_unique_session_alias(state: &StateDb) -> Result<String, Box<dyn std::error::Error>> {
     for _ in 0..100 {
         let alias = random_alias();
@@ -229,267 +233,4 @@ fn random_alias() -> String {
         .take(8)
         .map(|byte| ALPHABET[*byte as usize % ALPHABET.len()] as char)
         .collect()
-}
-
-fn state_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let Some(home) = std::env::var_os("HOME") else {
-        return Err("cannot open Tau state because HOME is not set".into());
-    };
-    Ok(PathBuf::from(home).join(".tau/state.db"))
-}
-
-fn edit_message() -> Result<String, Box<dyn std::error::Error>> {
-    let editor = std::env::var_os("EDITOR").ok_or("EDITOR is not set")?;
-    let path = std::env::temp_dir().join(format!("tau-message-{}.md", uuid::Uuid::new_v4()));
-    fs::write(&path, "")?;
-    let status = ProcessCommand::new(editor).arg(&path).status()?;
-    if !status.success() {
-        return Err("editor exited unsuccessfully".into());
-    }
-    let message = fs::read_to_string(&path)?;
-    let _ = fs::remove_file(path);
-    Ok(message)
-}
-
-async fn run_turn(
-    context: &mut TauSession,
-    cli_config: &mut CliConfig,
-    user_message: &str,
-    output: &OutputStyle,
-) -> Result<Option<TokenUsage>, Box<dyn std::error::Error>> {
-    output.println_styled("muted", "[Sending message]");
-    context.push_user_content(vec![ContentPart::text(user_message)]);
-    output.println_styled("muted", "[Message sent. Waiting for model response]");
-    let mut response = request_response_with_reauth(context, cli_config).await?;
-    let mut total_usage = context.last_token_usage().cloned();
-
-    loop {
-        let mut tool_calls = Vec::new();
-        for part in response.parts {
-            match part {
-                ResponsePart::Content { content } => print_content(&content, output),
-                ResponsePart::ToolUse { call } => tool_calls.push(call),
-                ResponsePart::ServerToolUse { call } => {
-                    output.println_indented_styled("tool", &format_server_tool_use(&call));
-                }
-                ResponsePart::ServerToolResult { result } => {
-                    print_server_tool_result(&result, output)
-                }
-                ResponsePart::Stop { .. } => {}
-            }
-        }
-
-        if tool_calls.is_empty() {
-            return Ok(total_usage);
-        }
-
-        run_tools(context, &tool_calls, output);
-        output.println_styled(
-            "muted",
-            "[Sending tool results. Waiting for model response]",
-        );
-        response = request_response_with_reauth(context, cli_config).await?;
-        add_usage(&mut total_usage, context.last_token_usage());
-    }
-}
-
-async fn request_response_with_reauth(
-    context: &mut TauSession,
-    cli_config: &mut CliConfig,
-) -> Result<libtau::context::TauResponse, Box<dyn std::error::Error>> {
-    match context.request_response().await {
-        Ok(response) => Ok(response),
-        Err(libtau::api::ProviderError::ReauthenticationRequired {
-            access,
-            refresh,
-            expires,
-        }) => {
-            cli_config
-                .refresh_oauth_provider(
-                    &context.provider().name().to_string(),
-                    OAuthRefreshRequest {
-                        access,
-                        refresh,
-                        expires,
-                    },
-                )
-                .await?;
-            let provider = cli_config.build_provider_for_current_model()?;
-            context.refresh_provider(provider);
-            context.request_response().await.map_err(Into::into)
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn run_tools(
-    context: &mut TauSession,
-    tool_calls: &[ToolUse],
-    output: &OutputStyle,
-) -> Vec<ToolResult> {
-    for call in tool_calls {
-        output.println_indented_styled(
-            "tool",
-            &format!("[tool] {}({})", call.name, compact_json(&call.input)),
-        );
-    }
-
-    let results = context.call_tools_parallel_and_record(tool_calls);
-
-    for result in &results {
-        match &result.error {
-            Some(error) => output.println_indented_styled(
-                "tool",
-                &format!("[tool] {} failed: {error}", result.name),
-            ),
-            None => {
-                output.println_indented_styled("tool", &format!("[tool] {} completed", result.name))
-            }
-        }
-    }
-
-    results
-}
-
-fn add_usage(total: &mut Option<TokenUsage>, usage: Option<&TokenUsage>) {
-    let Some(usage) = usage else {
-        return;
-    };
-    match total {
-        Some(total) => {
-            total.input_tokens = add_optional(total.input_tokens, usage.input_tokens);
-            total.output_tokens = add_optional(total.output_tokens, usage.output_tokens);
-            total.total_tokens = add_optional(total.total_tokens, usage.total_tokens);
-        }
-        None => *total = Some(usage.clone()),
-    }
-}
-
-fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left + right),
-        _ => None,
-    }
-}
-
-fn print_token_usage(usage: Option<&TokenUsage>, output: &OutputStyle) {
-    let Some(usage) = usage else {
-        return;
-    };
-
-    let line = match (usage.input_tokens, usage.output_tokens, usage.total_tokens) {
-        (Some(input), Some(output_tokens), Some(total)) => {
-            format!("[tokens] input={input}, output={output_tokens}, total={total}")
-        }
-        (input, output_tokens, total) => format!(
-            "[tokens] input={}, output={}, total={}",
-            format_optional_u64(input),
-            format_optional_u64(output_tokens),
-            format_optional_u64(total)
-        ),
-    };
-    output.println_styled("muted", &line);
-}
-
-fn format_optional_u64(value: Option<u64>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn print_content(content: &ContentPart, output: &OutputStyle) {
-    match content {
-        ContentPart::Text { text, .. } => output.println_styled("agent", text),
-        ContentPart::Thinking { summary, .. } => {
-            if !summary.is_empty() {
-                for text in summary {
-                    output.println_indented_styled("muted", &format!("[thinking]\n{text}"))
-                }
-            } else {
-                output.println_indented_styled("muted", "[redacted thinking]");
-            }
-        }
-        ContentPart::Refusal { text, .. } => {
-            output.println_indented_styled("muted", &format!("[refusal]\n{text}"))
-        }
-        ContentPart::FailedToolCall { text, .. } => {
-            output.println_indented_styled("error", &format!("[failed tool call]\n{text}"))
-        }
-        ContentPart::Image {
-            media_type, data, ..
-        } => {
-            output.println_indented_styled("muted", &format!("[image: {media_type}, {data:?}]"));
-        }
-        ContentPart::Binary {
-            media_type, data, ..
-        } => {
-            output.println_indented_styled("muted", &format!("[binary: {media_type}, {data:?}]"));
-        }
-    }
-}
-
-fn compact_json(value: &serde_json::Value) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "<invalid json>".to_string())
-}
-
-fn print_server_tool_result(result: &ServerToolResult, output: &OutputStyle) {
-    for content in &result.content {
-        match content {
-            ContentPart::Text { text, .. } => output.println_indented_styled("tool", text),
-            other => print_content(other, output),
-        }
-    }
-}
-
-fn format_server_tool_use(call: &libtau::context::ServerToolUse) -> String {
-    if call.name == "web_search"
-        && let Some(query) = call.input.get("query").and_then(serde_json::Value::as_str)
-    {
-        return format!("[server tool] web_search\nquery: {query}");
-    }
-
-    format!("[server tool] {}", call.name)
-}
-
-fn indent_display_block(text: &str) -> String {
-    const INDENT: &str = "  ";
-    text.lines()
-        .map(|line| format!("{INDENT}{line}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-#[derive(Debug, Clone, Copy)]
-struct OutputStyle {
-    color: bool,
-}
-
-impl OutputStyle {
-    fn detect() -> Self {
-        let color = io::stdout().is_terminal()
-            && std::env::var_os("NO_COLOR").is_none()
-            && std::env::var("TERM")
-                .map(|term| term != "dumb")
-                .unwrap_or(true);
-        Self { color }
-    }
-
-    fn println_styled(&self, style: &str, text: &str) {
-        if !self.color {
-            println!("{text}");
-            return;
-        }
-
-        let code = match style {
-            "muted" => "90",
-            "tool" => "36",
-            "agent" => "97",
-            _ => "0",
-        };
-        println!("\x1b[{code}m{text}\x1b[0m");
-    }
-
-    fn println_indented_styled(&self, style: &str, text: &str) {
-        self.println_styled(style, &indent_display_block(text));
-    }
 }
