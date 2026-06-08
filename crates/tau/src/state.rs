@@ -6,6 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use bon::Builder;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
@@ -18,7 +19,7 @@ pub(crate) struct StateDb {
     connection: Connection,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Builder, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionRecord {
     pub(crate) id: String,
     pub(crate) alias: String,
@@ -33,7 +34,7 @@ pub(crate) struct SessionRecord {
     pub(crate) contents_path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Builder, Debug, Clone, PartialEq)]
 pub(crate) struct StagedMessageRecord {
     pub(crate) session_id: String,
     /// Unix timestamp in milliseconds.
@@ -65,17 +66,37 @@ impl StateDb {
         alias_generated: bool,
         contents_path: impl AsRef<Path>,
     ) -> StateResult<SessionRecord> {
-        let now = unix_timestamp_millis()?;
-        let record = SessionRecord {
-            id: format!("session-{}", uuid::Uuid::new_v4()),
-            alias: alias.to_string(),
-            created_at: now,
-            updated_at: now,
-            provider: provider.to_string(),
+        let id = format!("session-{}", uuid::Uuid::new_v4());
+        self.create_session_with_id(
+            &id,
+            alias,
+            provider,
             readonly,
             alias_generated,
-            contents_path: contents_path.as_ref().to_path_buf(),
-        };
+            contents_path,
+        )
+    }
+
+    pub(crate) fn create_session_with_id(
+        &self,
+        id: &str,
+        alias: &str,
+        provider: &str,
+        readonly: bool,
+        alias_generated: bool,
+        contents_path: impl AsRef<Path>,
+    ) -> StateResult<SessionRecord> {
+        let now = unix_timestamp_millis()?;
+        let record = SessionRecord::builder()
+            .id(id.to_string())
+            .alias(alias.to_string())
+            .created_at(now)
+            .updated_at(now)
+            .provider(provider.to_string())
+            .readonly(readonly)
+            .alias_generated(alias_generated)
+            .contents_path(contents_path.as_ref().to_path_buf())
+            .build();
         self.insert_session(&record)?;
         Ok(record)
     }
@@ -271,16 +292,16 @@ impl StateDb {
 }
 
 fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
-    Ok(SessionRecord {
-        id: row.get(0)?,
-        alias: row.get(1)?,
-        created_at: row.get(2)?,
-        updated_at: row.get(3)?,
-        provider: row.get(4)?,
-        readonly: row.get::<_, i64>(5)? != 0,
-        alias_generated: row.get::<_, i64>(6)? != 0,
-        contents_path: PathBuf::from(row.get::<_, String>(7)?),
-    })
+    Ok(SessionRecord::builder()
+        .id(row.get(0)?)
+        .alias(row.get(1)?)
+        .created_at(row.get(2)?)
+        .updated_at(row.get(3)?)
+        .provider(row.get(4)?)
+        .readonly(row.get::<_, i64>(5)? != 0)
+        .alias_generated(row.get::<_, i64>(6)? != 0)
+        .contents_path(PathBuf::from(row.get::<_, String>(7)?))
+        .build())
 }
 
 fn staged_message_record_from_row(
@@ -291,12 +312,12 @@ fn staged_message_record_from_row(
         rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
     })?;
 
-    Ok(StagedMessageRecord {
-        session_id: row.get(0)?,
-        created_at: row.get(1)?,
-        updated_at: row.get(2)?,
-        parts,
-    })
+    Ok(StagedMessageRecord::builder()
+        .session_id(row.get(0)?)
+        .created_at(row.get(1)?)
+        .updated_at(row.get(2)?)
+        .parts(parts)
+        .build())
 }
 
 fn unix_timestamp_millis() -> StateResult<i64> {
@@ -337,6 +358,31 @@ mod tests {
             Some(record.clone())
         );
         assert_eq!(db.get_session_by_id(&record.id).unwrap(), Some(record));
+    }
+
+    #[test]
+    fn creates_session_with_supplied_id() {
+        let db = StateDb::open(temp_db_path("creates-with-id")).unwrap();
+        let record = db
+            .create_session_with_id(
+                "session-explicit",
+                "Feature work",
+                "openai/gpt-4.1-mini",
+                true,
+                false,
+                "/home/me/.tau/sessions/session-explicit.json",
+            )
+            .unwrap();
+
+        assert_eq!(record.id, "session-explicit");
+        assert_eq!(
+            record.contents_path,
+            PathBuf::from("/home/me/.tau/sessions/session-explicit.json")
+        );
+        assert_eq!(
+            db.get_session_by_id("session-explicit").unwrap(),
+            Some(record)
+        );
     }
 
     #[test]

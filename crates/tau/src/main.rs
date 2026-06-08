@@ -11,6 +11,7 @@ mod editor;
 mod output;
 mod provider_config;
 mod session;
+mod session_manager;
 mod state;
 
 use cli::parse_cli_from;

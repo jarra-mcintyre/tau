@@ -8,10 +8,11 @@ use crate::{
     config::CliConfig,
     editor::edit_message,
     output::{OutputStyle, print_token_usage},
+    session_manager::SessionManager,
     state::StateDb,
 };
 
-use super::{conversation::load_or_create_current_session, state_path};
+use super::state_path;
 
 pub(super) async fn dispatch(
     modifiers: Modifiers,
@@ -46,13 +47,16 @@ async fn send(
     let mut context = libtau::context::TauContext::default();
     tools::register_builtin_tools(&mut context)?;
 
-    let (record, mut session, persistence) = load_or_create_current_session(
-        &state,
-        &context,
-        &mut cli_config,
-        modifiers.conversation.as_deref(),
-        modifiers.read_only,
-    )?;
+    let mut session_manager = SessionManager::builder()
+        .state(&state)
+        .context(&context)
+        .config(&mut cli_config)
+        .build();
+    let loaded_session = session_manager
+        .load_or_create_current(modifiers.conversation.as_deref(), modifiers.read_only)?;
+    let record = loaded_session.record;
+    let mut session = loaded_session.session;
+    let persistence = loaded_session.persistence;
 
     match run_turn(&mut session, &mut cli_config, &message, &output).await {
         Ok(usage) => {
