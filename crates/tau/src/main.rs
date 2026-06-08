@@ -300,18 +300,19 @@ async fn request_response_with_reauth(
     match context.request_response().await {
         Ok(response) => Ok(response),
         Err(libtau::api::ProviderError::ReauthenticationRequired {
-            provider,
             access,
             refresh,
             expires,
         }) => {
             cli_config
-                .refresh_current_oauth_provider(OAuthRefreshRequest {
-                    provider,
-                    access,
-                    refresh,
-                    expires,
-                })
+                .refresh_oauth_provider(
+                    &context.provider().name().to_string(),
+                    OAuthRefreshRequest {
+                        access,
+                        refresh,
+                        expires,
+                    },
+                )
                 .await?;
             let provider = cli_config.build_provider_for_current_model()?;
             context.refresh_provider(provider);
@@ -399,8 +400,14 @@ fn format_optional_u64(value: Option<u64>) -> String {
 fn print_content(content: &ContentPart, output: &OutputStyle) {
     match content {
         ContentPart::Text { text, .. } => output.println_styled("agent", text),
-        ContentPart::Thinking { text, .. } => {
-            output.println_indented_styled("muted", &format!("[thinking]\n{text}"))
+        ContentPart::Thinking { summary, .. } => {
+            if !summary.is_empty() {
+                for text in summary {
+                    output.println_indented_styled("muted", &format!("[thinking]\n{text}"))
+                }
+            } else {
+                output.println_indented_styled("muted", "[redacted thinking]");
+            }
         }
         ContentPart::Refusal { text, .. } => {
             output.println_indented_styled("muted", &format!("[refusal]\n{text}"))

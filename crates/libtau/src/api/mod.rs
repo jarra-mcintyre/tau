@@ -45,9 +45,8 @@ pub enum ProviderError {
         status: reqwest::StatusCode,
         body: String,
     },
-    #[error("provider '{provider}' requires OAuth re-authentication")]
+    #[error("provider requires OAuth re-authentication")]
     ReauthenticationRequired {
-        provider: String,
         access: String,
         refresh: String,
         expires: i64,

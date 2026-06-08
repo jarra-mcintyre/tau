@@ -255,15 +255,17 @@ The API may return the following response types, as identified by the `type` fie
   "id": "123",
   "type": "reasoning",
   "status": "complete",
-  "summary": {
-    "text": "The user has asked me to tell them the weather in Tokyo, Japan",
-    "type": "summary_text" // always summary text
-  },
+  "summary": [
+    {
+      "text": "The user has asked me to tell them the weather in Tokyo, Japan",
+      "type": "summary_text" // always summary_text
+    }
+  ],
   // optional array of additional content
   "content": [
     {
       "text": "The user has asked me to tell them the weather in Tokyo, Japan",
-      "type": "summary_text" // always summary text
+      "type": "reasoning_text" // always reasoning_text
     }
   ],
   "encrypted_content": "afwqgt" // optional

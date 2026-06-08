@@ -18,12 +18,12 @@ Use normal Cargo commands for building, formatting, testing and running. Use `fi
 
 ### Clean and simple code
 
-The following guidelines are intended to keep the code cleaner and simpler to read:
-- Prefer imports over-qualified references (e.g. import `Error` rather than writing `std::error::Error`).
-- Function names should decribe what the function does, not how. Don't put implementation details in the name (e.g. don't add `_arc` to a function name just because it takes an Arc).
-- Avoid one-line or unnecessary helper functions.  You do it too much and it ends up creating noise in the code.
-- Don't add new functions unless you're actually using them. That includes public functions. They just add noise.
-- For structures you are manually instantiating, derive `Builder` (from `bon`) and uses builders. This reduces noise line-noise especially for structures with large numbers of optional parameters.
+The following guidelines are intended to keep the code clean and simpler to read. They are not optional
+- You must prefer imports over-qualified references (e.g. import `Error` rather than writing `std::error::Error`).
+- Function names must decribe what the function does, not how. Do not put implementation details in the name (e.g. do not add `_arc` to a function name just because it takes an Arc).
+- You must avoid one-line or unnecessary helper functions. Never create a function that just calls `default`. One line helper functions which don't encode any complex logic are just unnecessary line-noise.
+- Never add new public functions unless you're actually using them or were told to. They just add noise.
+- For structures with multiple fields, derive `Builder` (from `bon`) and use builders to instantiate them. This reduces noise line-noise especially for structures with large numbers of optional parameters.
 
 ## Architecture
 

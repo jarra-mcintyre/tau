@@ -10,7 +10,10 @@ use crate::{
         ContentPart, ConversationItem, MediaData, ResponsePart, ResponseStop, ResponseStopReason,
         ServerToolResult, ServerToolUse, TauResponse, TauSession, ToolResult, ToolUse,
     },
-    providers::{ModelMetadata, ProviderConfig, ThinkingEffort, anthropic::AnthropicModelConfig},
+    providers::{
+        ModelMetadata, ProviderConfig, ProviderCredentials, ThinkingEffort,
+        anthropic::AnthropicModelConfig,
+    },
 };
 
 pub const API_NAME: &str = "anthropic_messages";
@@ -32,8 +35,13 @@ pub struct AnthropicProvider {
 }
 
 fn build_provider(config: ProviderConfig) -> Result<Arc<dyn ModelApi>, ProviderError> {
+    let ProviderCredentials::API(api_key) = config.auth else {
+        return Err(ProviderError::Configuration(
+            "Anthropic Messages API does not support OAuth credentials".to_string(),
+        ));
+    };
     let options = AnthropicOptions::from_value(config.options)?;
-    let provider = AnthropicProvider::with_base_url(config.api_key, config.base_url)
+    let provider = AnthropicProvider::with_base_url(api_key, config.base_url)
         .with_cache_ttl(options.cache_ttl)
         .with_web_search(options.web_search);
 
@@ -701,7 +709,7 @@ fn parse_response(response: AnthropicResponse) -> Result<TauResponse, ProviderEr
                     .and_then(Value::as_str)
                     .map(ToString::to_string);
                 let content_part = ContentPart::Thinking {
-                    text: text.to_string(),
+                    summary: vec![text.to_string()],
                     signature,
                 };
                 parts.push(ResponsePart::Content {
@@ -816,8 +824,8 @@ fn input_content_parts(parts: &[ContentPart]) -> Result<Vec<AnthropicContent>, P
             } => Ok(AnthropicContent::Text {
                 text: binary_content_as_text(media_type, data),
             }),
-            ContentPart::Thinking { text, .. } => Ok(AnthropicContent::Text {
-                text: format!("[thinking: {text}]"),
+            ContentPart::Thinking { summary: text, .. } => Ok(AnthropicContent::Text {
+                text: format!("[thinking: {}]", text.join("\n")),
             }),
             ContentPart::Refusal { text, .. } => Ok(AnthropicContent::Text { text: text.clone() }),
             ContentPart::FailedToolCall { text, .. } => {
@@ -856,9 +864,9 @@ fn anthropic_tool_result_content(
     if !has_media && result.content.len() == 1 {
         return match &result.content[0] {
             ContentPart::Text { text, .. } => Ok(AnthropicToolResultContent::Text(text.clone())),
-            ContentPart::Thinking { text, .. } => Ok(AnthropicToolResultContent::Text(format!(
-                "[thinking: {text}]"
-            ))),
+            ContentPart::Thinking { summary: text, .. } => Ok(AnthropicToolResultContent::Text(
+                format!("[thinking: {}]", text.join("\n")),
+            )),
             ContentPart::Refusal { text, .. } => Ok(AnthropicToolResultContent::Text(text.clone())),
             ContentPart::FailedToolCall { text, .. } => {
                 Ok(AnthropicToolResultContent::Text(text.clone()))
@@ -894,9 +902,11 @@ fn anthropic_tool_result_content(
             } => blocks.push(AnthropicToolResultBlock::Text {
                 text: binary_content_as_text(media_type, data),
             }),
-            ContentPart::Thinking { text, .. } => blocks.push(AnthropicToolResultBlock::Text {
-                text: format!("[thinking: {text}]"),
-            }),
+            ContentPart::Thinking { summary: text, .. } => {
+                blocks.push(AnthropicToolResultBlock::Text {
+                    text: format!("[thinking: {}]", text.join("\n")),
+                })
+            }
             ContentPart::Refusal { text, .. } => {
                 blocks.push(AnthropicToolResultBlock::Text { text: text.clone() })
             }
@@ -962,7 +972,7 @@ mod tests {
             content: vec![
                 ContentPart::text("I'll call a tool."),
                 ContentPart::Thinking {
-                    text: "Need to echo.".to_string(),
+                    summary: vec!["Need to echo.".to_string()],
                     signature: Some("sig_1".to_string()),
                 },
             ],
@@ -1259,7 +1269,7 @@ mod tests {
         let content = parsed.content();
         assert_eq!(content.len(), 2);
         match &content[0] {
-            ContentPart::Text { text, annotations } => {
+            ContentPart::Text { text, .. } => {
                 assert_eq!(text, "I'll check.");
                 //assert_eq!(
                 //    metadata.as_ref().unwrap()["citations"][0]["url"],
@@ -1269,8 +1279,11 @@ mod tests {
             other => panic!("expected text content, got {other:?}"),
         }
         match &content[1] {
-            ContentPart::Thinking { text, signature } => {
-                assert_eq!(text, "I should inspect the files.");
+            ContentPart::Thinking {
+                summary: text,
+                signature,
+            } => {
+                assert_eq!(text, &vec!["I should inspect the files."]);
                 assert_eq!(signature.as_deref(), Some("sig_1"));
             }
             other => panic!("expected thinking content, got {other:?}"),

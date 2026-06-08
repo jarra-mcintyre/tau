@@ -15,8 +15,8 @@ use libtau::{
     api::ModelApi,
     context::{TauContext, TauSession},
     providers::{
-        ApiKeyProviderConfig, ConfiguredModel, ConfiguredProvider, ModelMetadata,
-        ProviderConfigEntry, configured_provider_from_entry, refresh_oauth_provider,
+        ApiKeyProviderConfig, ConfiguredProvider, ModelMetadata, ProviderConfigEntry,
+        configured_provider_from_entry, refresh_oauth_provider,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -102,33 +102,25 @@ impl CliConfig {
         self.build_provider_for_selection(&self.current_model)
     }
 
-    pub(crate) async fn refresh_current_oauth_provider(
+    pub(crate) async fn refresh_oauth_provider(
         &mut self,
+        provider: &String,
         expected: OAuthRefreshRequest,
     ) -> Result<(), Box<dyn Error>> {
-        if self.current_model.provider_name != expected.provider {
-            return Err(format!(
-                "current provider '{}' does not match OAuth provider '{}'",
-                self.current_model.provider_name, expected.provider
-            )
-            .into());
-        }
-
-        let stored = if let Some(current) = oauth_provider_entry_if_changed(&expected)? {
+        let stored = if let Some(current) = oauth_provider_entry_if_changed(&provider, &expected)? {
             current
         } else {
-            let refreshed =
-                match refresh_oauth_provider(&expected.provider, &expected.refresh).await {
-                    Ok(refreshed) => refreshed,
-                    Err(error) => {
-                        if let Some(current) = oauth_provider_entry_if_changed(&expected)? {
-                            self.apply_provider_entry(current)?;
-                            return Ok(());
-                        }
-                        return Err(error);
+            let refreshed = match refresh_oauth_provider(&provider, &expected.refresh).await {
+                Ok(refreshed) => refreshed,
+                Err(error) => {
+                    if let Some(current) = oauth_provider_entry_if_changed(&provider, &expected)? {
+                        self.apply_provider_entry(current)?;
+                        return Ok(());
                     }
-                };
-            update_oauth_credentials(&expected, refreshed)?
+                    return Err(error);
+                }
+            };
+            update_oauth_credentials(&provider, &expected, refreshed)?
         };
         self.apply_provider_entry(stored)
     }
@@ -216,15 +208,7 @@ impl CliConfig {
                 )
             })?;
 
-        Ok(model.metadata.clone().unwrap_or_else(|| ModelMetadata {
-            name: model.name.clone(),
-            id: model.id.clone(),
-            context_length: 0,
-            max_tokens: 0,
-            thinking_effort: None,
-            provider_config: None,
-            costs: None,
-        }))
+        Ok(model.clone())
     }
 
     fn build_provider_for_selection(
@@ -300,7 +284,6 @@ pub(crate) fn configure_provider_entry(entry: ProviderConfigEntry) -> Result<(),
 
 #[derive(Debug, Clone)]
 pub(crate) struct OAuthRefreshRequest {
-    pub(crate) provider: String,
     pub(crate) access: String,
     pub(crate) refresh: String,
     pub(crate) expires: i64,
@@ -328,6 +311,7 @@ pub(crate) fn list_providers(json_output: bool) -> Result<(), Box<dyn Error>> {
 }
 
 fn oauth_provider_entry_if_changed(
+    provider: &str,
     expected: &OAuthRefreshRequest,
 ) -> Result<Option<ProviderConfigEntry>, Box<dyn Error>> {
     let path = providers_config_path()
@@ -337,31 +321,30 @@ fn oauth_provider_entry_if_changed(
     let current = config
         .providers
         .iter()
-        .find(|entry| entry.provider_name() == expected.provider)
-        .ok_or_else(|| format!("provider '{}' is no longer configured", expected.provider))?;
+        .find(|entry| entry.provider_name() == provider)
+        .ok_or_else(|| format!("provider '{provider}' is no longer configured"))?;
 
-    if !entry_matches_expected_oauth(current, expected)? {
+    if !entry_matches_expected_oauth(provider, current, expected)? {
         return Ok(Some(current.clone()));
     }
     Ok(None)
 }
 
 fn entry_matches_expected_oauth(
+    provider: &str,
     entry: &ProviderConfigEntry,
     expected: &OAuthRefreshRequest,
 ) -> Result<bool, Box<dyn Error>> {
-    let credentials = entry.oauth_credentials().ok_or_else(|| {
-        format!(
-            "provider '{}' is not configured with OAuth",
-            expected.provider
-        )
-    })?;
+    let credentials = entry
+        .oauth_credentials()
+        .ok_or_else(|| format!("provider '{provider}' is not configured with OAuth"))?;
     Ok(credentials.access == expected.access
         && credentials.refresh == expected.refresh
         && credentials.expires == expected.expires)
 }
 
 fn update_oauth_credentials(
+    provider: &str,
     expected: &OAuthRefreshRequest,
     refreshed: ProviderConfigEntry,
 ) -> Result<ProviderConfigEntry, Box<dyn Error>> {
@@ -376,17 +359,17 @@ fn update_oauth_credentials(
     let entry = config
         .providers
         .iter_mut()
-        .find(|entry| entry.provider_name() == expected.provider)
-        .ok_or_else(|| format!("provider '{}' is no longer configured", expected.provider))?;
+        .find(|entry| entry.provider_name() == provider)
+        .ok_or_else(|| format!("provider '{provider}' is no longer configured"))?;
 
-    if !entry_matches_expected_oauth(entry, expected)? {
+    if !entry_matches_expected_oauth(provider, entry, expected)? {
         return Ok(entry.clone());
     }
 
-    if refreshed.provider_name() != expected.provider {
+    if refreshed.provider_name() != provider {
         return Err(format!(
             "OAuth refresh for provider '{}' returned credentials for '{}'",
-            expected.provider,
+            provider,
             refreshed.provider_name()
         )
         .into());
@@ -456,17 +439,13 @@ fn configured_providers(
         .collect::<Result<Vec<_>, _>>()
 }
 
-fn model_metadata_summary(model: &ConfiguredModel) -> String {
-    let Some(metadata) = model.metadata.as_ref() else {
-        return String::new();
-    };
-
-    let costs = metadata
+fn model_metadata_summary(model: &ModelMetadata) -> String {
+    let costs = model
         .costs
         .as_ref()
         .map(|costs| format!(", costs: {costs:?}"))
         .unwrap_or_default();
-    let provider_config = metadata
+    let provider_config = model
         .provider_config
         .as_ref()
         .map(|config| format!(", provider_config: {config:?}"))
@@ -474,7 +453,7 @@ fn model_metadata_summary(model: &ConfiguredModel) -> String {
 
     format!(
         " (id: {}, context: {}{provider_config}{costs})",
-        metadata.id, metadata.context_length
+        model.id, model.context_length
     )
 }
 
@@ -638,26 +617,22 @@ fn providers_config_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libtau::{api::find_model_api, providers::ProviderAuth};
+    use libtau::{api::find_model_api, providers::ProviderAuthConfig};
 
     fn provider(name: &str, models: &[&str]) -> ConfiguredProvider {
         ConfiguredProvider {
             name: name.to_string(),
             api: find_model_api("openai_responses").unwrap(),
             display_name: name.to_string(),
-            auth: ProviderAuth::ApiKey {
+            auth: ProviderAuthConfig::ApiKey {
                 api_key: None,
-                api_key_env: "OPENAI_API_KEY".to_string(),
+                api_key_env: Some("OPENAI_API_KEY".to_string()),
             },
             base_url: "https://example.com".to_string(),
             options: Value::Null,
             models: models
                 .iter()
-                .map(|model| ConfiguredModel {
-                    name: model.to_string(),
-                    id: model.to_string(),
-                    metadata: None,
-                })
+                .map(|model| ModelMetadata::custom(*model))
                 .collect(),
         }
     }

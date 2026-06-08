@@ -18,7 +18,7 @@ use crate::{
         Annotation, Citation, ContentPart, ConversationItem, ResponsePart, ResponseStop,
         ResponseStopReason, ServerToolUse, TauResponse, TauSession, ToolResult, ToolUse,
     },
-    providers::{ProviderConfig, ThinkingEffort},
+    providers::{OAuthCredentials, ProviderConfig, ProviderCredentials, ThinkingEffort},
 };
 
 pub const API: ModelApiFactory = ModelApiFactory {
@@ -29,16 +29,21 @@ pub const API: ModelApiFactory = ModelApiFactory {
 #[derive(Debug, Clone)]
 pub struct OpenAiResponsesApi {
     client: reqwest::Client,
-    api_key: String,
+    auth: ProviderCredentials,
     base_url: String,
-    oauth: Option<OAuthCredentials>,
+    web_search: Option<OpenAiWebSearchConfig>,
 }
 
-#[derive(Debug, Clone)]
-struct OAuthCredentials {
-    provider: String,
-    refresh: String,
-    expires: i64,
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+struct OpenAiOptions {
+    #[serde(default)]
+    web_search: Option<OpenAiWebSearchConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+pub struct OpenAiWebSearchConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 const OAUTH_EXPIRY_SKEW_MILLIS: i64 = 60_000;
@@ -55,86 +60,54 @@ struct OpenAiConversationData {
 }
 
 fn build_api(config: ProviderConfig) -> Result<Arc<dyn ModelApi>, ProviderError> {
-    let oauth = OAuthCredentials::from_options(&config.options)?;
-    Ok(Arc::new(OpenAiResponsesApi::with_base_url_and_oauth(
-        config.api_key,
-        config.base_url,
-        oauth,
-    )))
+    let options = OpenAiOptions::from_value(config.options)?;
+    Ok(Arc::new(OpenAiResponsesApi {
+        client: reqwest::Client::new(),
+        auth: config.auth,
+        base_url: config.base_url.trim_end_matches('/').to_string(),
+        web_search: options.web_search,
+    }))
 }
 
 impl OpenAiResponsesApi {
-    pub fn new(api_key: impl Into<String>) -> Self {
-        Self::with_base_url(api_key, crate::providers::openai::DEFAULT_BASE_URL)
-    }
-
-    pub fn from_env() -> Result<Self, ProviderError> {
-        let api_key = std::env::var(crate::providers::openai::API_KEY_ENV).map_err(|_| {
-            ProviderError::Configuration(format!(
-                "{} environment variable is not set",
-                crate::providers::openai::API_KEY_ENV
-            ))
-        })?;
-        Ok(Self::new(api_key))
-    }
-
-    pub fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
-        Self::with_base_url_and_oauth(api_key, base_url, None)
-    }
-
-    fn with_base_url_and_oauth(
-        api_key: impl Into<String>,
-        base_url: impl Into<String>,
-        oauth: Option<OAuthCredentials>,
-    ) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            api_key: api_key.into(),
-            base_url: base_url.into().trim_end_matches('/').to_string(),
-            oauth,
+    fn reauthentication_required(credentials: &OAuthCredentials) -> ProviderError {
+        ProviderError::ReauthenticationRequired {
+            access: credentials.access.clone(),
+            refresh: credentials.refresh.clone(),
+            expires: credentials.expires,
         }
     }
 
-    fn reauthentication_required(&self) -> ProviderError {
-        ProviderError::ReauthenticationRequired {
-            provider: self
-                .oauth
-                .as_ref()
-                .map(|oauth| oauth.provider.clone())
-                .unwrap_or_else(|| self.name().to_string()),
-            access: self.api_key.clone(),
-            refresh: self
-                .oauth
-                .as_ref()
-                .map(|oauth| oauth.refresh.clone())
-                .unwrap_or_default(),
-            expires: self.oauth.as_ref().map(|oauth| oauth.expires).unwrap_or(0),
+    fn authenticated_request(&self, url: &str) -> Result<reqwest::RequestBuilder, ProviderError> {
+        match &self.auth {
+            ProviderCredentials::API(api_key) => Ok(self.client.post(url).bearer_auth(api_key)),
+            ProviderCredentials::OAuth(credentials) => {
+                if credentials.expires <= unix_timestamp_millis()? + OAUTH_EXPIRY_SKEW_MILLIS {
+                    return Err(Self::reauthentication_required(credentials));
+                }
+
+                Ok(self
+                    .client
+                    .post(url)
+                    .bearer_auth(&credentials.access)
+                    .header("chatgpt-account-id", &credentials.account_id)
+                    .header("originator", "tau")
+                    .header("User-Agent", "tau")
+                    .header("OpenAI-Beta", "responses=experimental"))
+            }
         }
     }
 }
 
-impl OAuthCredentials {
-    fn from_options(options: &Value) -> Result<Option<Self>, ProviderError> {
-        let Some(refresh) = options.get("refresh").and_then(Value::as_str) else {
-            return Ok(None);
-        };
-        let provider = options
-            .get("provider")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ProviderError::Configuration("OAuth provider missing provider name".to_string())
-            })?;
-        let expires = options
-            .get("expires")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| {
-                ProviderError::Configuration("OAuth provider missing expires".to_string())
-            })?;
-        Ok(Some(Self {
-            provider: provider.to_string(),
-            refresh: refresh.to_string(),
-            expires,
-        }))
+impl OpenAiOptions {
+    fn from_value(value: Value) -> Result<Self, ProviderError> {
+        if value.is_null() {
+            return Ok(Self::default());
+        }
+
+        serde_json::from_value(value).map_err(|error| {
+            ProviderError::Configuration(format!("invalid OpenAI options: {error}"))
+        })
     }
 }
 
@@ -156,13 +129,7 @@ impl ModelApi for OpenAiResponsesApi {
     }
 
     async fn respond(&self, session: &mut TauSession) -> Result<TauResponse, ProviderError> {
-        if let Some(oauth) = &self.oauth {
-            if oauth.expires <= unix_timestamp_millis()? + OAUTH_EXPIRY_SKEW_MILLIS {
-                return Err(self.reauthentication_required());
-            }
-        }
-
-        let (request, conversation) = build_request(session)?;
+        let (request, conversation) = build_request(session, self.web_search.as_ref())?;
         let url = format!("{}/responses", self.base_url);
         let request_body = serde_json::to_string_pretty(&request)?;
         tracing::debug!(
@@ -173,9 +140,7 @@ impl ModelApi for OpenAiResponsesApi {
         );
 
         let response = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
+            .authenticated_request(&url)?
             .json(&request)
             .send()
             .await?;
@@ -189,8 +154,10 @@ impl ModelApi for OpenAiResponsesApi {
             "response"
         );
         if !status.is_success() {
-            if status == reqwest::StatusCode::UNAUTHORIZED && self.oauth.is_some() {
-                return Err(self.reauthentication_required());
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                if let ProviderCredentials::OAuth(credentials) = &self.auth {
+                    return Err(Self::reauthentication_required(credentials));
+                }
             }
             return Err(ProviderError::Api { status, body });
         }
@@ -285,6 +252,7 @@ enum OpenAiTool {
         kind: &'static str,
         name: String,
         description: String,
+        strict: bool,
         parameters: Value,
     },
     Server {
@@ -324,6 +292,7 @@ struct OpenAiFunctionCallOutput {
 
 fn build_request(
     session: &mut TauSession,
+    web_search: Option<&OpenAiWebSearchConfig>,
 ) -> Result<(OpenAiRequest, OpenAiConversationData), ProviderError> {
     let model = session
         .model()
@@ -353,7 +322,7 @@ fn build_request(
         input.extend(openai_input_items_for_conversation_item(item)?);
     }
 
-    let tools = openai_tools(session);
+    let tools = openai_tools(session, web_search);
 
     Ok((
         OpenAiRequest {
@@ -373,7 +342,8 @@ fn openai_reasoning(effort: Option<ThinkingEffort>) -> Option<OpenAiReasoning> {
         ThinkingEffort::Disabled => return None,
         ThinkingEffort::Low => "low",
         ThinkingEffort::Medium => "medium",
-        ThinkingEffort::High | ThinkingEffort::XHigh | ThinkingEffort::Max => "high",
+        ThinkingEffort::High => "high",
+        ThinkingEffort::XHigh | ThinkingEffort::Max => "xhigh",
     };
 
     Some(OpenAiReasoning {
@@ -446,7 +416,10 @@ fn record_openai_response(
     session.set_provider_conversation_data(&conversation)
 }
 
-fn openai_tools(session: &TauSession) -> Vec<OpenAiTool> {
+fn openai_tools(
+    session: &TauSession,
+    web_search: Option<&OpenAiWebSearchConfig>,
+) -> Vec<OpenAiTool> {
     let mut tools: Vec<_> = session
         .context()
         .tools()
@@ -454,11 +427,14 @@ fn openai_tools(session: &TauSession) -> Vec<OpenAiTool> {
             kind: "function",
             name: tool.name.clone(),
             description: tool.description.clone(),
+            strict: true,
             parameters: tool.input_schema.clone(),
         })
         .collect();
 
-    tools.push(OpenAiTool::Server { kind: "web_search" });
+    if web_search.is_some_and(|config| config.enabled.unwrap_or(true)) {
+        tools.push(OpenAiTool::Server { kind: "web_search" });
+    }
 
     tools
 }
@@ -664,24 +640,19 @@ fn openai_text_annotations(part: &Value) -> Result<Option<Vec<Annotation>>, Prov
 }
 
 fn openai_reasoning_content(item: Value) -> ContentPart {
-    let text = item
-        .get("summary")
-        .and_then(Value::as_array)
-        .map(|summary| {
-            summary
-                .iter()
-                .filter_map(|part| {
-                    part.get("text")
-                        .or_else(|| part.get("summary"))
-                        .and_then(Value::as_str)
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
-
     ContentPart::Thinking {
-        text,
+        summary: match item.get("content").or(item.get("summary")) {
+            Some(Value::Array(content)) => content
+                .iter()
+                .filter_map(|v| {
+                    v.get("text").and_then(|v| match v {
+                        Value::String(text) => Some(text.clone()),
+                        _ => None,
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
+        },
         signature: None,
     }
 }
@@ -701,8 +672,8 @@ fn input_content_parts(parts: &[ContentPart]) -> Result<Vec<OpenAiContent>, Prov
             } => Ok(OpenAiContent::InputText {
                 text: binary_content_as_text(media_type, data),
             }),
-            ContentPart::Thinking { text, .. } => Ok(OpenAiContent::InputText {
-                text: format!("[thinking: {text}]"),
+            ContentPart::Thinking { summary: text, .. } => Ok(OpenAiContent::InputText {
+                text: format!("[thinking: {}]", text.join("\n")),
             }),
             ContentPart::Refusal { text, .. } => {
                 Ok(OpenAiContent::InputText { text: text.clone() })
@@ -719,8 +690,8 @@ fn output_content_parts(parts: &[ContentPart]) -> Vec<OpenAiContent> {
         .iter()
         .map(|part| match part {
             ContentPart::Text { text, .. } => OpenAiContent::OutputText { text: text.clone() },
-            ContentPart::Thinking { text, .. } => OpenAiContent::OutputText {
-                text: format!("[thinking: {text}]"),
+            ContentPart::Thinking { summary: text, .. } => OpenAiContent::OutputText {
+                text: format!("[thinking: {}]", text.join("\n")),
             },
             ContentPart::Refusal { text, .. } => OpenAiContent::OutputText { text: text.clone() },
             ContentPart::FailedToolCall { text, .. } => {
@@ -782,6 +753,72 @@ mod tests {
         Ok(ToolOutput::json(input))
     }
 
+    fn test_api(web_search: Option<OpenAiWebSearchConfig>) -> OpenAiResponsesApi {
+        OpenAiResponsesApi {
+            client: reqwest::Client::new(),
+            auth: ProviderCredentials::API("test-key".to_string()),
+            base_url: crate::providers::openai::DEFAULT_BASE_URL.to_string(),
+            web_search,
+        }
+    }
+
+    fn oauth_api(expires: i64) -> OpenAiResponsesApi {
+        OpenAiResponsesApi {
+            client: reqwest::Client::new(),
+            auth: ProviderCredentials::OAuth(OAuthCredentials {
+                access: "access-token".to_string(),
+                refresh: "refresh-token".to_string(),
+                expires,
+                account_id: "account-id".to_string(),
+            }),
+            base_url: crate::providers::codex::DEFAULT_BASE_URL.to_string(),
+            web_search: None,
+        }
+    }
+
+    #[test]
+    fn applies_api_key_auth_headers() {
+        let request = test_api(None)
+            .authenticated_request("https://example.com/responses")
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_eq!(request.headers()["authorization"], "Bearer test-key");
+        assert!(!request.headers().contains_key("chatgpt-account-id"));
+    }
+
+    #[test]
+    fn applies_oauth_auth_headers() {
+        let request = oauth_api(i64::MAX)
+            .authenticated_request("https://example.com/responses")
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_eq!(request.headers()["authorization"], "Bearer access-token");
+        assert_eq!(request.headers()["chatgpt-account-id"], "account-id");
+        assert_eq!(request.headers()["originator"], "tau");
+        assert_eq!(request.headers()["user-agent"], "tau");
+        assert_eq!(request.headers()["openai-beta"], "responses=experimental");
+    }
+
+    #[test]
+    fn expired_oauth_auth_requires_reauthentication() {
+        let error = oauth_api(0)
+            .authenticated_request("https://example.com/responses")
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProviderError::ReauthenticationRequired {
+                access,
+                refresh,
+                expires: 0,
+            } if access == "access-token" && refresh == "refresh-token"
+        ));
+    }
+
     #[test]
     fn builds_responses_api_request_from_complete_history() {
         let mut context = crate::context::TauContext::default();
@@ -794,7 +831,10 @@ mod tests {
                 callback,
             })
             .unwrap();
-        let mut session = context.session(OpenAiResponsesApi::new("test-key"), "gpt-4.1-mini");
+        let mut session = context.session(
+            test_api(Some(OpenAiWebSearchConfig::default())),
+            "gpt-4.1-mini",
+        );
         session.push_system_text("be helpful");
         session.push_user_text("hello");
         session.push_item(ConversationItem::ToolUse {
@@ -812,17 +852,39 @@ mod tests {
                 error: None,
             }],
         });
-        let request = build_request(&mut session).unwrap();
+        let request = build_request(&mut session, Some(&OpenAiWebSearchConfig::default())).unwrap();
         let value = serde_json::to_value(request.0).unwrap();
 
         assert_eq!(value["model"], "gpt-4.1-mini");
         assert_eq!(value["parallel_tool_calls"], true);
         assert!(value.get("previous_response_id").is_none());
         assert_eq!(value["tools"][0]["type"], "function");
+        assert_eq!(value["tools"][0]["strict"], true);
         assert_eq!(value["tools"][1]["type"], "web_search");
         assert_eq!(value["input"][0]["role"], "system");
         assert_eq!(value["input"][2]["type"], "function_call");
         assert_eq!(value["input"][3]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn disables_web_search_when_not_configured() {
+        let mut context = crate::context::TauContext::default();
+        context
+            .register_tool(ToolDefinition {
+                name: "echo".to_string(),
+                readonly: true,
+                description: "echo input".to_string(),
+                input_schema: json!({"type":"object"}),
+                callback,
+            })
+            .unwrap();
+        let mut session = context.session(test_api(None), "gpt-4.1-mini");
+
+        let request = build_request(&mut session, None).unwrap();
+        let value = serde_json::to_value(request.0).unwrap();
+
+        assert_eq!(value["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(value["tools"][0]["type"], "function");
     }
 
     #[test]
@@ -837,7 +899,7 @@ mod tests {
                 callback,
             })
             .unwrap();
-        let mut session = context.session(OpenAiResponsesApi::new("test-key"), "gpt-4.1-mini");
+        let mut session = context.session(test_api(None), "gpt-4.1-mini");
         session.push_system_text("be helpful");
         session.push_user_text("hello");
         session.push_agent_text("I'll call a tool.");
@@ -863,7 +925,7 @@ mod tests {
             })
             .unwrap();
 
-        let request = build_request(&mut session).unwrap();
+        let request = build_request(&mut session, None).unwrap();
         let value = serde_json::to_value(request.0).unwrap();
 
         assert_eq!(value["previous_response_id"], "resp_previous");
@@ -874,7 +936,7 @@ mod tests {
     #[test]
     fn sends_tool_result_images_in_function_call_output() {
         let context = crate::context::TauContext::default();
-        let mut session = context.session(OpenAiResponsesApi::new("test-key"), "gpt-4.1-mini");
+        let mut session = context.session(test_api(None), "gpt-4.1-mini");
         session.push_item(ConversationItem::ToolResult {
             results: vec![ToolResult {
                 call_id: "call_1".to_string(),
@@ -890,7 +952,7 @@ mod tests {
             }],
         });
 
-        let request = build_request(&mut session).unwrap();
+        let request = build_request(&mut session, None).unwrap();
         let value = serde_json::to_value(request.0).unwrap();
 
         assert_eq!(value["input"].as_array().unwrap().len(), 1);
@@ -980,8 +1042,8 @@ mod tests {
             other => panic!("expected text content, got {other:?}"),
         }
         match &content[1] {
-            ContentPart::Thinking { text, .. } => {
-                assert_eq!(text, "I should inspect the files.");
+            ContentPart::Thinking { summary: text, .. } => {
+                assert_eq!(text, &vec!["I should inspect the files."]);
             }
             other => panic!("expected thinking content, got {other:?}"),
         }

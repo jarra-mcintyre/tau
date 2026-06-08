@@ -60,22 +60,31 @@ impl ModelMetadata {
     }
 }
 
-impl From<String> for ModelMetadata {
-    fn from(model: String) -> Self {
-        Self::custom(model)
-    }
-}
-
+// short-cut for unit tests
 impl From<&str> for ModelMetadata {
     fn from(model: &str) -> Self {
         Self::custom(model)
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthCredentials {
+    pub access: String,
+    pub refresh: String,
+    pub expires: i64,
+    pub account_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderCredentials {
+    API(String),
+    OAuth(OAuthCredentials),
+}
+
 /// Runtime API configuration consumed by a concrete model API implementation.
 #[derive(Debug, Clone)]
 pub struct ProviderConfig {
-    pub api_key: String,
+    pub auth: ProviderCredentials,
     pub base_url: String,
     pub options: Value,
 }
@@ -140,22 +149,18 @@ pub struct CustomProviderConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum ModelConfigEntry {
-    Name(String),
-    Detailed {
-        name: String,
-        #[serde(default)]
-        id: Option<String>,
-        #[serde(default)]
-        context_length: u64,
-        #[serde(default)]
-        max_tokens: u64,
-        #[serde(default)]
-        thinking_effort: Option<ThinkingEffort>,
-        #[serde(default)]
-        provider_config: Value,
-    },
+pub struct ModelConfigEntry {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_effort: Option<ThinkingEffort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_config: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -163,31 +168,19 @@ pub struct ConfiguredProvider {
     pub name: String,
     pub api: &'static api::ModelApiFactory,
     pub display_name: String,
-    pub auth: ProviderAuth,
+    pub auth: ProviderAuthConfig,
     pub base_url: String,
     pub options: Value,
-    pub models: Vec<ConfiguredModel>,
+    pub models: Vec<ModelMetadata>,
 }
 
-#[derive(Debug)]
-pub enum ProviderAuth {
+#[derive(Debug, Clone)]
+pub enum ProviderAuthConfig {
     ApiKey {
         api_key: Option<String>,
-        api_key_env: String,
+        api_key_env: Option<String>,
     },
-    OAuth {
-        access: String,
-        refresh: String,
-        expires: i64,
-        account_id: String,
-    },
-}
-
-#[derive(Debug)]
-pub struct ConfiguredModel {
-    pub name: String,
-    pub id: String,
-    pub metadata: Option<ModelMetadata>,
+    OAuth(OAuthCredentials),
 }
 
 impl ProviderConfigEntry {
@@ -216,50 +209,29 @@ impl ProviderConfigEntry {
 
 impl ConfiguredProvider {
     pub fn build_api(&self) -> Result<Arc<dyn api::ModelApi>, Box<dyn std::error::Error>> {
-        let api_key = match &self.auth {
-            ProviderAuth::ApiKey {
+        let auth: ProviderCredentials = match &self.auth {
+            ProviderAuthConfig::ApiKey {
                 api_key,
                 api_key_env,
-            } => std::env::var(api_key_env)
-                .ok()
-                .or_else(|| api_key.clone())
+            } => api_key
+                .as_ref()
+                .map(|k| k.clone())
+                .or_else(|| api_key_env.as_ref().and_then(|v| std::env::var(v).ok()))
+                .map(|k| ProviderCredentials::API(k))
                 .ok_or_else(|| {
-                    format!(
-                        "missing {} API key; set {} or configure provider '{}' in ~/.tau/providers.json",
-                        self.display_name, api_key_env, self.name
-                    )
+                    match api_key_env {
+                        Some(k) => format!("missing {} API key. Set the {} environment variable or directly configure the API key", self.display_name, k),
+                        None => format!("missing {} API key. Either configure an API key environment variable or directly configure the API key", self.display_name)
+                    }
                 })?,
-            ProviderAuth::OAuth { access, .. } => access.clone(),
+            ProviderAuthConfig::OAuth(config) => ProviderCredentials::OAuth(config.clone())
         };
 
         Ok(self.api.build_api(ProviderConfig {
-            api_key,
+            auth,
             base_url: self.base_url.clone(),
-            options: self.runtime_options(),
+            options: self.options.clone(),
         })?)
-    }
-
-    fn runtime_options(&self) -> Value {
-        match &self.auth {
-            ProviderAuth::ApiKey { .. } => self.options.clone(),
-            ProviderAuth::OAuth {
-                refresh,
-                expires,
-                account_id,
-                ..
-            } => {
-                let mut options = self.options.clone();
-                if !options.is_object() {
-                    options = serde_json::json!({});
-                }
-                let map = options.as_object_mut().expect("options was object above");
-                map.insert("provider".to_string(), Value::String(self.name.clone()));
-                map.insert("refresh".to_string(), Value::String(refresh.clone()));
-                map.insert("expires".to_string(), Value::Number((*expires).into()));
-                map.insert("accountId".to_string(), Value::String(account_id.clone()));
-                options
-            }
-        }
     }
 }
 
@@ -279,17 +251,15 @@ pub fn configured_provider_from_entry(
     entry: &ProviderConfigEntry,
 ) -> Result<ConfiguredProvider, Box<dyn std::error::Error>> {
     match entry {
-        ProviderConfigEntry::OpenAiApi(config) => configured_openai_provider(config),
+        ProviderConfigEntry::OpenAiApi(config) => Ok(configured_openai_provider(config)),
         ProviderConfigEntry::OpenAiCodex(config) => Ok(configured_codex_provider(config)),
-        ProviderConfigEntry::AnthropicApi(config) => configured_anthropic_provider(config),
+        ProviderConfigEntry::AnthropicApi(config) => Ok(configured_anthropic_provider(config)),
         ProviderConfigEntry::Custom(config) => configured_custom_provider(config),
     }
 }
 
-fn configured_openai_provider(
-    config: &ApiKeyProviderConfig,
-) -> Result<ConfiguredProvider, Box<dyn std::error::Error>> {
-    Ok(ConfiguredProvider {
+fn configured_openai_provider(config: &ApiKeyProviderConfig) -> ConfiguredProvider {
+    ConfiguredProvider {
         name: openai::PROVIDER_NAME.to_string(),
         api: &api::openai_responses::API,
         display_name: "OpenAI".to_string(),
@@ -299,14 +269,12 @@ fn configured_openai_provider(
             .clone()
             .unwrap_or_else(|| openai::DEFAULT_BASE_URL.to_string()),
         options: Value::Null,
-        models: models_from_metadata(openai::default_models()),
-    })
+        models: openai::default_models(),
+    }
 }
 
-fn configured_anthropic_provider(
-    config: &ApiKeyProviderConfig,
-) -> Result<ConfiguredProvider, Box<dyn std::error::Error>> {
-    Ok(ConfiguredProvider {
+fn configured_anthropic_provider(config: &ApiKeyProviderConfig) -> ConfiguredProvider {
+    ConfiguredProvider {
         name: anthropic::PROVIDER_NAME.to_string(),
         api: &api::anthropic_messages::API,
         display_name: "Anthropic".to_string(),
@@ -316,17 +284,17 @@ fn configured_anthropic_provider(
             .clone()
             .unwrap_or_else(|| anthropic::DEFAULT_BASE_URL.to_string()),
         options: Value::Null,
-        models: models_from_metadata(anthropic::default_models()),
-    })
+        models: anthropic::default_models(),
+    }
 }
 
-fn api_key_auth(config: &ApiKeyProviderConfig, default_env: &str) -> ProviderAuth {
-    ProviderAuth::ApiKey {
+fn api_key_auth(config: &ApiKeyProviderConfig, default_env: &str) -> ProviderAuthConfig {
+    ProviderAuthConfig::ApiKey {
         api_key: config.api_key.clone(),
         api_key_env: config
             .api_key_env
             .clone()
-            .unwrap_or_else(|| default_env.to_string()),
+            .or_else(|| Option::Some(default_env.to_string())),
     }
 }
 
@@ -335,15 +303,15 @@ fn configured_codex_provider(config: &CodexProviderConfig) -> ConfiguredProvider
         name: codex::PROVIDER_NAME.to_string(),
         api: &api::openai_responses::API,
         display_name: "OpenAI Codex".to_string(),
-        auth: ProviderAuth::OAuth {
+        auth: ProviderAuthConfig::OAuth(OAuthCredentials {
             access: config.access.clone(),
             refresh: config.refresh.clone(),
             expires: config.expires,
             account_id: config.account_id.clone(),
-        },
+        }),
         base_url: codex::DEFAULT_BASE_URL.to_string(),
         options: Value::Null,
-        models: models_from_metadata(codex::default_models()),
+        models: codex::default_models(),
     }
 }
 
@@ -352,6 +320,7 @@ fn configured_custom_provider(
 ) -> Result<ConfiguredProvider, Box<dyn std::error::Error>> {
     let api = api::find_model_api(&config.api)
         .ok_or_else(|| format!("unsupported provider API: {}", config.api))?;
+    // FIXME: should be able to automatically discover models
     if config.models.is_empty() {
         return Err(format!(
             "custom provider '{}' must specify at least one model",
@@ -364,12 +333,9 @@ fn configured_custom_provider(
         name: config.name.clone(),
         api,
         display_name: config.api.clone(),
-        auth: ProviderAuth::ApiKey {
+        auth: ProviderAuthConfig::ApiKey {
             api_key: config.api_key.clone(),
-            api_key_env: config
-                .api_key_env
-                .clone()
-                .unwrap_or_else(|| "TAU_API_KEY".to_string()),
+            api_key_env: config.api_key_env.clone(),
         },
         base_url: config.base_url.clone(),
         options: config.options.clone(),
@@ -380,7 +346,7 @@ fn configured_custom_provider(
 fn configured_models_for_api(
     api: &'static api::ModelApiFactory,
     models: &[ModelConfigEntry],
-) -> Result<Vec<ConfiguredModel>, Box<dyn std::error::Error>> {
+) -> Result<Vec<ModelMetadata>, Box<dyn std::error::Error>> {
     models
         .iter()
         .map(|model| configured_model(api, model))
@@ -390,68 +356,35 @@ fn configured_models_for_api(
 fn configured_model(
     api: &'static api::ModelApiFactory,
     model: &ModelConfigEntry,
-) -> Result<ConfiguredModel, Box<dyn std::error::Error>> {
-    match model {
-        ModelConfigEntry::Name(name) => Ok(ConfiguredModel {
-            name: name.clone(),
-            id: name.clone(),
-            metadata: Some(ModelMetadata::custom(name.clone())),
-        }),
-        ModelConfigEntry::Detailed {
-            name,
-            id,
-            context_length,
-            max_tokens,
-            thinking_effort,
-            provider_config,
-        } => {
-            let id = id.clone().unwrap_or_else(|| name.clone());
-            Ok(ConfiguredModel {
-                name: name.clone(),
-                id: id.clone(),
-                metadata: Some(ModelMetadata {
-                    name: name.clone(),
-                    id,
-                    context_length: *context_length,
-                    max_tokens: *max_tokens,
-                    thinking_effort: *thinking_effort,
-                    provider_config: parse_provider_model_config(api, provider_config)?,
-                    costs: None,
-                }),
-            })
-        }
-    }
+) -> Result<ModelMetadata, Box<dyn std::error::Error>> {
+    Ok(ModelMetadata {
+        name: model.name.clone(),
+        id: model.id.clone().unwrap_or_else(|| model.name.clone()),
+        context_length: model.context_length.unwrap_or_default(),
+        max_tokens: model.max_tokens.unwrap_or_default(),
+        thinking_effort: model.thinking_effort.or(Some(ThinkingEffort::Max)),
+        provider_config: parse_provider_model_config(api, model.provider_config.as_ref())?,
+        costs: None,
+    })
 }
 
 fn parse_provider_model_config(
     api: &'static api::ModelApiFactory,
-    value: &Value,
+    value: Option<&Value>,
 ) -> Result<Option<Arc<dyn ProviderModelConfig>>, Box<dyn std::error::Error>> {
-    if value.is_null() {
-        return Ok(None);
+    match value {
+        Some(value) if !value.is_null() => match api.name {
+            "anthropic_messages" => Ok(Some(Arc::new(serde_json::from_value::<
+                anthropic::AnthropicModelConfig,
+            >(value.clone())?))),
+            _ => Err(format!(
+                "provider_config is not supported for provider API {}",
+                api.name
+            )
+            .into()),
+        },
+        _ => Ok(None),
     }
-
-    match api.name {
-        "anthropic_messages" => Ok(Some(Arc::new(serde_json::from_value::<
-            anthropic::AnthropicModelConfig,
-        >(value.clone())?))),
-        _ => Err(format!(
-            "provider_config is not supported for provider API {}",
-            api.name
-        )
-        .into()),
-    }
-}
-
-fn models_from_metadata(models: Vec<ModelMetadata>) -> Vec<ConfiguredModel> {
-    models
-        .into_iter()
-        .map(|metadata| ConfiguredModel {
-            name: metadata.name.to_string(),
-            id: metadata.id.to_string(),
-            metadata: Some(metadata),
-        })
-        .collect()
 }
 
 // Backwards-compatible re-exports for callers that still import API items from `providers`.
@@ -472,7 +405,7 @@ mod tests {
                 "api": "openai_responses",
                 "api_key": "none",
                 "base_url": "http://localhost:8080",
-                "models": ["model-a"]
+                "models": [{"name": "model-a"}]
             }
         }))
         .unwrap();
@@ -498,8 +431,10 @@ mod tests {
 
         assert_eq!(provider.name, openai::PROVIDER_NAME);
         match provider.auth {
-            ProviderAuth::ApiKey { api_key, .. } => assert_eq!(api_key.as_deref(), Some("sk-test")),
-            ProviderAuth::OAuth { .. } => panic!("expected API key auth"),
+            ProviderAuthConfig::ApiKey { api_key, .. } => {
+                assert_eq!(api_key.as_deref(), Some("sk-test"))
+            }
+            ProviderAuthConfig::OAuth { .. } => panic!("expected API key auth"),
         }
         assert!(!provider.models.is_empty());
     }

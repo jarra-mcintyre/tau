@@ -8,7 +8,7 @@ use crate::{
 pub fn assistant_content_as_text(part: &ContentPart) -> String {
     match part {
         ContentPart::Text { text, .. } => text.clone(),
-        ContentPart::Thinking { text, .. } => format!("[thinking: {text}]"),
+        ContentPart::Thinking { summary: text, .. } => format!("[thinking: {}]", text.join("\n")),
         ContentPart::Refusal { text, .. } => text.clone(),
         ContentPart::FailedToolCall { text, .. } => text.clone(),
         ContentPart::Image {
@@ -59,7 +59,7 @@ pub fn tool_result_json(result: &ToolResult) -> Result<String, ProviderError> {
 fn tool_result_part_json(part: &ContentPart) -> Result<Value, ProviderError> {
     Ok(match part {
         ContentPart::Text { text, .. } => json!({ "type": "text", "text": text }),
-        ContentPart::Thinking { text, .. } => json!({ "type": "thinking", "text": text }),
+        ContentPart::Thinking { summary: text, .. } => json!({ "type": "thinking", "text": text }),
         ContentPart::Refusal { text, .. } => json!({ "type": "refusal", "text": text }),
         ContentPart::FailedToolCall { text, .. } => {
             json!({ "type": "failed_tool_call", "text": text })
