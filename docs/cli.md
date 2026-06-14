@@ -7,7 +7,7 @@ Tau works differently to other agentic coding tools. There's no TUI. You just in
 You code with Tau by sending messages on the command line. Messages are added to the current conversation history.
 
 ```bash
-tau # shows the current stage (conversation alias, message offset, token usage .etc.)
+tau # shows the current status (conversation alias, message offset, token usage .etc.)
 
 # You build messages with message commands. These use the 'm' alias.
 tau m "Also ..."  # Send a message to the model. This sends the message straight away
@@ -123,5 +123,6 @@ Provider commands allow you to update the current provider/model configuration.
 - `query <query>` (`-q`): Ask a general question. No project context or edit tools are provided to the model. Use `prompt` (`-p`) if you need these. Accepts the `--model`/`-m` flags.
 - `prompt <prompt>` (`-p`): Execute a prompt (like `-p` in other coding agents). You can optionally stream additional content on `stdin` to allow piped usage. Accepts the `--read-only`/`-r` and `--model`/`-m` flags.
 - `file <path>` (`-f`): Same as `prompt` (`-p`), but reads the prompt from a file. Accepts the `--read-only`/`-r` and `--model`/`-m` flags.
+- `status`: Show the current provider, model, conversation, message offset and token usage. This is the default when no command is given.
 - `version` (`-v`): Show the current Tau version.
 - `help (<question>)` (`h`, `-h`): Show the help. You can optionally specify a question.

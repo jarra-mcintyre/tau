@@ -477,7 +477,7 @@ impl TauSession {
     pub async fn request_response(&mut self) -> Result<TauResponse, ProviderError> {
         let provider = self.provider.clone();
         let response = provider.respond(self).await?;
-        TokenUsage::add(&mut self.conversation.token_usage, response.usage.as_ref());
+        self.conversation.token_usage = TokenUsage::sum(self.conversation.token_usage.as_ref(), response.usage.as_ref());
         self.record_provider_response(&response);
 
         Ok(response)

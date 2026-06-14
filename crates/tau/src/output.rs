@@ -53,6 +53,11 @@ pub(crate) fn print_token_usage(usage: Option<&TokenUsage>, output: &OutputStyle
         return;
     };
 
+    let line = format!("[tokens] {}", format_token_usage(usage));
+    output.println_styled(Style::Muted, &line);
+}
+
+pub(crate) fn format_token_usage(usage: &TokenUsage) -> String {
     let mut fields = Vec::new();
     if let Some(uncached_input) = usage.uncached_input_tokens {
         fields.push(format!("uncached_input={uncached_input}"));
@@ -70,8 +75,7 @@ pub(crate) fn print_token_usage(usage: Option<&TokenUsage>, output: &OutputStyle
         fields.push(format!("total={total}"));
     }
 
-    let line = format!("[tokens] {}", fields.join(", "));
-    output.println_styled(Style::Muted, &line);
+    fields.join(", ")
 }
 
 pub(crate) fn print_content(content: &ContentPart, output: &OutputStyle) {

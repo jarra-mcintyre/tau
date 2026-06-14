@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::providers::{ModelCosts, ModelMetadata};
 
-pub const PROVIDER_NAME: &str = "openai";
+pub const PROVIDER_NAME: &str = "openai-api";
 pub const API_KEY_ENV: &str = "OPENAI_API_KEY";
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 

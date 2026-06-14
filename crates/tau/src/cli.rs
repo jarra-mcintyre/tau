@@ -4,11 +4,20 @@ use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 
 use crate::provider_config::ConfigurableProvider;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CliInvocation {
     pub modifiers: Modifiers,
     pub command: Command,
+    pub(crate) definition: &'static CommandDefinition,
 }
+
+impl PartialEq for CliInvocation {
+    fn eq(&self, other: &Self) -> bool {
+        self.modifiers == other.modifiers && self.command == other.command
+    }
+}
+
+impl Eq for CliInvocation {}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Modifiers {
@@ -252,6 +261,8 @@ enum RawCommand {
     #[command(name = "provider-list", alias = "pl")]
     ProviderList,
 
+    #[command(name = "status")]
+    Status,
     #[command(name = "query")]
     Query { query: String },
     #[command(name = "prompt")]
@@ -297,157 +308,328 @@ impl TryFrom<RawCli> for CliInvocation {
             ));
         }
 
-        let command = if top_level_command_count == 0 {
-            Command::Status
+        let (command, definition) = if top_level_command_count == 0 {
+            (Command::Status, &STATUS_COMMAND)
         } else if let Some(query) = raw.query {
-            Command::Query { query }
+            (Command::Query { query }, &QUERY_COMMAND)
         } else if let Some(prompt) = raw.prompt {
-            Command::Prompt { prompt }
+            (Command::Prompt { prompt }, &PROMPT_COMMAND)
         } else if let Some(path) = raw.file {
-            Command::File { path }
+            (Command::File { path }, &FILE_COMMAND)
         } else if raw.version {
-            Command::Version
+            (Command::Version, &VERSION_COMMAND)
         } else if let Some(question) = raw.help {
-            Command::Help { question }
+            (Command::Help { question }, &HELP_COMMAND)
         } else {
             command_from_raw(raw.command.expect("checked above"), raw.alias)
         };
 
-        validate_modifiers(&modifiers, &command, command.allowed_modifiers())?;
+        validate_modifiers(&modifiers, &command, definition.allowed_modifiers)?;
 
-        Ok(Self { modifiers, command })
+        Ok(Self {
+            modifiers,
+            command,
+            definition,
+        })
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct AllowedModifiers {
-    yes: bool,
-    conversation: bool,
-    model: bool,
-    read_only: bool,
-    writes_allowed: bool,
-    json: bool,
-    alias: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommandDefinition {
+    pub(crate) name: &'static str,
+    pub(crate) aliases: &'static [&'static str],
+    pub(crate) usage: &'static str,
+    pub(crate) summary: &'static str,
+    pub(crate) category: CommandCategory,
+    pub(crate) allowed_modifiers: &'static [Modifier],
 }
 
-impl AllowedModifiers {
-    const NONE: Self = Self {
-        yes: false,
-        conversation: false,
-        model: false,
-        read_only: false,
-        writes_allowed: false,
-        json: false,
-        alias: false,
-    };
-
-    const fn yes(mut self) -> Self {
-        self.yes = true;
-        self
-    }
-
-    const fn conversation(mut self) -> Self {
-        self.conversation = true;
-        self
-    }
-
-    const fn model(mut self) -> Self {
-        self.model = true;
-        self
-    }
-
-    const fn read_only(mut self) -> Self {
-        self.read_only = true;
-        self
-    }
-
-    const fn writes_allowed(mut self) -> Self {
-        self.writes_allowed = true;
-        self
-    }
-
-    const fn json(mut self) -> Self {
-        self.json = true;
-        self
-    }
-
-    const fn alias(mut self) -> Self {
-        self.alias = true;
-        self
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandCategory {
+    General,
+    Message,
+    Conversation,
+    Provider,
 }
 
-impl Command {
-    fn allowed_modifiers(&self) -> AllowedModifiers {
-        match self {
-            Command::Status => AllowedModifiers::NONE,
-
-            Command::Message(command) => match command {
-                MessageCommand::Message { .. }
-                | MessageCommand::Add { .. }
-                | MessageCommand::Include { .. }
-                | MessageCommand::Paste
-                | MessageCommand::Reference { .. }
-                | MessageCommand::Send
-                | MessageCommand::Echo => AllowedModifiers::NONE.conversation(),
-                MessageCommand::Clear | MessageCommand::Undo { .. } => {
-                    AllowedModifiers::NONE.conversation().yes()
-                }
-            },
-
-            Command::Conversation(command) => match command {
-                ConversationCommand::Create { .. } => AllowedModifiers::NONE.alias().read_only(),
-                ConversationCommand::Alias { .. } => AllowedModifiers::NONE,
-                ConversationCommand::History => AllowedModifiers::NONE.json(),
-                ConversationCommand::Compact => AllowedModifiers::NONE.yes(),
-                ConversationCommand::Fork { .. } => {
-                    AllowedModifiers::NONE.alias().read_only().writes_allowed()
-                }
-                ConversationCommand::Switch { .. } => AllowedModifiers::NONE,
-                ConversationCommand::List => AllowedModifiers::NONE.json(),
-                ConversationCommand::Delete { .. } => AllowedModifiers::NONE.yes(),
-            },
-
-            Command::Provider(command) => match command {
-                ProviderCommand::Select { .. } => AllowedModifiers::NONE.yes(),
-                ProviderCommand::Thinking { .. } => AllowedModifiers::NONE,
-                ProviderCommand::Config { .. } => AllowedModifiers::NONE,
-                ProviderCommand::List => AllowedModifiers::NONE.json(),
-            },
-
-            Command::Query { .. } => AllowedModifiers::NONE.model(),
-            Command::Prompt { .. } | Command::File { .. } => {
-                AllowedModifiers::NONE.model().read_only()
-            }
-            Command::Version | Command::Help { .. } => AllowedModifiers::NONE,
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Modifier {
+    Yes,
+    Conversation,
+    Model,
+    ReadOnly,
+    WritesAllowed,
+    Json,
+    Alias,
 }
+
+const STATUS_COMMAND: CommandDefinition = CommandDefinition {
+    name: "status",
+    aliases: &[],
+    usage: "tau status",
+    summary: "Show the current Tau status.",
+    category: CommandCategory::General,
+    allowed_modifiers: &[],
+};
+
+const QUERY_COMMAND: CommandDefinition = CommandDefinition {
+    name: "query",
+    aliases: &[],
+    usage: "tau query <QUERY>",
+    summary: "Ask a general question with no project context.",
+    category: CommandCategory::General,
+    allowed_modifiers: &[Modifier::Model],
+};
+
+const PROMPT_COMMAND: CommandDefinition = CommandDefinition {
+    name: "prompt",
+    aliases: &[],
+    usage: "tau prompt <PROMPT>",
+    summary: "Execute a prompt with project context.",
+    category: CommandCategory::General,
+    allowed_modifiers: &[Modifier::Model, Modifier::ReadOnly],
+};
+
+const FILE_COMMAND: CommandDefinition = CommandDefinition {
+    name: "file",
+    aliases: &[],
+    usage: "tau file <PATH>",
+    summary: "Execute a prompt read from a file.",
+    category: CommandCategory::General,
+    allowed_modifiers: &[Modifier::Model, Modifier::ReadOnly],
+};
+
+const VERSION_COMMAND: CommandDefinition = CommandDefinition {
+    name: "version",
+    aliases: &[],
+    usage: "tau version",
+    summary: "Show the current Tau version.",
+    category: CommandCategory::General,
+    allowed_modifiers: &[],
+};
+
+const HELP_COMMAND: CommandDefinition = CommandDefinition {
+    name: "help",
+    aliases: &["h"],
+    usage: "tau help [QUESTION]",
+    summary: "Show help, optionally asking a question about Tau.",
+    category: CommandCategory::General,
+    allowed_modifiers: &[],
+};
+
+const MESSAGE_COMMAND: CommandDefinition = CommandDefinition {
+    name: "message",
+    aliases: &["m"],
+    usage: "tau message [CONTENTS]...",
+    summary: "Set the current message contents.",
+    category: CommandCategory::Message,
+    allowed_modifiers: &[Modifier::Conversation],
+};
+
+const MESSAGE_ADD_COMMAND: CommandDefinition = CommandDefinition {
+    name: "message-add",
+    aliases: &["ma"],
+    usage: "tau message-add [CONTENTS]...",
+    summary: "Append text to the current message.",
+    category: CommandCategory::Message,
+    allowed_modifiers: &[Modifier::Conversation],
+};
+
+const MESSAGE_INCLUDE_COMMAND: CommandDefinition = CommandDefinition {
+    name: "message-include",
+    aliases: &["mi"],
+    usage: "tau message-include [PATH]...",
+    summary: "Include files in the current message.",
+    category: CommandCategory::Message,
+    allowed_modifiers: &[Modifier::Conversation],
+};
+
+const MESSAGE_PASTE_COMMAND: CommandDefinition = CommandDefinition {
+    name: "message-paste",
+    aliases: &["mp"],
+    usage: "tau message-paste",
+    summary: "Paste clipboard contents into the current message.",
+    category: CommandCategory::Message,
+    allowed_modifiers: &[Modifier::Conversation],
+};
+
+const MESSAGE_REFERENCE_COMMAND: CommandDefinition = CommandDefinition {
+    name: "message-reference",
+    aliases: &["mr"],
+    usage: "tau message-reference [PATH]...",
+    summary: "Reference files from the current message.",
+    category: CommandCategory::Message,
+    allowed_modifiers: &[Modifier::Conversation],
+};
+
+const MESSAGE_SEND_COMMAND: CommandDefinition = CommandDefinition {
+    name: "message-send",
+    aliases: &["ms"],
+    usage: "tau message-send",
+    summary: "Send the current message.",
+    category: CommandCategory::Message,
+    allowed_modifiers: &[Modifier::Conversation],
+};
+
+const MESSAGE_ECHO_COMMAND: CommandDefinition = CommandDefinition {
+    name: "message-echo",
+    aliases: &["me"],
+    usage: "tau message-echo",
+    summary: "Print the current message.",
+    category: CommandCategory::Message,
+    allowed_modifiers: &[Modifier::Conversation],
+};
+
+const MESSAGE_CLEAR_COMMAND: CommandDefinition = CommandDefinition {
+    name: "message-clear",
+    aliases: &["mc"],
+    usage: "tau message-clear",
+    summary: "Clear the current message.",
+    category: CommandCategory::Message,
+    allowed_modifiers: &[Modifier::Conversation, Modifier::Yes],
+};
+
+const MESSAGE_UNDO_COMMAND: CommandDefinition = CommandDefinition {
+    name: "message-undo",
+    aliases: &["mu"],
+    usage: "tau message-undo [OFFSET]",
+    summary: "Undo messages from the current conversation.",
+    category: CommandCategory::Message,
+    allowed_modifiers: &[Modifier::Conversation, Modifier::Yes],
+};
+
+const CONVERSATION_COMMAND: CommandDefinition = CommandDefinition {
+    name: "conversation",
+    aliases: &["c"],
+    usage: "tau conversation",
+    summary: "Create a conversation.",
+    category: CommandCategory::Conversation,
+    allowed_modifiers: &[Modifier::Alias, Modifier::ReadOnly],
+};
+
+const CONVERSATION_ALIAS_COMMAND: CommandDefinition = CommandDefinition {
+    name: "conversation-alias",
+    aliases: &["ca"],
+    usage: "tau conversation-alias <ALIAS>",
+    summary: "Rename the current conversation.",
+    category: CommandCategory::Conversation,
+    allowed_modifiers: &[],
+};
+
+const CONVERSATION_HISTORY_COMMAND: CommandDefinition = CommandDefinition {
+    name: "conversation-history",
+    aliases: &["ch"],
+    usage: "tau conversation-history",
+    summary: "Show the current conversation history.",
+    category: CommandCategory::Conversation,
+    allowed_modifiers: &[Modifier::Json],
+};
+
+const CONVERSATION_COMPACT_COMMAND: CommandDefinition = CommandDefinition {
+    name: "conversation-compact",
+    aliases: &["cc"],
+    usage: "tau conversation-compact",
+    summary: "Compact the current conversation.",
+    category: CommandCategory::Conversation,
+    allowed_modifiers: &[Modifier::Yes],
+};
+
+const CONVERSATION_FORK_COMMAND: CommandDefinition = CommandDefinition {
+    name: "conversation-fork",
+    aliases: &["cf"],
+    usage: "tau conversation-fork [OFFSET]",
+    summary: "Fork the current conversation.",
+    category: CommandCategory::Conversation,
+    allowed_modifiers: &[Modifier::Alias, Modifier::ReadOnly, Modifier::WritesAllowed],
+};
+
+const CONVERSATION_SWITCH_COMMAND: CommandDefinition = CommandDefinition {
+    name: "conversation-switch",
+    aliases: &["cs"],
+    usage: "tau conversation-switch <ALIAS>",
+    summary: "Switch to another conversation.",
+    category: CommandCategory::Conversation,
+    allowed_modifiers: &[],
+};
+
+const CONVERSATION_LIST_COMMAND: CommandDefinition = CommandDefinition {
+    name: "conversation-list",
+    aliases: &["cl"],
+    usage: "tau conversation-list",
+    summary: "List conversations.",
+    category: CommandCategory::Conversation,
+    allowed_modifiers: &[Modifier::Json],
+};
+
+const CONVERSATION_DELETE_COMMAND: CommandDefinition = CommandDefinition {
+    name: "conversation-delete",
+    aliases: &["cd"],
+    usage: "tau conversation-delete <ALIAS>",
+    summary: "Delete a conversation.",
+    category: CommandCategory::Conversation,
+    allowed_modifiers: &[Modifier::Yes],
+};
+
+const PROVIDER_COMMAND: CommandDefinition = CommandDefinition {
+    name: "provider",
+    aliases: &["p"],
+    usage: "tau provider <PROVIDER/MODEL>",
+    summary: "Select the current provider and model.",
+    category: CommandCategory::Provider,
+    allowed_modifiers: &[Modifier::Yes],
+};
+
+const PROVIDER_THINKING_COMMAND: CommandDefinition = CommandDefinition {
+    name: "provider-thinking",
+    aliases: &["pt"],
+    usage: "tau provider-thinking <LEVEL>",
+    summary: "Set the current thinking level.",
+    category: CommandCategory::Provider,
+    allowed_modifiers: &[],
+};
+
+const PROVIDER_CONFIG_COMMAND: CommandDefinition = CommandDefinition {
+    name: "provider-config",
+    aliases: &[],
+    usage: "tau provider-config [PROVIDER]",
+    summary: "Configure a provider.",
+    category: CommandCategory::Provider,
+    allowed_modifiers: &[],
+};
+
+const PROVIDER_LIST_COMMAND: CommandDefinition = CommandDefinition {
+    name: "provider-list",
+    aliases: &["pl"],
+    usage: "tau provider-list",
+    summary: "List configured providers.",
+    category: CommandCategory::Provider,
+    allowed_modifiers: &[Modifier::Json],
+};
 
 fn validate_modifiers(
     modifiers: &Modifiers,
     command: &Command,
-    allowed: AllowedModifiers,
+    allowed: &[Modifier],
 ) -> Result<(), clap::Error> {
-    if modifiers.yes && !allowed.yes {
+    if modifiers.yes && !allowed.contains(&Modifier::Yes) {
         return Err(unsupported_modifier("--yes/-y", command));
     }
-    if modifiers.conversation.is_some() && !allowed.conversation {
+    if modifiers.conversation.is_some() && !allowed.contains(&Modifier::Conversation) {
         return Err(unsupported_modifier("--conversation/-c", command));
     }
-    if modifiers.model.is_some() && !allowed.model {
+    if modifiers.model.is_some() && !allowed.contains(&Modifier::Model) {
         return Err(unsupported_modifier("--model/-m", command));
     }
-    if modifiers.read_only && !allowed.read_only {
+    if modifiers.read_only && !allowed.contains(&Modifier::ReadOnly) {
         return Err(unsupported_modifier("--read-only/-r", command));
     }
-    if modifiers.writes_allowed && !allowed.writes_allowed {
+    if modifiers.writes_allowed && !allowed.contains(&Modifier::WritesAllowed) {
         return Err(unsupported_modifier("--writes-allowed/-w", command));
     }
-    if modifiers.json && !allowed.json {
+    if modifiers.json && !allowed.contains(&Modifier::Json) {
         return Err(unsupported_modifier("--json/-j", command));
     }
-    if modifiers.alias.is_some() && !allowed.alias {
+    if modifiers.alias.is_some() && !allowed.contains(&Modifier::Alias) {
         return Err(unsupported_modifier("--alias/-a", command));
     }
 
@@ -461,63 +643,117 @@ fn unsupported_modifier(modifier: &str, _command: &Command) -> clap::Error {
     )
 }
 
-fn command_from_raw(command: RawCommand, alias_modifier: Option<String>) -> Command {
+fn command_from_raw(
+    command: RawCommand,
+    alias_modifier: Option<String>,
+) -> (Command, &'static CommandDefinition) {
     match command {
-        RawCommand::Message { contents } => Command::Message(MessageCommand::Message {
-            contents: join_optional(contents),
-        }),
-        RawCommand::MessageAdd { contents } => Command::Message(MessageCommand::Add {
-            contents: join_optional(contents),
-        }),
-        RawCommand::MessageInclude { paths } => Command::Message(MessageCommand::Include { paths }),
-        RawCommand::MessagePaste => Command::Message(MessageCommand::Paste),
-        RawCommand::MessageReference { paths } => {
-            Command::Message(MessageCommand::Reference { paths })
-        }
-        RawCommand::MessageSend => Command::Message(MessageCommand::Send),
-        RawCommand::MessageEcho => Command::Message(MessageCommand::Echo),
-        RawCommand::MessageClear => Command::Message(MessageCommand::Clear),
-        RawCommand::MessageUndo { offset } => Command::Message(MessageCommand::Undo {
-            offset: offset.unwrap_or(-1),
-        }),
-        RawCommand::Conversation => Command::Conversation(ConversationCommand::Create {
-            alias: alias_modifier,
-        }),
-        RawCommand::ConversationAlias { alias } => {
-            Command::Conversation(ConversationCommand::Alias { alias })
-        }
-        RawCommand::ConversationHistory => Command::Conversation(ConversationCommand::History),
-        RawCommand::ConversationCompact => Command::Conversation(ConversationCommand::Compact),
-        RawCommand::ConversationFork { offset } => {
+        RawCommand::Message { contents } => (
+            Command::Message(MessageCommand::Message {
+                contents: join_optional(contents),
+            }),
+            &MESSAGE_COMMAND,
+        ),
+        RawCommand::MessageAdd { contents } => (
+            Command::Message(MessageCommand::Add {
+                contents: join_optional(contents),
+            }),
+            &MESSAGE_ADD_COMMAND,
+        ),
+        RawCommand::MessageInclude { paths } => (
+            Command::Message(MessageCommand::Include { paths }),
+            &MESSAGE_INCLUDE_COMMAND,
+        ),
+        RawCommand::MessagePaste => (
+            Command::Message(MessageCommand::Paste),
+            &MESSAGE_PASTE_COMMAND,
+        ),
+        RawCommand::MessageReference { paths } => (
+            Command::Message(MessageCommand::Reference { paths }),
+            &MESSAGE_REFERENCE_COMMAND,
+        ),
+        RawCommand::MessageSend => (
+            Command::Message(MessageCommand::Send),
+            &MESSAGE_SEND_COMMAND,
+        ),
+        RawCommand::MessageEcho => (
+            Command::Message(MessageCommand::Echo),
+            &MESSAGE_ECHO_COMMAND,
+        ),
+        RawCommand::MessageClear => (
+            Command::Message(MessageCommand::Clear),
+            &MESSAGE_CLEAR_COMMAND,
+        ),
+        RawCommand::MessageUndo { offset } => (
+            Command::Message(MessageCommand::Undo {
+                offset: offset.unwrap_or(-1),
+            }),
+            &MESSAGE_UNDO_COMMAND,
+        ),
+        RawCommand::Conversation => (
+            Command::Conversation(ConversationCommand::Create {
+                alias: alias_modifier,
+            }),
+            &CONVERSATION_COMMAND,
+        ),
+        RawCommand::ConversationAlias { alias } => (
+            Command::Conversation(ConversationCommand::Alias { alias }),
+            &CONVERSATION_ALIAS_COMMAND,
+        ),
+        RawCommand::ConversationHistory => (
+            Command::Conversation(ConversationCommand::History),
+            &CONVERSATION_HISTORY_COMMAND,
+        ),
+        RawCommand::ConversationCompact => (
+            Command::Conversation(ConversationCommand::Compact),
+            &CONVERSATION_COMPACT_COMMAND,
+        ),
+        RawCommand::ConversationFork { offset } => (
             Command::Conversation(ConversationCommand::Fork {
                 offset,
                 alias: alias_modifier,
-            })
-        }
-        RawCommand::ConversationSwitch { alias } => {
-            Command::Conversation(ConversationCommand::Switch { alias })
-        }
-        RawCommand::ConversationList => Command::Conversation(ConversationCommand::List),
-        RawCommand::ConversationDelete { alias } => {
-            Command::Conversation(ConversationCommand::Delete { alias })
-        }
-        RawCommand::Provider { model_ref } => {
-            Command::Provider(ProviderCommand::Select { model: model_ref })
-        }
-        RawCommand::ProviderThinking { level } => {
-            Command::Provider(ProviderCommand::Thinking { level })
-        }
-        RawCommand::ProviderConfig { provider } => {
-            Command::Provider(ProviderCommand::Config { provider })
-        }
-        RawCommand::ProviderList => Command::Provider(ProviderCommand::List),
-        RawCommand::Query { query } => Command::Query { query },
-        RawCommand::Prompt { prompt } => Command::Prompt { prompt },
-        RawCommand::File { path } => Command::File { path },
-        RawCommand::Version => Command::Version,
-        RawCommand::Help { question } => Command::Help {
-            question: join_optional(question),
-        },
+            }),
+            &CONVERSATION_FORK_COMMAND,
+        ),
+        RawCommand::ConversationSwitch { alias } => (
+            Command::Conversation(ConversationCommand::Switch { alias }),
+            &CONVERSATION_SWITCH_COMMAND,
+        ),
+        RawCommand::ConversationList => (
+            Command::Conversation(ConversationCommand::List),
+            &CONVERSATION_LIST_COMMAND,
+        ),
+        RawCommand::ConversationDelete { alias } => (
+            Command::Conversation(ConversationCommand::Delete { alias }),
+            &CONVERSATION_DELETE_COMMAND,
+        ),
+        RawCommand::Provider { model_ref } => (
+            Command::Provider(ProviderCommand::Select { model: model_ref }),
+            &PROVIDER_COMMAND,
+        ),
+        RawCommand::ProviderThinking { level } => (
+            Command::Provider(ProviderCommand::Thinking { level }),
+            &PROVIDER_THINKING_COMMAND,
+        ),
+        RawCommand::ProviderConfig { provider } => (
+            Command::Provider(ProviderCommand::Config { provider }),
+            &PROVIDER_CONFIG_COMMAND,
+        ),
+        RawCommand::ProviderList => (
+            Command::Provider(ProviderCommand::List),
+            &PROVIDER_LIST_COMMAND,
+        ),
+        RawCommand::Status => (Command::Status, &STATUS_COMMAND),
+        RawCommand::Query { query } => (Command::Query { query }, &QUERY_COMMAND),
+        RawCommand::Prompt { prompt } => (Command::Prompt { prompt }, &PROMPT_COMMAND),
+        RawCommand::File { path } => (Command::File { path }, &FILE_COMMAND),
+        RawCommand::Version => (Command::Version, &VERSION_COMMAND),
+        RawCommand::Help { question } => (
+            Command::Help {
+                question: join_optional(question),
+            },
+            &HELP_COMMAND,
+        ),
     }
 }
 
@@ -537,16 +773,24 @@ mod tests {
         parse_cli_from(args).unwrap_or_else(|error| panic!("{error}"))
     }
 
+    fn invocation(modifiers: Modifiers, command: Command) -> CliInvocation {
+        CliInvocation {
+            modifiers,
+            command,
+            definition: &STATUS_COMMAND,
+        }
+    }
+
     #[test]
     fn parses_message_command_with_alias_and_contents() {
         assert_eq!(
             parse(&["tau", "m", "Also", "check", "tests"]),
-            CliInvocation {
-                modifiers: Modifiers::default(),
-                command: Command::Message(MessageCommand::Message {
+            invocation(
+                Modifiers::default(),
+                Command::Message(MessageCommand::Message {
                     contents: Some("Also check tests".to_string())
-                }),
-            }
+                })
+            )
         );
     }
 
@@ -554,10 +798,10 @@ mod tests {
     fn parses_message_without_contents_for_editor() {
         assert_eq!(
             parse(&["tau", "message"]),
-            CliInvocation {
-                modifiers: Modifiers::default(),
-                command: Command::Message(MessageCommand::Message { contents: None }),
-            }
+            invocation(
+                Modifiers::default(),
+                Command::Message(MessageCommand::Message { contents: None })
+            )
         );
     }
 
@@ -565,15 +809,15 @@ mod tests {
     fn parses_message_building_commands() {
         assert_eq!(
             parse(&["tau", "-c", "bug-1234", "mi", "a.rs", "image.png"]),
-            CliInvocation {
-                modifiers: Modifiers {
+            invocation(
+                Modifiers {
                     conversation: Some("bug-1234".to_string()),
                     ..Modifiers::default()
                 },
-                command: Command::Message(MessageCommand::Include {
+                Command::Message(MessageCommand::Include {
                     paths: vec![PathBuf::from("a.rs"), PathBuf::from("image.png")]
-                }),
-            }
+                })
+            )
         );
 
         assert_eq!(
@@ -659,15 +903,15 @@ mod tests {
     fn parses_provider_commands() {
         assert_eq!(
             parse(&["tau", "-y", "p", "anthropic/opus-4.7"]),
-            CliInvocation {
-                modifiers: Modifiers {
+            invocation(
+                Modifiers {
                     yes: true,
                     ..Modifiers::default()
                 },
-                command: Command::Provider(ProviderCommand::Select {
+                Command::Provider(ProviderCommand::Select {
                     model: "anthropic/opus-4.7".to_string()
-                }),
-            }
+                })
+            )
         );
         assert_eq!(
             parse(&["tau", "pt", "xhigh"]).command,
@@ -702,16 +946,16 @@ mod tests {
                 "-p",
                 "Document the API"
             ]),
-            CliInvocation {
-                modifiers: Modifiers {
+            invocation(
+                Modifiers {
                     model: Some("anthropic/haiku-4.5".to_string()),
                     read_only: true,
                     ..Modifiers::default()
                 },
-                command: Command::Prompt {
+                Command::Prompt {
                     prompt: "Document the API".to_string()
-                },
-            }
+                }
+            )
         );
         assert_eq!(
             parse(&["tau", "-q", "How do generators work?"]).command,
@@ -772,6 +1016,7 @@ mod tests {
     #[test]
     fn parses_status_when_no_command_is_given() {
         assert_eq!(parse(&["tau"]).command, Command::Status);
+        assert_eq!(parse(&["tau", "status"]).command, Command::Status);
     }
 
     #[test]

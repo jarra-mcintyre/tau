@@ -88,7 +88,6 @@ pub async fn run_agent_turn_with_content(
     session.push_user_content(user_content);
     let mut response =
         request_response_with_hooks(session, hooks, RequestReason::UserMessage).await?;
-    let mut token_usage = response.usage.clone();
 
     loop {
         let mut tool_calls = Vec::new();
@@ -100,12 +99,11 @@ pub async fn run_agent_turn_with_content(
         }
 
         if tool_calls.is_empty() {
-            return Ok(AgentTurn { token_usage });
+            return Ok(AgentTurn { token_usage: session.total_token_usage().cloned() });
         }
 
         run_tools(session, &tool_calls, hooks).await?;
         response = request_response_with_hooks(session, hooks, RequestReason::ToolResults).await?;
-        token_usage = TokenUsage::sum(token_usage.as_ref(), response.usage.as_ref())
     }
 }
 
