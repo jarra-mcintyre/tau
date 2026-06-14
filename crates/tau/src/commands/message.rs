@@ -59,10 +59,10 @@ async fn send(
     let persistence = loaded_session.persistence;
 
     match run_turn(&mut session, &mut cli_config, &message, &output).await {
-        Ok(usage) => {
+        Ok(turn) => {
             crate::session::save_session(&persistence, cli_config.current_model(), &session)?;
             state.touch_session(&record.id)?;
-            print_token_usage(usage.as_ref(), &output);
+            print_token_usage(turn.token_usage.as_ref(), &output);
             Ok(())
         }
         Err(error) => {

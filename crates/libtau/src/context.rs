@@ -23,7 +23,6 @@ pub struct TauSession {
     provider: Arc<dyn ModelApi>,
     config: TauSessionConfig,
     provider_state: BTreeMap<String, ProviderState>,
-    last_token_usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -36,6 +35,8 @@ pub struct TauSessionConfig {
 pub struct Conversation {
     pub model: Option<String>,
     pub items: Vec<ConversationItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<TokenUsage>,
     /// Provider-specific conversation state for the session's current provider.
     ///
     /// Generic Tau content is stored in `items`; providers use this field to
@@ -283,7 +284,6 @@ impl TauSession {
             provider,
             config: TauSessionConfig::default(),
             provider_state: BTreeMap::new(),
-            last_token_usage: None,
         }
     }
 
@@ -320,7 +320,6 @@ impl TauSession {
         self.provider = provider;
         self.provider_state.clear();
         self.conversation.provider_data = None;
-        self.last_token_usage = None;
     }
 
     /// Refresh the provider. This preserves provider state and will panic if changing provider.
@@ -328,7 +327,6 @@ impl TauSession {
     pub fn refresh_provider(&mut self, provider: Arc<dyn ModelApi>) {
         assert_eq!(self.provider.name(), provider.name());
         self.provider = provider;
-        self.last_token_usage = None;
     }
 
     /// Set both the provider and model, clearing provider conversation state
@@ -341,8 +339,8 @@ impl TauSession {
         self.set_model(model);
     }
 
-    pub fn last_token_usage(&self) -> Option<&TokenUsage> {
-        self.last_token_usage.as_ref()
+    pub fn total_token_usage(&self) -> Option<&TokenUsage> {
+        self.conversation.token_usage.as_ref()
     }
 
     pub fn set_model(&mut self, model: impl Into<ModelMetadata>) {
@@ -479,7 +477,7 @@ impl TauSession {
     pub async fn request_response(&mut self) -> Result<TauResponse, ProviderError> {
         let provider = self.provider.clone();
         let response = provider.respond(self).await?;
-        self.last_token_usage = response.usage.clone();
+        TokenUsage::add(&mut self.conversation.token_usage, response.usage.as_ref());
         self.record_provider_response(&response);
 
         Ok(response)
@@ -551,9 +549,26 @@ impl ContentPart {
 mod tests {
     use super::*;
     use crate::{providers::ModelApi, tools};
+    use std::{collections::VecDeque, sync::Mutex};
 
     #[derive(Debug)]
     struct StubProvider;
+
+    #[derive(Debug)]
+    struct ResponsesProvider {
+        responses: Mutex<VecDeque<TauResponse>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelApi for ResponsesProvider {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+
+        async fn respond(&self, _session: &mut TauSession) -> Result<TauResponse, ProviderError> {
+            Ok(self.responses.lock().unwrap().pop_front().unwrap())
+        }
+    }
 
     #[async_trait::async_trait]
     impl ModelApi for StubProvider {
@@ -665,7 +680,74 @@ mod tests {
                 );
                 assert_eq!(session.model(), Some("gpt-test"));
                 assert_eq!(session.conversation().items.len(), 3);
-                assert_eq!(session.last_token_usage().unwrap().total_tokens, Some(15));
+                assert_eq!(session.total_token_usage().unwrap().total_tokens, Some(15));
+            });
+    }
+
+    #[test]
+    fn request_response_aggregates_token_usage_on_conversation() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let provider = ResponsesProvider {
+                    responses: Mutex::new(VecDeque::from([
+                        TauResponse {
+                            parts: vec![ResponsePart::Content {
+                                content: ContentPart::text("one"),
+                            }],
+                            usage: Some(TokenUsage {
+                                uncached_input_tokens: Some(2),
+                                cache_read_input_tokens: Some(3),
+                                cache_creation_input_tokens: None,
+                                output_tokens: Some(5),
+                                total_tokens: Some(10),
+                            }),
+                        },
+                        TauResponse {
+                            parts: vec![ResponsePart::Content {
+                                content: ContentPart::text("two"),
+                            }],
+                            usage: Some(TokenUsage {
+                                uncached_input_tokens: Some(7),
+                                cache_read_input_tokens: None,
+                                cache_creation_input_tokens: Some(11),
+                                output_tokens: Some(13),
+                                total_tokens: Some(31),
+                            }),
+                        },
+                    ])),
+                };
+                let mut session = TauContext::default().session(provider, "gpt-test");
+
+                session.request_response().await.unwrap();
+                session.request_response().await.unwrap();
+
+                assert_eq!(
+                    session.total_token_usage(),
+                    Some(&TokenUsage {
+                        uncached_input_tokens: Some(9),
+                        cache_read_input_tokens: Some(3),
+                        cache_creation_input_tokens: Some(11),
+                        output_tokens: Some(18),
+                        total_tokens: Some(41),
+                    })
+                );
+            });
+    }
+
+    #[test]
+    fn provider_refresh_does_not_clear_token_usage() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut session = TauContext::default().session(StubProvider, "gpt-test");
+                session.request_response().await.unwrap();
+
+                session.refresh_provider(Arc::new(StubProvider));
+
+                assert_eq!(session.total_token_usage().unwrap().total_tokens, Some(15));
             });
     }
 
