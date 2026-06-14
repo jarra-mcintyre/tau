@@ -379,6 +379,8 @@ struct AnthropicResponse {
 struct AnthropicUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -622,11 +624,18 @@ fn push_message(
 fn parse_response(response: AnthropicResponse) -> Result<TauResponse, ProviderError> {
     let usage = response.usage.map(|usage| {
         let total_tokens = match (usage.input_tokens, usage.output_tokens) {
-            (Some(input), Some(output)) => Some(input + output),
+            (Some(input), Some(output)) => Some(
+                input
+                    + usage.cache_creation_input_tokens.unwrap_or(0)
+                    + usage.cache_read_input_tokens.unwrap_or(0)
+                    + output,
+            ),
             _ => None,
         };
         TokenUsage {
-            input_tokens: usage.input_tokens,
+            uncached_input_tokens: usage.input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
             output_tokens: usage.output_tokens,
             total_tokens,
         }
@@ -1231,6 +1240,8 @@ mod tests {
             usage: Some(AnthropicUsage {
                 input_tokens: Some(50),
                 output_tokens: Some(12),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             }),
             stop_reason: Some("tool_use".to_string()),
             stop_sequence: None,

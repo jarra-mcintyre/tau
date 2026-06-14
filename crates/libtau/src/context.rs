@@ -570,7 +570,9 @@ mod tests {
             Ok(TauResponse {
                 parts: vec![ResponsePart::ToolUse { call: call.clone() }],
                 usage: Some(TokenUsage {
-                    input_tokens: Some(10),
+                    uncached_input_tokens: Some(10),
+                    cache_read_input_tokens: None,
+                    cache_creation_input_tokens: None,
                     output_tokens: Some(5),
                     total_tokens: Some(15),
                 }),
@@ -653,7 +655,9 @@ mod tests {
                             }
                         }],
                         usage: Some(TokenUsage {
-                            input_tokens: Some(10),
+                            uncached_input_tokens: Some(10),
+                            cache_read_input_tokens: None,
+                            cache_creation_input_tokens: None,
                             output_tokens: Some(5),
                             total_tokens: Some(15),
                         }),

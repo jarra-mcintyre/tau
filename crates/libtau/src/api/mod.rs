@@ -15,9 +15,12 @@ pub mod openai_responses;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
-    pub input_tokens: Option<u64>,
+    pub uncached_input_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+    //pub expected_cost: Option<u64>
 }
 
 impl TauResponse {

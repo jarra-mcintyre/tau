@@ -116,7 +116,14 @@ fn add_usage(total: &mut Option<TokenUsage>, usage: Option<&TokenUsage>) {
     };
     match total {
         Some(total) => {
-            total.input_tokens = add_optional(total.input_tokens, usage.input_tokens);
+            total.uncached_input_tokens =
+                add_optional(total.uncached_input_tokens, usage.uncached_input_tokens);
+            total.cache_read_input_tokens =
+                add_optional(total.cache_read_input_tokens, usage.cache_read_input_tokens);
+            total.cache_creation_input_tokens = add_optional(
+                total.cache_creation_input_tokens,
+                usage.cache_creation_input_tokens,
+            );
             total.output_tokens = add_optional(total.output_tokens, usage.output_tokens);
             total.total_tokens = add_optional(total.total_tokens, usage.total_tokens);
         }

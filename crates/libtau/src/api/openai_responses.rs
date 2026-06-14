@@ -277,8 +277,14 @@ struct OpenAiIncompleteDetails {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct OpenAiInputTokenDetails {
+    cached_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct OpenAiUsage {
     input_tokens: Option<u64>,
+    input_tokens_details: Option<OpenAiInputTokenDetails>,
     output_tokens: Option<u64>,
     total_tokens: Option<u64>,
 }
@@ -456,10 +462,19 @@ fn pending_input_items(session: &TauSession) -> &[ConversationItem] {
 }
 
 fn parse_response(response: OpenAiResponse) -> Result<TauResponse, ProviderError> {
-    let usage = response.usage.map(|usage| TokenUsage {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        total_tokens: usage.total_tokens,
+    let usage = response.usage.map(|usage| {
+        let cached_input_tokens = usage
+            .input_tokens_details
+            .and_then(|details| details.cached_tokens);
+        TokenUsage {
+            uncached_input_tokens: usage
+                .input_tokens
+                .map(|input_tokens| input_tokens.saturating_sub(cached_input_tokens.unwrap_or(0))),
+            cache_read_input_tokens: cached_input_tokens,
+            cache_creation_input_tokens: None,
+            output_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+        }
     });
     let mut parts = Vec::new();
     let mut saw_refusal = false;
@@ -972,6 +987,7 @@ mod tests {
             id: "resp_1".to_string(),
             usage: Some(OpenAiUsage {
                 input_tokens: Some(100),
+                input_tokens_details: None,
                 output_tokens: Some(20),
                 total_tokens: Some(120),
             }),

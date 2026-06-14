@@ -53,17 +53,24 @@ pub(crate) fn print_token_usage(usage: Option<&TokenUsage>, output: &OutputStyle
         return;
     };
 
-    let line = match (usage.input_tokens, usage.output_tokens, usage.total_tokens) {
-        (Some(input), Some(output_tokens), Some(total)) => {
-            format!("[tokens] input={input}, output={output_tokens}, total={total}")
-        }
-        (input, output_tokens, total) => format!(
-            "[tokens] input={}, output={}, total={}",
-            format_optional_u64(input),
-            format_optional_u64(output_tokens),
-            format_optional_u64(total)
-        ),
-    };
+    let mut fields = Vec::new();
+    if let Some(uncached_input) = usage.uncached_input_tokens {
+        fields.push(format!("uncached_input={uncached_input}"));
+    }
+    if let Some(cache_read_input) = usage.cache_read_input_tokens {
+        fields.push(format!("cache_read_input={cache_read_input}"));
+    }
+    if let Some(cache_creation_input) = usage.cache_creation_input_tokens {
+        fields.push(format!("cache_creation_input={cache_creation_input}"));
+    }
+    if let Some(output) = usage.output_tokens {
+        fields.push(format!("output={output}"));
+    }
+    if let Some(total) = usage.total_tokens {
+        fields.push(format!("total={total}"));
+    }
+
+    let line = format!("[tokens] {}", fields.join(", "));
     output.println_styled(Style::Muted, &line);
 }
 
@@ -123,12 +130,6 @@ pub(crate) fn format_server_tool_use(call: &libtau::context::ServerToolUse) -> S
     }
 
     format!("[server tool] {}", call.name)
-}
-
-fn format_optional_u64(value: Option<u64>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn indent_display_block(text: &str) -> String {
